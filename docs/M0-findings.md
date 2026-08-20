@@ -159,9 +159,13 @@ so no global post-id index exists. The public id resolves inside the posts query
 subquery, which measured as `SEARCH thread USING COVERING INDEX idx_thread_public_id` — served
 from the index without touching the table, and keeping both statements in one `batch()`.
 
-Widening the id later must be done by *appending*, not by switching to a standard 26-character
-ULID: ULID's two padding bits shift every character boundary, so the formats share no prefix and
-a mixed set stops sorting by time. See DESIGN.md §4.3, which is backed by a test.
+Widening the id later stays in base32 and works cleanly, provided the 48-bit timestamp stays in
+the top bits and extra characters are *appended* at the bottom. Every shorter id is then a literal
+prefix of its wider form, so mixed widths still sort by creation time — verified for 16/18/20/22/26
+characters, including widths interleaved per id as they would be mid-deploy. The parser already
+accepts 16-26 characters while generation emits 16, so widening needs no parser change and strands
+no URLs. The one thing to avoid is adopting a *canonical* ULID, whose two padding bits re-align
+every character boundary. See DESIGN.md §4.3, backed by tests.
 
 ## D1 access
 

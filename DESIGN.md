@@ -364,62 +364,49 @@ entirely from the index without touching the thread table, and both statements s
 
 ### 4.3 Widening the id later
 
-If 32 random bits ever stops being enough, widen **by appending only**. A standard 26-character
-ULID is not a drop-in successor: ULID packs 128 bits into 130 bits of base32 space, so its two
-leading padding bits shift every character boundary. Ids in the two formats share no prefix even
-for the same millisecond, and a mixed set no longer sorts by creation time:
+If 32 random bits ever stops being enough, the id widens **while staying base32** — and this
+works cleanly, provided one rule is followed:
+
+> Keep the 48-bit timestamp in the **top** bits and append whole base32 characters at the
+> **bottom**. Never re-align the payload.
+
+Under that rule every shorter id is a *literal prefix* of its wider form, prefix order is time
+order, and mixed-width ids sort correctly with no special handling:
 
 ```
-same timestamp, three encodings
-  ours (16)       06a1yabw00000000
-  ULID (26)       01jgfjjz000000000000000000   <- 1 char in common; different alignment
-  appended (26)   06a1yabw000000000000000000   <- all 16 in common; same alignment
+same timestamp, four widths
+  16 chars ( 80 bits, 32 random)   06a1yabw00000000
+  20 chars (100 bits, 52 random)   06a1yabw000000000000
+  26 chars (130 bits, 82 random)   06a1yabw000000000000000000
+  32 chars (160 bits, 112 random)  06a1yabw000000000000000000000000
 ```
 
-Appending 50 bits gives 130 bits in 26 characters whose first 16 are byte-identical to today's
-id. Old and new interleave correctly in one index, old URLs keep resolving, and no backfill is
-needed. `extension_by_appending_preserves_order` in `crates/core/src/id.rs` is the executable
-form of that claim, so the path stays tested rather than assumed.
+`crates/core/src/id.rs` already parses any width in 16-26 characters even though this build only
+generates 16, so **a future instance can widen its generated ids with no change to the parser and
+no stranded URLs**. Making the generated width a per-instance setting is therefore a small change:
+generation picks a width, parsing already accepts them all. `mixed_width_ids_sort_by_creation_time`
+covers the realistic rollout case where widths interleave mid-deploy rather than changing cleanly.
 
-Worth knowing before treating this as a constraint: **nothing currently needs cross-format sort
-order.** Feeds order by `created_at`/`bumped_at`, never by id. What the time prefix actually buys
-is index insert locality, and every candidate format keeps that, because all of them put the same
-timestamp in the high bits. A hard switch to standard ULID would still work operationally — it
-would only forfeit a property nothing reads. Making the generated length a per-instance setting is
-therefore reasonable; the parser just needs to accept both lengths at that point.
+**The one thing to avoid is adopting a canonical 26-character ULID.** ULID packs 128 bits into
+130 bits of base32 space, so it carries two leading padding bits, and that offset shifts every
+character boundary. Ids in the two formats then share no prefix even for the same millisecond,
+and a mixed set stops sorting by time:
 
-```sql
-CREATE TABLE signal (
-  id          INTEGER PRIMARY KEY,
-  target_kind TEXT NOT NULL,          -- thread|post|user
-  target_id   INTEGER NOT NULL,
-  actor_id    INTEGER NOT NULL REFERENCES user(id),
-  kind        TEXT NOT NULL,          -- upvote|downvote|like|flag|label
-  reason      TEXT,                   -- 'insightful' | 'troll' | 'spam' | ...
-  weight      REAL NOT NULL DEFAULT 1.0,
-  created_at  INTEGER NOT NULL,
-  UNIQUE(target_kind, target_id, actor_id, kind)
-);
-
-CREATE TABLE action_log (            -- immutable. never UPDATE, never DELETE.
-  id          INTEGER PRIMARY KEY,
-  actor_kind  TEXT NOT NULL,          -- user|system|model
-  actor_id    INTEGER,
-  action      TEXT NOT NULL,
-  target_kind TEXT NOT NULL,
-  target_id   INTEGER NOT NULL,
-  reason      TEXT,
-  metadata    TEXT NOT NULL DEFAULT '{}',
-  public      INTEGER NOT NULL DEFAULT 1,
-  created_at  INTEGER NOT NULL
-);
+```
+  ours     (16)   06a1yabw00000000
+  ULID     (26)   01jgfjjz000000000000000000   <- 1 char in common; re-aligned
+  appended (26)   06a1yabw000000000000000000   <- all 16 in common; safe
 ```
 
-Also needed: `user`, `capability`, `role`, `role_grant`, `rule`, `review_queue`, `notification`,
-`subscription`, `poll` / `poll_vote`, `attachment`, plus an FTS5 virtual table over
-`post(body_md)`.
+That is a difference of encoding alignment, not of alphabet — both are base32. Widening our own
+format is safe; swapping in someone else's 128-bit layout is not.
 
----
+Worth knowing before treating even that as a hard constraint: **nothing currently reads
+cross-format sort order.** Feeds order by `created_at`/`bumped_at`, never by id. What the time
+prefix actually buys is index insert locality, and every candidate keeps that, because all of them
+put the timestamp in the high bits. A hard switch to canonical ULID would still work
+operationally; it would only forfeit a property nothing uses. The append rule is what keeps the
+option open for free.
 
 ## 5. Moderation pipeline
 
