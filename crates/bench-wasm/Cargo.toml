@@ -1,0 +1,18 @@
+[package]
+name = "notespace-bench"
+description = "Exposes the render paths to a Node harness so CPU can be measured in real wasm."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+notespace-core = { workspace = true }
+notespace-render = { workspace = true }
+wasm-bindgen = "0.2"
+serde = { workspace = true }
+serde_json = { workspace = true }

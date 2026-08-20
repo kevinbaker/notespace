@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/render",
+    "crates/seed",
+    "crates/worker",
+    "crates/bench-wasm",
+]
+
+default-members = ["crates/core", "crates/render", "crates/seed"]
+
+# `worker` and `bench-wasm` are wasm-only and are built explicitly with
+# `--target wasm32-unknown-unknown`; keeping them out of the default set means a bare
+# `cargo test` exercises the target-agnostic crates without dragging in the wasm toolchain.
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+repository = "https://github.com/kevinbaker/notespace"
+homepage = "https://notespace.org"
+
+[workspace.dependencies]
+notespace-core = { path = "crates/core" }
+notespace-render = { path = "crates/render" }
+
+# Every dependency here must compile to wasm32-unknown-unknown. See DESIGN.md §9.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+ammonia = "4"
+maud = "0.27"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[profile.release]
+opt-level = "s"    # size over speed: the 3MB script limit binds before CPU does
+lto = true
+codegen-units = 1
+panic = "abort"    # no unwinding on wasm anyway; saves ~10% of the binary
+
+# Deliberately NOT `strip = true`. Stripping drops the externref table, and wasm-bindgen
+# then fails with "externref table required for catch wrappers". worker-build runs wasm-opt
+# afterwards, which strips debug sections properly, so nothing is lost by leaving this off.
+strip = false

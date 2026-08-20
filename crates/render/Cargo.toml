@@ -1,0 +1,14 @@
+[package]
+name = "notespace-render"
+description = "Markdown -> sanitized HTML at write time, and page templates for the read path."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+notespace-core = { workspace = true }
+pulldown-cmark = { workspace = true }
+ammonia = { workspace = true }
+maud = { workspace = true }

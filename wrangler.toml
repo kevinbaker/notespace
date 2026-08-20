@@ -1,0 +1,22 @@
+name = "notespace"
+main = "crates/worker/build/worker/shim.mjs"
+compatibility_date = "2025-08-01"
+
+# The M0 spike. `wrangler dev` runs this against a local SQLite-backed D1.
+[build]
+command = "worker-build --release"
+cwd = "crates/worker"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "notespace"
+# Placeholder: replace with the real id from `wrangler d1 create notespace` before deploying.
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+
+[observability]
+enabled = true
+
+[placement]
+mode = "smart"
