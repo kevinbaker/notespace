@@ -50,12 +50,14 @@
 //! order, mixed widths sort correctly with no special handling.
 //!
 //! ```text
-//! same timestamp, four widths
+//! same timestamp, three widths
 //!   16 chars ( 80 bits, 32 random)   06a1yabw00000000
 //!   20 chars (100 bits, 52 random)   06a1yabw000000000000
-//!   26 chars (130 bits, 82 random)   06a1yabw000000000000000000
-//!   32 chars (160 bits, 112 random)  06a1yabw000000000000000000000000
+//!   25 chars (125 bits, 77 random)   06a1yabw00000000000000000
 //! ```
+//!
+//! 25 characters is the ceiling, set by [`PublicId::to_u128`]: 125 bits fits a `u128`, so every
+//! id has an exact integer form. 26 would be 130 bits and would make that form fallible.
 //!
 //! [`PublicId::parse`] already accepts any width in [`MIN_CHARS`]`..=`[`MAX_CHARS`], while
 //! [`PublicId::new`] only ever generates [`ID_CHARS`]. That asymmetry is the point: a future
@@ -69,7 +71,7 @@
 //! ```text
 //!   ours     (16)   06a1yabw00000000
 //!   ULID     (26)   01jgfjjz000000000000000000   <- 1 char in common; re-aligned
-//!   appended (26)   06a1yabw000000000000000000   <- all 16 in common; safe
+//!   appended (25)   06a1yabw00000000000000000    <- all 16 in common; safe
 //! ```
 //!
 //! That is an alignment difference, not an alphabet one; both are base32. Widening this format
@@ -94,12 +96,20 @@ pub const ID_CHARS: usize = 16;
 /// Shortest accepted id. Below this, 48 bits of timestamp leaves too little randomness.
 pub const MIN_CHARS: usize = 16;
 
-/// Longest accepted id: 130 bits, matching a ULID's payload size.
+/// Longest accepted id: 25 characters, 125 bits.
+///
+/// The cap is set by [`PublicId::to_u128`]. 26 characters would be 130 bits and would make the
+/// integer form fallible or lossy; 25 fits a `u128` with room to spare, so *every* id has an
+/// exact integer representation. What that gives up is three bits of randomness against a
+/// ULID's 80 — not a difference any forum can observe.
 ///
 /// Ids are *parsed* anywhere in `MIN_CHARS..=MAX_CHARS` even though this build only ever
 /// *generates* [`ID_CHARS`]. That asymmetry is deliberate: it means widening the generated id
 /// later (§4.3) needs no change here and cannot strand an existing URL.
-pub const MAX_CHARS: usize = 26;
+pub const MAX_CHARS: usize = 25;
+
+/// Bits in the widest id. Comfortably inside a `u128`.
+pub const MAX_BITS: u32 = (MAX_CHARS as u32) * 5;
 
 /// Bits of millisecond timestamp. 48 bits runs to the year 10889.
 pub const TIMESTAMP_BITS: u32 = 48;
@@ -146,6 +156,8 @@ pub enum IdError {
     WrongLength(usize),
     #[error("character {0:?} is not in the id alphabet")]
     BadCharacter(char),
+    #[error("value {0} does not fit the requested id width")]
+    ValueTooWide(u128),
 }
 
 /// An opaque, time-sortable public identifier.
@@ -158,19 +170,6 @@ pub enum IdError {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PublicId(String);
 
-/// Bit `pos` of the conceptual value: 48 bits of timestamp, then randomness, MSB first.
-///
-/// Working a bit at a time avoids ever materialising the whole value, which at [`MAX_CHARS`]
-/// is 130 bits and would not fit a `u128`.
-fn bit_at(timestamp_ms: u64, random: u128, random_bits: u32, pos: u32) -> u8 {
-    if pos < TIMESTAMP_BITS {
-        ((timestamp_ms >> (TIMESTAMP_BITS - 1 - pos)) & 1) as u8
-    } else {
-        let i = pos - TIMESTAMP_BITS;
-        ((random >> (random_bits - 1 - i)) & 1) as u8
-    }
-}
-
 impl PublicId {
     /// Build an id at the default width.
     ///
@@ -182,26 +181,44 @@ impl PublicId {
     }
 
     /// Build an id at an explicit width, for a future instance configured to generate wider
-    /// ids (DESIGN.md §4.3). The extra bits are appended below the existing ones, so an id
-    /// built here is prefix-compatible with one built by [`PublicId::new`].
+    /// ids (DESIGN.md §4.3). Extra bits are appended below the existing ones, so an id built
+    /// here is prefix-compatible with one built by [`PublicId::new`].
     pub fn with_width(timestamp_ms: u64, random: u128, chars: usize) -> Result<Self, IdError> {
         if timestamp_ms > MAX_TIMESTAMP_MS {
             return Err(IdError::TimestampOutOfRange(timestamp_ms));
         }
-        if !(MIN_CHARS..=MAX_CHARS).contains(&chars) {
-            return Err(IdError::WrongLength(chars));
+        let random_bits = Self::random_bits(chars)?;
+        let mask = (1u128 << random_bits) - 1;
+        // Always fits: chars <= MAX_CHARS means at most MAX_BITS = 125 bits.
+        let bits = ((timestamp_ms as u128) << random_bits) | (random & mask);
+        Ok(PublicId(Self::render(bits, chars)))
+    }
+
+    /// Rebuild an id from its integer form, e.g. after storing it as a number elsewhere.
+    ///
+    /// `bits` must fit the width: `chars * 5` bits.
+    pub fn from_u128(bits: u128, chars: usize) -> Result<Self, IdError> {
+        let _ = Self::random_bits(chars)?;
+        let total = chars as u32 * 5;
+        if total < 128 && bits >= (1u128 << total) {
+            return Err(IdError::ValueTooWide(bits));
         }
-        let total_bits = chars as u32 * 5;
-        let random_bits = total_bits - TIMESTAMP_BITS;
-        let mut out = String::with_capacity(chars);
-        for c in 0..chars as u32 {
-            let mut digit = 0u8;
-            for b in 0..5 {
-                digit = (digit << 1) | bit_at(timestamp_ms, random, random_bits, c * 5 + b);
-            }
-            out.push(ALPHABET[digit as usize] as char);
-        }
-        Ok(PublicId(out))
+        Ok(PublicId(Self::render(bits, chars)))
+    }
+
+    /// The id as a packed integer: 48 bits of timestamp in the high position, randomness below.
+    ///
+    /// Exact for every id, which is what the [`MAX_CHARS`] cap buys. Useful anywhere an integer
+    /// is genuinely wanted — a bitmask, a numeric key in another system, arithmetic on the
+    /// timestamp — without having to re-derive the layout.
+    ///
+    /// Note that this is *width-relative*: the same timestamp at two widths yields different
+    /// integers, because the randomness below it is wider. Compare [`PublicId`] values directly
+    /// rather than their integer forms unless the widths are known to match.
+    pub fn to_u128(&self) -> u128 {
+        self.0
+            .bytes()
+            .fold(0u128, |acc, b| (acc << 5) | DECODE[b as usize] as u128)
     }
 
     /// Parse a rendered id. Accepts either case, `I`/`L`/`O` confusions, grouping hyphens, and
@@ -231,40 +248,17 @@ impl PublicId {
         Ok(PublicId(out))
     }
 
-    /// Creation time, in unix milliseconds.
-    ///
-    /// Read from the top 48 bits, which sit in the same place at every width: that invariance
-    /// is exactly what makes widening safe.
+    /// Creation time, in unix milliseconds. Read from the top 48 bits, which sit in the same
+    /// place at every width — that invariance is exactly what makes widening safe.
     pub fn timestamp_ms(&self) -> u64 {
-        let mut ts: u64 = 0;
-        let mut taken = 0u32;
-        for b in self.0.bytes() {
-            let digit = DECODE[b as usize] as u64;
-            for k in (0..5).rev() {
-                if taken == TIMESTAMP_BITS {
-                    return ts;
-                }
-                ts = (ts << 1) | ((digit >> k) & 1);
-                taken += 1;
-            }
-        }
-        ts
+        let random_bits = self.0.len() as u32 * 5 - TIMESTAMP_BITS;
+        (self.to_u128() >> random_bits) as u64
     }
 
-    /// The random component, as an integer. Exposed for tests and diagnostics.
+    /// The random component, as an integer.
     pub fn random(&self) -> u128 {
-        let mut r: u128 = 0;
-        let mut pos = 0u32;
-        for b in self.0.bytes() {
-            let digit = DECODE[b as usize] as u128;
-            for k in (0..5).rev() {
-                if pos >= TIMESTAMP_BITS {
-                    r = (r << 1) | ((digit >> k) & 1);
-                }
-                pos += 1;
-            }
-        }
-        r
+        let random_bits = self.0.len() as u32 * 5 - TIMESTAMP_BITS;
+        self.to_u128() & ((1u128 << random_bits) - 1)
     }
 
     /// Characters in this id.
@@ -273,6 +267,10 @@ impl PublicId {
     }
 
     /// Canonical rendering: lowercase, no hyphens.
+    ///
+    /// Allocates. Prefer [`PublicId::as_str`] where a borrow will do — the page template
+    /// renders through `Display`, which borrows, and that is why the string representation
+    /// outperforms a packed integer on the read path.
     pub fn encode(&self) -> String {
         self.0.clone()
     }
@@ -290,6 +288,22 @@ impl PublicId {
                 out.push('-');
             }
             out.push(c);
+        }
+        out
+    }
+
+    fn random_bits(chars: usize) -> Result<u32, IdError> {
+        if !(MIN_CHARS..=MAX_CHARS).contains(&chars) {
+            return Err(IdError::WrongLength(chars));
+        }
+        Ok(chars as u32 * 5 - TIMESTAMP_BITS)
+    }
+
+    fn render(bits: u128, chars: usize) -> String {
+        let mut out = String::with_capacity(chars);
+        for c in 0..chars {
+            let shift = 5 * (chars - 1 - c) as u32;
+            out.push(ALPHABET[((bits >> shift) & 31) as usize] as char);
         }
         out
     }
@@ -404,7 +418,7 @@ mod tests {
     fn mixed_width_ids_sort_by_creation_time() {
         // The realistic rollout: widths interleaved per id, not in clean eras, because during
         // a deploy some requests still generate the narrow form.
-        let widths = [16usize, 20, 26, 18, 22];
+        let widths = [16usize, 20, 25, 18, 22];
         let mut rows: Vec<(u64, PublicId)> = Vec::new();
         for i in 0..600u64 {
             let w = widths[i as usize % widths.len()];
@@ -425,6 +439,33 @@ mod tests {
             by_time, by_string,
             "mixed-width sort must equal creation order"
         );
+    }
+
+    #[test]
+    fn integer_form_round_trips_at_every_width() {
+        // The point of capping MAX_CHARS at 25: every id has an exact u128 form.
+        for chars in MIN_CHARS..=MAX_CHARS {
+            let id = PublicId::with_width(T, 0xDEAD_BEEF_CAFE, chars).unwrap();
+            let bits = id.to_u128();
+            assert_eq!(PublicId::from_u128(bits, chars).unwrap(), id);
+            assert!(
+                bits < (1u128 << (chars as u32 * 5)),
+                "value exceeds its width"
+            );
+            // Timestamp sits in the top 48 bits at every width.
+            assert_eq!(id.timestamp_ms(), T);
+        }
+        assert_eq!(MAX_BITS, 125, "must stay inside a u128");
+    }
+
+    #[test]
+    fn from_u128_rejects_overwide_values() {
+        assert!(matches!(
+            PublicId::from_u128(1u128 << 81, MIN_CHARS),
+            Err(IdError::ValueTooWide(_))
+        ));
+        assert!(PublicId::from_u128(0, MIN_CHARS - 1).is_err());
+        assert!(PublicId::from_u128(0, MAX_CHARS + 1).is_err());
     }
 
     #[test]
@@ -587,6 +628,18 @@ mod tests {
             prop_assert_eq!(PublicId::parse(&id.encode())?, id.clone());
             prop_assert_eq!(PublicId::parse(&id.encode_grouped())?, id.clone());
             prop_assert_eq!(PublicId::parse(&id.encode().to_uppercase())?, id);
+        }
+
+        /// The integer form is an exact, lossless view of the id.
+        #[test]
+        fn integer_form_is_lossless(
+            ms in 0u64..=MAX_TIMESTAMP_MS,
+            r in any::<u64>(),
+            chars in MIN_CHARS..=MAX_CHARS,
+        ) {
+            let id = PublicId::with_width(ms, r as u128, chars)?;
+            prop_assert_eq!(PublicId::from_u128(id.to_u128(), chars)?, id.clone());
+            prop_assert_eq!(id.timestamp_ms(), ms);
         }
 
         /// Widening preserves both the prefix relationship and the timestamp, at every width.

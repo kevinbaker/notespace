@@ -40,6 +40,15 @@ bench() {
 
   step "Measuring render CPU in wasm under V8"
   BENCH_DIR="$BENCH_OUT" node "$ROOT/scripts/bench.mjs"
+
+  step "Nesting depth vs cost"
+  for prof in flat shallow mixed deep; do
+    cargo run -q -p notespace-seed -- 200 json "$prof" > "$BENCH_OUT/fixture_prof_$prof.json"
+  done
+  BENCH_DIR="$BENCH_OUT" node "$ROOT/scripts/nesting.mjs"
+
+  step "Public id representation: canonical String vs packed u128"
+  BENCH_DIR="$BENCH_OUT" node "$ROOT/scripts/id-bench.mjs"
 }
 
 if [[ "${1:-all}" == "bench" ]]; then bench; exit 0; fi

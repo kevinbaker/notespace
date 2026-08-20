@@ -167,6 +167,49 @@ accepts 16-26 characters while generation emits 16, so widening needs no parser 
 no URLs. The one thing to avoid is adopting a *canonical* ULID, whose two padding bits re-align
 every character boundary. See DESIGN.md §4.3, backed by tests.
 
+## Public id representation: canonical `String` vs packed `u128`
+
+Both representations were implemented and cross-checked (identical encodings, timestamps, widths
+and sort order across mixed widths — 0 mismatches), then timed in wasm under V8 over 2000 ids at
+widths 16/18/20/22/25:
+
+| operation (per 2000 ids) | `String` | packed `u128` | packed is |
+|---|---|---|---|
+| parse, canonical (from D1) | 0.348 ms | 0.136 ms | **2.56x faster** |
+| parse, messy (from URL) | 0.359 ms | 0.157 ms | **2.28x faster** |
+| encode | 0.059 ms | 0.346 ms | 5.89x slower |
+| `timestamp_ms` | 0.058 ms | 0.012 ms | **5.00x faster** |
+| sort | 0.033 ms | 0.032 ms | about the same |
+| **page mix, as the template runs** | **0.673 ms** | 0.995 ms | 1.48x slower |
+
+**Decision: keep the canonical `String`, and expose the integer form as an accessor.**
+
+The last row is the one that decides it. A thread page parses two ids (one from the URL, one
+from D1) and renders one several times — canonical URL, RSS link, pager, personalisation hook.
+The template renders through `Display`, which *borrows* from the string form but forces the
+packed form to materialise a `String` every time. Packed wins every isolated operation that
+matters except encoding, and loses the mix because encoding is what a page does most.
+
+Measuring `.encode()` instead of the template's `Display` reverses none of this but does flatter
+the packed form (1.27x slower rather than 1.48x); the table above uses the honest comparison.
+
+**Neither choice is a performance decision.** The whole difference is **0.161 µs per request** —
+0.0016% of the 10 ms CPU budget. The real reasons to prefer the string form are that `Ord` is
+plain string comparison, which is automatically correct across mixed widths where a width-aware
+integer comparison is fiddly and easy to get subtly wrong, and that it cannot overflow.
+
+What the packed experiment did change: `PublicId` now uses `u128` as its internal *primitive*
+even though it stores the string. `to_u128` and `from_u128` are exact at every width, and
+`timestamp_ms` and `random` are derived from them rather than walking the string bit by bit —
+which made `timestamp_ms` 3.4x faster than the original implementation. `MAX_CHARS` dropped from
+26 to 25 to make that exactness unconditional: 125 bits fits a `u128`, 130 would not. The cost is
+three bits of randomness fewer than a ULID, which nothing can observe.
+
+The packed implementation is kept in `crates/bench-wasm/src/packed.rs` so the comparison stays
+reproducible via `./scripts/spike.sh`. If a future workload ever became parse-heavy and
+render-light — many ids loaded and sorted but rarely rendered — the tradeoff would flip. Posts
+deliberately have no public ids, so that workload does not currently exist.
+
 ## D1 access
 
 The thread page is **two statements in a single `batch()` round trip**:

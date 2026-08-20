@@ -374,14 +374,18 @@ Under that rule every shorter id is a *literal prefix* of its wider form, prefix
 order, and mixed-width ids sort correctly with no special handling:
 
 ```
-same timestamp, four widths
+same timestamp, three widths
   16 chars ( 80 bits, 32 random)   06a1yabw00000000
   20 chars (100 bits, 52 random)   06a1yabw000000000000
-  26 chars (130 bits, 82 random)   06a1yabw000000000000000000
-  32 chars (160 bits, 112 random)  06a1yabw000000000000000000000000
+  25 chars (125 bits, 77 random)   06a1yabw00000000000000000
 ```
 
-`crates/core/src/id.rs` already parses any width in 16-26 characters even though this build only
+25 characters is the ceiling, and it is chosen rather than inherited: 125 bits fits a `u128`, so
+every id has an exact integer form via `PublicId::to_u128`. 26 characters would be 130 bits and
+would make that form fallible or lossy, for three more bits of randomness than a ULID has — a
+trade with no upside.
+
+`crates/core/src/id.rs` already parses any width in 16-25 characters even though this build only
 generates 16, so **a future instance can widen its generated ids with no change to the parser and
 no stranded URLs**. Making the generated width a per-instance setting is therefore a small change:
 generation picks a width, parsing already accepts them all. `mixed_width_ids_sort_by_creation_time`
@@ -395,7 +399,7 @@ and a mixed set stops sorting by time:
 ```
   ours     (16)   06a1yabw00000000
   ULID     (26)   01jgfjjz000000000000000000   <- 1 char in common; re-aligned
-  appended (26)   06a1yabw000000000000000000   <- all 16 in common; safe
+  appended (25)   06a1yabw00000000000000000    <- all 16 in common; safe
 ```
 
 That is a difference of encoding alignment, not of alphabet — both are base32. Widening our own

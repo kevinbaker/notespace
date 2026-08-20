@@ -14,6 +14,8 @@
 //! `Date.now()` inside a real Worker is coarse and advances only on I/O, which is exactly
 //! why the measurement is taken here instead of in the Worker itself.
 
+pub mod packed;
+
 use std::cell::RefCell;
 
 use notespace_core::model::{Space, Thread, ThreadPage};
@@ -168,4 +170,262 @@ pub fn path_bytes() -> usize {
 #[wasm_bindgen]
 pub fn page_bytes() -> usize {
     render_read_path()
+}
+
+// ---------------------------------------------------------------------------
+// Public id representation: canonical `String` (shipping) vs packed `u128`.
+// ---------------------------------------------------------------------------
+
+use crate::packed::PackedId;
+use notespace_core::id::PublicId;
+
+/// The same ids in both representations, plus their canonical and messy renderings.
+#[derive(Default)]
+struct IdCorpus {
+    strings: Vec<PublicId>,
+    packed: Vec<PackedId>,
+    canonical: Vec<String>,
+    messy: Vec<String>,
+}
+
+thread_local! {
+    static IDS: RefCell<IdCorpus> = RefCell::new(IdCorpus::default());
+}
+
+/// Build `n` ids at mixed widths in both representations.
+#[wasm_bindgen]
+pub fn id_setup(n: usize) -> usize {
+    // 25 is the packed representation's ceiling; compare over a range both support.
+    const WIDTHS: [usize; 5] = [16, 18, 20, 22, 25];
+    let base: u64 = 1_735_689_600_000;
+    let (mut a, mut b, mut canon, mut messy) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for i in 0..n as u64 {
+        let w = WIDTHS[i as usize % WIDTHS.len()];
+        let rand = (i as u128).wrapping_mul(0x9E37_79B9_7F4A_7C15_1234_5678_9ABC_DEF1);
+        let Some(p) = PackedId::new(base + i, rand, w) else {
+            continue;
+        };
+        let Ok(s) = PublicId::with_width(base + i, rand, w) else {
+            continue;
+        };
+        let text = s.encode();
+        // The URL case: uppercase with grouping hyphens, as someone might type it.
+        let grouped = s.encode_grouped().to_uppercase();
+        a.push(s);
+        b.push(p);
+        canon.push(text);
+        messy.push(grouped);
+    }
+    let len = a.len();
+    IDS.with(|c| {
+        *c.borrow_mut() = IdCorpus {
+            strings: a,
+            packed: b,
+            canonical: canon,
+            messy,
+        }
+    });
+    len
+}
+
+/// Verify the two representations agree before timing them. Returns the number of mismatches;
+/// a nonzero result invalidates every timing below.
+#[wasm_bindgen]
+pub fn id_cross_check() -> usize {
+    IDS.with(|c| {
+        let corpus = c.borrow();
+        let (strs, packs, canon, messy) = (
+            &corpus.strings,
+            &corpus.packed,
+            &corpus.canonical,
+            &corpus.messy,
+        );
+        let mut bad = 0;
+        for i in 0..strs.len() {
+            if strs[i].encode() != packs[i].encode() {
+                bad += 1;
+            }
+            if strs[i].timestamp_ms() != packs[i].timestamp_ms() {
+                bad += 1;
+            }
+            if strs[i].width() != packs[i].width() {
+                bad += 1;
+            }
+            // Both must accept the messy form and normalise to the same canonical text.
+            match (PublicId::parse(&messy[i]), PackedId::parse(&messy[i])) {
+                (Ok(x), Some(y)) if x.encode() == canon[i] && y.encode() == canon[i] => {}
+                _ => bad += 1,
+            }
+        }
+        // Sort order must agree across widths, which is the subtle part for the packed form.
+        let mut sa: Vec<&PublicId> = strs.iter().collect();
+        let mut sb: Vec<&PackedId> = packs.iter().collect();
+        sa.sort();
+        sb.sort();
+        for i in 0..sa.len() {
+            if sa[i].encode() != sb[i].encode() {
+                bad += 1;
+            }
+        }
+        bad
+    })
+}
+
+macro_rules! id_bench {
+    ($name:ident, $body:expr) => {
+        #[wasm_bindgen]
+        pub fn $name() -> usize {
+            IDS.with(|c| {
+                let b = c.borrow();
+                #[allow(clippy::redundant_closure_call)]
+                ($body)(&b.strings, &b.packed, &b.canonical, &b.messy)
+            })
+        }
+    };
+}
+
+id_bench!(
+    id_parse_canonical_string,
+    |_: &Vec<PublicId>, _: &Vec<PackedId>, canon: &Vec<String>, _: &Vec<String>| {
+        canon
+            .iter()
+            .filter_map(|s| PublicId::parse(s).ok())
+            .map(|i| i.width())
+            .sum()
+    }
+);
+
+id_bench!(
+    id_parse_canonical_packed,
+    |_: &Vec<PublicId>, _: &Vec<PackedId>, canon: &Vec<String>, _: &Vec<String>| {
+        canon
+            .iter()
+            .filter_map(|s| PackedId::parse(s))
+            .map(|i| i.width())
+            .sum()
+    }
+);
+
+id_bench!(
+    id_parse_messy_string,
+    |_: &Vec<PublicId>, _: &Vec<PackedId>, _: &Vec<String>, messy: &Vec<String>| {
+        messy
+            .iter()
+            .filter_map(|s| PublicId::parse(s).ok())
+            .map(|i| i.width())
+            .sum()
+    }
+);
+
+id_bench!(
+    id_parse_messy_packed,
+    |_: &Vec<PublicId>, _: &Vec<PackedId>, _: &Vec<String>, messy: &Vec<String>| {
+        messy
+            .iter()
+            .filter_map(|s| PackedId::parse(s))
+            .map(|i| i.width())
+            .sum()
+    }
+);
+
+id_bench!(id_encode_string, |strs: &Vec<PublicId>, _, _, _| strs
+    .iter()
+    .map(|i| i.encode().len())
+    .sum());
+
+id_bench!(id_encode_packed, |_, packs: &Vec<PackedId>, _, _| packs
+    .iter()
+    .map(|i| i.encode().len())
+    .sum());
+
+id_bench!(id_timestamp_string, |strs: &Vec<PublicId>, _, _, _| strs
+    .iter()
+    .map(|i| i.timestamp_ms() as usize)
+    .sum());
+
+id_bench!(id_timestamp_packed, |_, packs: &Vec<PackedId>, _, _| packs
+    .iter()
+    .map(|i| i.timestamp_ms() as usize)
+    .sum());
+
+id_bench!(id_sort_string, |strs: &Vec<PublicId>, _, _, _| {
+    let mut v: Vec<&PublicId> = strs.iter().collect();
+    v.sort();
+    v.len()
+});
+
+id_bench!(id_sort_packed, |_, packs: &Vec<PackedId>, _, _| {
+    let mut v: Vec<&PackedId> = packs.iter().collect();
+    v.sort();
+    v.len()
+});
+
+/// The mix as the real template runs it.
+///
+/// `page.rs` renders the id through `Display`, which for the string form borrows and for the
+/// packed form must materialise a `String` every time. Measuring `.encode()` instead (as
+/// `id_page_mix_string` does) charges the string form for a clone that the render path never
+/// performs, so this is the honest comparison.
+#[wasm_bindgen]
+pub fn id_page_mix_string_display() -> usize {
+    IDS.with(|c| {
+        let corpus = c.borrow();
+        let (canon, messy) = (&corpus.canonical, &corpus.messy);
+        let mut acc = 0;
+        for i in 0..canon.len() {
+            if let (Ok(from_url), Ok(from_db)) =
+                (PublicId::parse(&messy[i]), PublicId::parse(&canon[i]))
+            {
+                // Borrowed, not cloned: what `(t.public_id)` in a maud template costs.
+                acc += from_url.as_str().len() + from_db.as_str().len() * 3;
+            }
+        }
+        acc
+    })
+}
+
+/// What one thread-page request actually costs: parse the id from the URL, parse the one that
+/// came back from D1, then render it into the page a few times (canonical URL, RSS link,
+/// pager, personalisation hook).
+#[wasm_bindgen]
+pub fn id_page_mix_string() -> usize {
+    IDS.with(|c| {
+        let corpus = c.borrow();
+        let (canon, messy) = (&corpus.canonical, &corpus.messy);
+        let mut acc = 0;
+        for i in 0..canon.len() {
+            if let (Ok(from_url), Ok(from_db)) =
+                (PublicId::parse(&messy[i]), PublicId::parse(&canon[i]))
+            {
+                acc += from_url.encode().len() + from_db.encode().len() * 3;
+            }
+        }
+        acc
+    })
+}
+
+#[wasm_bindgen]
+pub fn id_page_mix_packed() -> usize {
+    IDS.with(|c| {
+        let corpus = c.borrow();
+        let (canon, messy) = (&corpus.canonical, &corpus.messy);
+        let mut acc = 0;
+        for i in 0..canon.len() {
+            if let (Some(from_url), Some(from_db)) =
+                (PackedId::parse(&messy[i]), PackedId::parse(&canon[i]))
+            {
+                acc += from_url.encode().len() + from_db.encode().len() * 3;
+            }
+        }
+        acc
+    })
+}
+
+/// In-memory footprint of each representation, excluding heap for the string case.
+#[wasm_bindgen]
+pub fn id_sizes() -> Vec<usize> {
+    vec![
+        core::mem::size_of::<PublicId>(),
+        core::mem::size_of::<PackedId>(),
+    ]
 }
