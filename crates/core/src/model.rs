@@ -3,6 +3,7 @@
 //! M0 covers only the read path for a thread page, so this is the Space/Thread/Post/User
 //! subset. Signal, Capability, ActionLog and Rule land in M1-M4.
 
+use crate::id::PublicId;
 use crate::path::Path;
 use serde::{Deserialize, Serialize};
 
@@ -78,7 +79,10 @@ pub struct User {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Thread {
+    /// Internal identity. Carries every foreign key; never appears in a URL.
     pub id: ThreadId,
+    /// Opaque, time-sortable id used in URLs (DESIGN.md §4.2).
+    pub public_id: PublicId,
     pub space_id: SpaceId,
     pub kind: ThreadKind,
     pub title: String,

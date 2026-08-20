@@ -10,6 +10,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use notespace_core::id::PublicId;
 use notespace_core::path::Path as TreePath;
 use notespace_core::store::{Page, StoreError};
 use serde::Deserialize;
@@ -51,20 +52,54 @@ async fn healthz() -> &'static str {
 
 async fn thread_page_slug(
     state: State<Env>,
-    UrlPath((id, _slug)): UrlPath<(i64, String)>,
+    UrlPath((id, slug)): UrlPath<(String, String)>,
     query: Query<PageQuery>,
 ) -> Response {
-    thread_page(state, UrlPath(id), query).await
+    // The slug is decorative: it exists for readability and for search engines, and is never
+    // used to resolve the thread. Retitling a thread therefore cannot break its links.
+    render_thread(state, id, Some(slug), query).await
+}
+
+async fn thread_page(
+    state: State<Env>,
+    UrlPath(id): UrlPath<String>,
+    query: Query<PageQuery>,
+) -> Response {
+    render_thread(state, id, None, query).await
 }
 
 /// `#[worker::send]` wraps the future so axum's `Send` bound is satisfied. Workers are
 /// single-threaded, so this is sound here and is the pattern workers-rs prescribes.
 #[worker::send]
-async fn thread_page(
+async fn render_thread(
     State(env): State<Env>,
-    UrlPath(id): UrlPath<i64>,
+    id: String,
+    slug: Option<String>,
     Query(q): Query<PageQuery>,
 ) -> Response {
+    // Parsing is forgiving in the ways people actually mistype: either case, `I`/`l` for `1`,
+    // `O` for `0`, and grouping hyphens (see `notespace_core::id`). It is strict otherwise.
+    let thread_id = match PublicId::parse(&id) {
+        Ok(p) => p,
+        Err(e) => return error(StatusCode::BAD_REQUEST, &format!("bad thread id: {e}")),
+    };
+
+    // Redirect any accepted-but-non-canonical spelling to the canonical lowercase form, so a
+    // thread has exactly one cacheable URL instead of one per way of typing it. Without this,
+    // `/t/ABCD...` and `/t/abcd...` would occupy separate cache entries for identical bytes.
+    let canonical = thread_id.encode();
+    if id != canonical {
+        let location = match &slug {
+            Some(s) => format!("/t/{canonical}/{s}"),
+            None => format!("/t/{canonical}"),
+        };
+        return (
+            StatusCode::MOVED_PERMANENTLY,
+            [(header::LOCATION, location)],
+        )
+            .into_response();
+    }
+
     let db = match env.d1(DB_BINDING) {
         Ok(db) => db,
         Err(e) => {
@@ -91,7 +126,7 @@ async fn thread_page(
         limit: PAGE_SIZE,
     };
 
-    match store.thread_page_with_space(id, page).await {
+    match store.thread_page_with_space(thread_id, page).await {
         Ok((space, page)) => {
             let html = notespace_render::thread_page(&space, &page).into_string();
             (

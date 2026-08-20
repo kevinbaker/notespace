@@ -55,15 +55,18 @@ printf 'wasm:        %8.1f KB (%.1f KB gzipped)\n' \
   "$(gzip -c "$WASM" | wc -c | awk '{print $1/1024}')"
 
 step "Applying migrations + seed to local D1"
-$WRANGLER d1 execute notespace --local --file=migrations/0001_init.sql >/dev/null
-cargo run -q -p notespace-seed -- "$POSTS" sql > seed.sql
+for m in migrations/*.sql; do
+  $WRANGLER d1 execute notespace --local --file="$m" >/dev/null
+done
+cargo run -q -p notespace-seed -- "$POSTS" sql mixed > seed.sql
 $WRANGLER d1 execute notespace --local --file=seed.sql >/dev/null
 echo "seeded $POSTS posts"
 
-step "Query plan for the thread-page read (must be an index range scan)"
+step "Query plan for the thread-page read (index range scan + covering-index id probe)"
 $WRANGLER d1 execute notespace --local --json --command="EXPLAIN QUERY PLAN \
   SELECT p.id FROM post p JOIN user u ON u.id=p.author_id \
-  WHERE p.thread_id=1 AND p.path>'' ORDER BY p.path LIMIT 201" \
+  WHERE p.thread_id=(SELECT id FROM thread WHERE public_id=(SELECT public_id FROM thread LIMIT 1)) \
+  AND p.path>'' ORDER BY p.path LIMIT 201" \
   | python3 -c "import json,sys; [print('   ', r['detail']) for r in json.load(sys.stdin)[0]['results']]"
 
 bench

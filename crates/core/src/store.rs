@@ -12,7 +12,8 @@
 //! - No connection pool on the wasm side: sqlx's pool needs a Tokio runtime that does not
 //!   exist there.
 
-use crate::model::{ThreadId, ThreadPage};
+use crate::id::PublicId;
+use crate::model::ThreadPage;
 use crate::path::Path;
 
 /// `?Send` is required: wasm futures are not `Send` (DESIGN.md §3.1).
@@ -62,8 +63,11 @@ impl Page {
 pub trait Store {
     /// Fetch one page of a thread.
     ///
+    /// Threads are addressed by their public id, not their internal integer id: the integer
+    /// never leaves the database (DESIGN.md §4.2).
+    ///
     /// **Budget: at most 2 D1 queries.** One for thread metadata, one indexed range scan
     /// over `(thread_id, path)` for the posts. Implementations that issue a query per post
     /// violate DESIGN.md §3.1 and will not survive the free tier.
-    async fn thread_page(&self, thread: ThreadId, page: Page) -> StoreResult<ThreadPage>;
+    async fn thread_page(&self, thread: PublicId, page: Page) -> StoreResult<ThreadPage>;
 }

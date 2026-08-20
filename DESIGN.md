@@ -329,9 +329,64 @@ colliding integer sequences from separate source forums are otherwise a genuine 
 extra index probe is paid once per pageview on the thread lookup, not once per post — under
 0.3% of a 200-post page's rows read.
 
-Posts also need addressing (`POST /p/{id}/signal`, §7). Prefer addressing them *within* their
-thread — `/t/{thread_pub}/p/{n}` — so a global unique index over every post's public id is never
-needed. Settle this in M2 when routes are built.
+Posts also need addressing (`POST /p/{id}/signal`, §7). Address them *within* their thread —
+`/t/{thread_pub}/p/{n}` — so a global unique index over every post's public id is never needed.
+At 5M posts such an index would cost ~135 MB, 27% of the free ceiling, for no benefit.
+
+**Format: 16 lowercase Crockford base32 characters** — 48-bit unix-ms timestamp + 32 random bits.
+A ULID truncated from 26 characters to 16. Implemented in `crates/core/src/id.rs`.
+
+```
+/t/06a1yabw03jnhej1/is-a-rust-forum-on-free-cloudflare-viable
+```
+
+Lowercase is canonical because these get typed and read aloud. The alphabet already omits
+`I`, `L`, `O` and `U`; on input the parser also accepts either case, folds `I`/`l` to `1` and
+`O` to `0`, and ignores grouping hyphens, so `06a1-YABW-O3jn-heJ1` resolves. Anything
+non-canonical gets a 301 to the canonical spelling, so a thread has exactly one cacheable URL
+rather than one per way of typing it.
+
+32 random bits is ample because collisions are only possible *within* a millisecond: the
+birthday bound is ~65,536 ids/ms for a 50% chance, against a forum's realistic ~0. And they are
+caught, not silent — `public_id` is UNIQUE, so a collision is a failed insert to retry.
+
+**Resolving a public id must not cost a round trip.** The URL carries `public_id` but posts key
+off the integer `thread_id`, so the naive implementation looks up the thread, then queries posts
+— two round trips, undoing §3.1's batching. Instead the posts query resolves it inline:
+
+```sql
+WHERE p.thread_id = (SELECT id FROM thread WHERE public_id = ?1) AND p.path > ?2
+```
+
+Measured plan: `SEARCH thread USING COVERING INDEX idx_thread_public_id`. The subquery is served
+entirely from the index without touching the thread table, and both statements stay in one
+`batch()`.
+
+### 4.3 Widening the id later
+
+If 32 random bits ever stops being enough, widen **by appending only**. A standard 26-character
+ULID is not a drop-in successor: ULID packs 128 bits into 130 bits of base32 space, so its two
+leading padding bits shift every character boundary. Ids in the two formats share no prefix even
+for the same millisecond, and a mixed set no longer sorts by creation time:
+
+```
+same timestamp, three encodings
+  ours (16)       06a1yabw00000000
+  ULID (26)       01jgfjjz000000000000000000   <- 1 char in common; different alignment
+  appended (26)   06a1yabw000000000000000000   <- all 16 in common; same alignment
+```
+
+Appending 50 bits gives 130 bits in 26 characters whose first 16 are byte-identical to today's
+id. Old and new interleave correctly in one index, old URLs keep resolving, and no backfill is
+needed. `extension_by_appending_preserves_order` in `crates/core/src/id.rs` is the executable
+form of that claim, so the path stays tested rather than assumed.
+
+Worth knowing before treating this as a constraint: **nothing currently needs cross-format sort
+order.** Feeds order by `created_at`/`bumped_at`, never by id. What the time prefix actually buys
+is index insert locality, and every candidate format keeps that, because all of them put the same
+timestamp in the high bits. A hard switch to standard ULID would still work operationally — it
+would only forfeit a property nothing reads. Making the generated length a per-instance setting is
+therefore reasonable; the parser just needs to accept both lengths at that point.
 
 ```sql
 CREATE TABLE signal (

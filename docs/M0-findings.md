@@ -153,8 +153,15 @@ Rationale:
 
 Posts need addressing too (`POST /p/{id}/signal` in DESIGN.md §7). Cheapest option is to
 address them within their thread — `/t/{thread_pub}/p/{n}` — so that a global unique index
-over every post's public id is never needed. That decision is deferred to M2, when routes
-are actually built; the measurements above are what it should be made against.
+over every post's public id is never needed. **Implemented since:** threads now carry a 16-character lowercase public id
+(48-bit ms + 32 random), served at `/t/{public_id}`. Posts are addressed within their thread,
+so no global post-id index exists. The public id resolves inside the posts query via a scalar
+subquery, which measured as `SEARCH thread USING COVERING INDEX idx_thread_public_id` — served
+from the index without touching the table, and keeping both statements in one `batch()`.
+
+Widening the id later must be done by *appending*, not by switching to a standard 26-character
+ULID: ULID's two padding bits shift every character boundary, so the formats share no prefix and
+a mixed set stops sorting by time. See DESIGN.md §4.3, which is backed by a test.
 
 ## D1 access
 

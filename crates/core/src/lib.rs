@@ -4,10 +4,12 @@
 //! dependency that cannot compile to `wasm32-unknown-unknown` (DESIGN.md §9). Everything
 //! here is unit-testable without a database or a network.
 
+pub mod id;
 pub mod model;
 pub mod path;
 pub mod store;
 
+pub use id::{IdError, PublicId, ID_CHARS, MAX_TIMESTAMP_MS};
 pub use model::{Post, PostState, Space, Thread, ThreadKind, ThreadPage, ThreadState, User};
 pub use path::{Path, PathError, MAX_DEPTH, MAX_ORDINAL, SEGMENT_WIDTH};
 pub use store::{Page, Store, StoreError, StoreResult};

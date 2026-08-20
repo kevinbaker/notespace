@@ -30,7 +30,7 @@ pub fn thread_page(space: &Space, page: &ThreadPage) -> Markup {
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (t.title) " — " (space.name) }
                 link rel="alternate" type="application/rss+xml"
-                     title=(t.title) href={ "/t/" (t.id) ".rss" };
+                     title=(t.title) href={ "/t/" (t.public_id) ".rss" };
                 style { (PreEscaped(STYLE)) }
             }
             body {
@@ -91,7 +91,7 @@ pub fn thread_page(space: &Space, page: &ThreadPage) -> Markup {
 
                     @if let Some(cursor) = &page.next_cursor {
                         nav class="pager" {
-                            a rel="next" href={ "/t/" (t.id) "?after=" (cursor.as_str()) } {
+                            a rel="next" href={ "/t/" (t.public_id) "?after=" (cursor.as_str()) } {
                                 "next page →"
                             }
                         }
@@ -99,7 +99,7 @@ pub fn thread_page(space: &Space, page: &ThreadPage) -> Markup {
                 }
                 // Personalisation (vote state, unread markers) is fetched separately so this
                 // document stays identical for every reader and can be cached once.
-                script defer src="/static/personalize.js" data-thread=(t.id) {}
+                script defer src="/static/personalize.js" data-thread=(t.public_id) {}
             }
         }
     }
@@ -137,6 +137,7 @@ border-left:2px solid var(--line);margin-bottom:.4rem}\
 #[cfg(test)]
 mod tests {
     use super::*;
+    use notespace_core::id::PublicId;
     use notespace_core::model::*;
     use notespace_core::path::Path;
 
@@ -154,6 +155,7 @@ mod tests {
     fn thread() -> Thread {
         Thread {
             id: 42,
+            public_id: PublicId::new(1_735_689_600_000, 0x2468_ACE0).expect("valid timestamp"),
             space_id: 1,
             kind: ThreadKind::Discussion,
             title: "Hello".into(),

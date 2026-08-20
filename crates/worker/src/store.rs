@@ -10,6 +10,7 @@
 //! `D1Database::batch` sends both in one request, so the invocation costs two queries
 //! against the 50 budget and one network round trip against the CPU budget.
 
+use notespace_core::id::PublicId;
 use notespace_core::model::*;
 use notespace_core::path::Path;
 use notespace_core::store::{async_trait, Page, Store, StoreError, StoreResult};
@@ -18,25 +19,32 @@ use worker::D1Database;
 
 /// Columns for the thread header. Deliberately narrow.
 const THREAD_SQL: &str = "\
-SELECT t.id, t.space_id, t.kind, t.title, t.url, t.author_id, u.name AS author_name, \
+SELECT t.id, t.public_id, t.space_id, t.kind, t.title, t.url, t.author_id, u.name AS author_name, \
 t.created_at, t.bumped_at, t.post_count, t.state, t.cache_version, \
 s.slug AS space_slug, s.name AS space_name, s.ranking AS space_ranking, \
 s.depth_cap AS space_depth_cap \
 FROM thread t \
 JOIN user u ON u.id = t.author_id \
 JOIN space s ON s.id = t.space_id \
-WHERE t.id = ?1";
+WHERE t.public_id = ?1";
 
 /// The read-path query. `path > ?2` is an indexed range scan on `idx_post_thread_path`,
 /// not a sort: SQLite walks the index in order and stops at LIMIT.
 ///
 /// `body_md` is intentionally absent; see the note on [`Post::body_md`].
+/// Note the subquery rather than a literal thread id.
+///
+/// The URL carries a `public_id`, but posts are keyed by the integer `thread_id`. Resolving
+/// the public id in the Worker first would mean a second round trip, undoing the batching this
+/// module exists to protect. Folding the resolution into a scalar subquery keeps both
+/// statements in one `batch()`: the subquery is a single probe of `idx_thread_public_id`,
+/// which is the "+1 row read per pageview" that DESIGN.md §4.2 budgets for.
 const POSTS_SQL: &str = "\
 SELECT p.id, p.thread_id, p.parent_id, p.path, p.depth, p.author_id, \
 u.name AS author_name, p.body_html, p.created_at, p.edited_at, p.score, p.state \
 FROM post p \
 JOIN user u ON u.id = p.author_id \
-WHERE p.thread_id = ?1 AND p.path > ?2 \
+WHERE p.thread_id = (SELECT id FROM thread WHERE public_id = ?1) AND p.path > ?2 \
 ORDER BY p.path \
 LIMIT ?3";
 
@@ -48,6 +56,7 @@ const PATH_START: &str = "";
 #[derive(Deserialize)]
 struct ThreadRow {
     id: i64,
+    public_id: String,
     space_id: i64,
     kind: String,
     title: String,
@@ -138,7 +147,7 @@ impl D1Store {
     /// page render does not need a third query for `depth_cap`.
     pub async fn thread_page_with_space(
         &self,
-        thread: ThreadId,
+        thread: PublicId,
         page: Page,
     ) -> StoreResult<(Space, ThreadPage)> {
         let cursor = page
@@ -149,19 +158,19 @@ impl D1Store {
         // Over-fetch by one to detect "is there a next page?" without a second COUNT query.
         let fetch = page.limit.saturating_add(1);
 
-        // D1 rejects JS bigints (`D1_TYPE_ERROR: Type 'bigint' not supported`), so integer
-        // parameters cross the boundary as f64. Exact for every id below 2^53, which is
-        // seven orders of magnitude past what the 500MB D1 ceiling can hold.
-        let thread_param = (thread as f64).into();
+        // Both statements key off the public id, which crosses as TEXT. Integer parameters
+        // would need to cross as f64: D1 rejects JS bigints outright
+        // (`D1_TYPE_ERROR: Type 'bigint' not supported`).
+        let public = thread.encode();
         let thread_stmt = self
             .db
             .prepare(THREAD_SQL)
-            .bind(&[thread_param])
+            .bind(&[public.as_str().into()])
             .map_err(backend)?;
         let posts_stmt = self
             .db
             .prepare(POSTS_SQL)
-            .bind(&[(thread as f64).into(), cursor.into(), (fetch as f64).into()])
+            .bind(&[public.as_str().into(), cursor.into(), (fetch as f64).into()])
             .map_err(backend)?;
 
         // One round trip, two statements. This is the line that must not regress.
@@ -192,6 +201,14 @@ impl D1Store {
 
         let t = Thread {
             id: tr.id,
+            // Re-parsed rather than reusing the request's id: a row whose stored id does not
+            // round-trip is corrupt, and should say so instead of being papered over.
+            public_id: PublicId::parse(&tr.public_id).map_err(|e| {
+                StoreError::Corrupt(format!(
+                    "thread {} has invalid public_id {:?}: {e}",
+                    tr.id, tr.public_id
+                ))
+            })?,
             space_id: tr.space_id,
             kind: thread_kind(&tr.kind),
             title: tr.title,
@@ -257,7 +274,7 @@ impl D1Store {
 
 #[async_trait(?Send)]
 impl Store for D1Store {
-    async fn thread_page(&self, thread: ThreadId, page: Page) -> StoreResult<ThreadPage> {
+    async fn thread_page(&self, thread: PublicId, page: Page) -> StoreResult<ThreadPage> {
         self.thread_page_with_space(thread, page)
             .await
             .map(|(_, page)| page)
