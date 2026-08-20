@@ -11,8 +11,20 @@
 
 pub const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 pub const MIN_CHARS: usize = 16;
-pub const MAX_CHARS: usize = 25;
-pub const MAX_BITS: u32 = (MAX_CHARS as u32) * 5; // 125
+pub const MAX_CHARS: usize = 26;
+pub const MAX_PAYLOAD_BITS: u32 = 128;
+
+const fn reserved_bits(chars: usize) -> u32 {
+    (chars as u32 * 5).saturating_sub(MAX_PAYLOAD_BITS)
+}
+const fn payload_bits(chars: usize) -> u32 {
+    let raw = chars as u32 * 5;
+    if raw > MAX_PAYLOAD_BITS {
+        MAX_PAYLOAD_BITS
+    } else {
+        raw
+    }
+}
 pub const TIMESTAMP_BITS: u32 = 48;
 
 const INVALID: u8 = 0xFF;
@@ -51,8 +63,7 @@ impl PackedId {
         if !(MIN_CHARS..=MAX_CHARS).contains(&width) {
             return None;
         }
-        let total = width as u32 * 5;
-        let random_bits = total - TIMESTAMP_BITS;
+        let random_bits = payload_bits(width) - TIMESTAMP_BITS;
         let mask = if random_bits >= 128 {
             u128::MAX
         } else {
@@ -65,7 +76,7 @@ impl PackedId {
     }
 
     pub fn parse(s: &str) -> Option<Self> {
-        let mut bits: u128 = 0;
+        let mut digits: [u8; MAX_CHARS] = [0; MAX_CHARS];
         let mut width = 0usize;
         for ch in s.chars() {
             if !ch.is_ascii() {
@@ -75,35 +86,48 @@ impl PackedId {
                 SKIP => continue,
                 INVALID => return None,
                 d => {
-                    width += 1;
-                    if width > MAX_CHARS {
+                    if width >= MAX_CHARS {
                         return None;
                     }
-                    bits = (bits << 5) | d as u128;
+                    digits[width] = d;
+                    width += 1;
                 }
             }
         }
         if width < MIN_CHARS {
             return None;
         }
+        let reserved = reserved_bits(width);
+        if digits[width - 1] & ((1 << reserved) - 1) as u8 != 0 {
+            return None;
+        }
+        let head = digits[..width - 1]
+            .iter()
+            .fold(0u128, |acc, d| (acc << 5) | *d as u128);
         Some(PackedId {
-            bits,
+            bits: (head << (5 - reserved)) | (digits[width - 1] >> reserved) as u128,
             width: width as u8,
         })
     }
 
     pub fn encode(&self) -> String {
         let w = self.width as usize;
+        let reserved = reserved_bits(w);
         let mut out = String::with_capacity(w);
         for c in 0..w {
-            let shift = 5 * (w - 1 - c) as u32;
-            out.push(ALPHABET[((self.bits >> shift) & 31) as usize] as char);
+            let hi = 5 * (w - 1 - c) as u32;
+            let digit = if hi >= reserved {
+                self.bits >> (hi - reserved)
+            } else {
+                self.bits << (reserved - hi)
+            } & 31;
+            out.push(ALPHABET[digit as usize] as char);
         }
         out
     }
 
     pub fn timestamp_ms(&self) -> u64 {
-        (self.bits >> (self.width as u32 * 5 - TIMESTAMP_BITS)) as u64
+        (self.bits >> (payload_bits(self.width as usize) - TIMESTAMP_BITS)) as u64
     }
 
     pub fn width(&self) -> usize {
@@ -113,7 +137,7 @@ impl PackedId {
     /// Left-align to a common width so numeric order matches string order across widths, then
     /// break ties by width: a shorter id is a prefix of a longer one, and a prefix sorts first.
     fn normalized(&self) -> u128 {
-        self.bits << (MAX_BITS - self.width as u32 * 5)
+        self.bits << (MAX_PAYLOAD_BITS - payload_bits(self.width as usize))
     }
 }
 

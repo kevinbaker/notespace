@@ -200,10 +200,47 @@ integer comparison is fiddly and easy to get subtly wrong, and that it cannot ov
 
 What the packed experiment did change: `PublicId` now uses `u128` as its internal *primitive*
 even though it stores the string. `to_u128` and `from_u128` are exact at every width, and
-`timestamp_ms` and `random` are derived from them rather than walking the string bit by bit —
-which made `timestamp_ms` 3.4x faster than the original implementation. `MAX_CHARS` dropped from
-26 to 25 to make that exactness unconditional: 125 bits fits a `u128`, 130 would not. The cost is
-three bits of randomness fewer than a ULID, which nothing can observe.
+`timestamp_ms` and `random` derive from them rather than walking the string bit by bit — which
+made `timestamp_ms` 3.4x faster than the original implementation.
+
+## The widest width, and why the spare bits sit at the bottom
+
+Making the integer form exact needs the payload to stop at 128 bits, but 26 characters is 130
+bits of base32 space. Those two spare bits have to go somewhere, and the choice is load-bearing:
+
+| | 26-char rendering | chars shared with the 16-char id |
+|---|---|---|
+| top-aligned (canonical ULID) | `01jgfjjz00krvqkebz99y1a4hm` | **1** |
+| bottom-aligned (this format) | `06a1yabw02f3eydsfx57r58j6g` | **16** |
+
+Canonical ULID pads at the top, which shifts every character boundary along by two and destroys
+the prefix relationship the whole widening story rests on. Reserving at the bottom keeps the
+48-bit timestamp in the top bits at every width, so a 16-character id stays a literal prefix of
+a 26-character one. `parse` rejects a 26-character id whose reserved bits are set — such an id
+was never issued here, and the most likely cause is someone pasting a canonical ULID.
+
+The payload at 26 characters is then 48 bits of timestamp and **80 of randomness — exactly a
+ULID's budget**, since the two bits ULID spends on top padding are the two reserved at the bottom.
+
+## Importing a ULID or UUIDv7
+
+`from_ulid` / `from_uuid` / `from_u128_payload` import a full 128-bit id; `to_ulid` / `to_uuid`
+render it back. `cargo run -p notespace-core --example ids` prints the round trip:
+
+```
+UUIDv7  source text   01890a5d-ac96-774b-bcce-b302099a8057
+        stored as     064gmqdcjsvmqf6epc10k6m0aw   <- re-aligned, still one of ours
+        to_u128()     0x01890a5dac96774bbcceb302099a8057
+        timestamp_ms  1688096058518
+        back to UUID  01890a5d-ac96-774b-bcce-b302099a8057
+```
+
+**The value round-trips exactly; the text does not.** An imported id keeps all 128 bits and its
+real creation time — both formats put a 48-bit millisecond timestamp in the top bits — but it is
+stored re-aligned, so its rendered form is not the canonical ULID string. That is the deliberate
+trade: an exact value *and* prefix-stable widening, rather than byte-identical text. Imported ids
+sort and interleave correctly with natively generated ones, which is what the M5 import path
+(§8) needs and what top-alignment would have cost.
 
 The packed implementation is kept in `crates/bench-wasm/src/packed.rs` so the comparison stays
 reproducible via `./scripts/spike.sh`. If a future workload ever became parse-heavy and

@@ -377,15 +377,23 @@ order, and mixed-width ids sort correctly with no special handling:
 same timestamp, three widths
   16 chars ( 80 bits, 32 random)   06a1yabw00000000
   20 chars (100 bits, 52 random)   06a1yabw000000000000
-  25 chars (125 bits, 77 random)   06a1yabw00000000000000000
+  26 chars (128 bits, 80 random)   06a1yabw0000000000000000000
 ```
 
-25 characters is the ceiling, and it is chosen rather than inherited: 125 bits fits a `u128`, so
-every id has an exact integer form via `PublicId::to_u128`. 26 characters would be 130 bits and
-would make that form fallible or lossy, for three more bits of randomness than a ULID has — a
-trade with no upside.
+26 characters is the ceiling: 130 bits of encoding space carrying a 128-bit payload, with the two
+spare bits **reserved at the bottom and always zero**. That cap makes `PublicId::to_u128` total
+and exact, and it means a full ULID or UUIDv7 imports without loss — at 26 characters the payload
+is 48 bits of timestamp and 80 of randomness, exactly a ULID's budget.
 
-`crates/core/src/id.rs` already parses any width in 16-25 characters even though this build only
+Bottom is the only place the spare bits can go. Canonical ULID puts them at the top, which shifts
+every character boundary and destroys the prefix relationship (1 character in common with a
+16-character id, against 16 when bottom-aligned).
+
+`from_ulid` / `from_uuid` / `to_ulid` / `to_uuid` cover the M5 import path. The *value* round-trips
+exactly and an imported UUIDv7 keeps its real creation time; the *text* does not, since the id is
+stored re-aligned. Exact value plus prefix-stable widening, rather than byte-identical text.
+
+`crates/core/src/id.rs` already parses any width in 16-26 characters even though this build only
 generates 16, so **a future instance can widen its generated ids with no change to the parser and
 no stranded URLs**. Making the generated width a per-instance setting is therefore a small change:
 generation picks a width, parsing already accepts them all. `mixed_width_ids_sort_by_creation_time`
@@ -397,9 +405,9 @@ character boundary. Ids in the two formats then share no prefix even for the sam
 and a mixed set stops sorting by time:
 
 ```
-  ours     (16)   06a1yabw00000000
-  ULID     (26)   01jgfjjz000000000000000000   <- 1 char in common; re-aligned
-  appended (25)   06a1yabw00000000000000000    <- all 16 in common; safe
+  native   (16)   06a1yabw02f3eyds
+  top-aligned     01jgfjjz00krvqkebz99y1a4hm   <- canonical ULID:  1 char in common
+  bottom-aligned  06a1yabw02f3eydsfx57r58j6g   <- ours:            16 chars in common
 ```
 
 That is a difference of encoding alignment, not of alphabet — both are base32. Widening our own

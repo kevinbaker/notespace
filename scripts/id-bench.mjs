@@ -9,7 +9,7 @@ const N = 2000;
 const n = wasm.id_setup(N);
 const bad = wasm.id_cross_check();
 console.log(`\nPUBLIC ID REPRESENTATION: canonical String vs packed u128`);
-console.log(`${n} ids at mixed widths (16/18/20/22/25).`);
+console.log(`${n} ids at mixed widths (16/18/20/22/26).`);
 console.log(`cross-check mismatches: ${bad}` + (bad === 0 ? '  (representations agree)' : '  <-- TIMINGS INVALID'));
 if (bad !== 0) process.exit(1);
 

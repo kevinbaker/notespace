@@ -195,8 +195,7 @@ thread_local! {
 /// Build `n` ids at mixed widths in both representations.
 #[wasm_bindgen]
 pub fn id_setup(n: usize) -> usize {
-    // 25 is the packed representation's ceiling; compare over a range both support.
-    const WIDTHS: [usize; 5] = [16, 18, 20, 22, 25];
+    const WIDTHS: [usize; 5] = [16, 18, 20, 22, 26];
     let base: u64 = 1_735_689_600_000;
     let (mut a, mut b, mut canon, mut messy) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for i in 0..n as u64 {
