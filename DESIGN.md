@@ -420,91 +420,87 @@ put the timestamp in the high bits. A hard switch to canonical ULID would still 
 operationally; it would only forfeit a property nothing uses. The append rule is what keeps the
 option open for free.
 
-### 4.4 Spaces and users are addressed by name
+### 4.4 Three different things were called "slug"
 
-Threads get an opaque id; spaces and users do not. `/s/sports/hockey`, `/u/testuser`. `/s/` and
-`/u/` are route prefixes — the slug is everything after them.
+They are not the same, and one type for all three was wrong for all three:
 
-**Space slugs are unique per parent**, so `sports/general` and `music/general` coexist and the URL
-carries the whole path. Resolution is one indexed lookup on a materialized `space.path`, the same
-trick `post.path` uses. Measured at depth 3:
+| | resolves the thing? | mutable? | unique? | type |
+|---|---|---|---|---|
+| thread title text, `/t/{id}/{slug}` | **no** — decorative | freely | never | *none needed* |
+| username, `/u/testuser` | yes | **never** | globally | `core::username::Username` |
+| space name, `/s/sports/hockey` | yes | yes, with a redirect | per parent | `core::space_key::SpaceKey` |
+
+The first is not modelled at all. `/t/{id}/anything-at-all` serves the same thread because the id
+resolves it; the trailing text is for readers and search engines. Retitling cannot break a link.
+
+The other two resolve, so they are validated — but their policies differ enough that they are
+**separate types with separate reserved lists**. They share only the character rules, and only
+because duplicating a charset check is how two of them drift apart.
+
+Normalization is **case, and only case**. `test-user` and `testuser` are two different names, as
+they are on GitHub. The stored text is already canonical, so there is no `*_canonical` column
+anywhere. The defence that remains is the ASCII restriction — a rejection rather than a fold,
+which kills every Cyrillic and Greek homoglyph outright, those being the invisible ones.
+
+### 4.5 Usernames are permanent
+
+There is no rename operation. Someone who wants a different name signs up again.
+
+A renameable username is a reusable one, and a reusable one is an impersonation vector: every old
+link, quote and `@mention` naming `alice` silently starts pointing at whoever claims it next. A
+forum is an archive — a thread from four years ago is still cited, and its attributions must keep
+meaning what they meant. Making the name permanent removes the whole class, along with the
+redirect table, reclaim-window policy and tombstones that would otherwise be needed to contain it.
+
+The name therefore stays taken after the account is gone: deletion sets `user.state` rather than
+removing the row. An old `/u/` link to a deleted account 404s. It never resolves to a different
+person.
+
+### 4.6 Spaces are hierarchical, and rename via one nullable column
+
+`/s/sports/hockey`, unique **per parent**, so `sports/general` and `music/general` coexist.
+Resolution is one indexed lookup on a materialized `space.path` — the same trick `post.path`
+uses. Measured at depth 3:
 
 | resolution strategy | time | D1 queries |
 |---|---|---|
-| one query per level (naive walk) | 32.9 µs | **3** (scales with depth) |
+| one query per level (naive walk) | 32.9 µs | **3** — scales with depth |
 | **materialized path** | **1.6 µs** | **1** |
-| flat global slug | 1.7 µs | 1 |
+| flat global name | 1.7 µs | 1 |
 | load whole tree, resolve in memory | 79.6 µs | 1 |
 
-Per-parent uniqueness therefore costs nothing at read time — the materialized path is exactly as
-fast as a flat global slug, and the walk is what §9's "no per-request query without justification"
-rule exists to prevent. Nesting is capped at 3 levels (`MAX_SPACE_DEPTH`).
+Per-parent uniqueness therefore costs nothing versus a flat namespace. Nesting caps at 3 levels.
+Subtree listing is a range scan, not a recursive CTE: **294 µs against 2634 µs**, and the CTE
+builds throwaway indexes at runtime.
 
-Listing a subtree is a range scan over the path, not a recursive CTE:
-
-| subtree listing | time |
-|---|---|
-| own threads only | 17 µs |
-| **path prefix range** | **294 µs** |
-| recursive CTE | 2634 µs (9x slower; builds throwaway indexes at runtime) |
+Spaces *do* rename, unlike usernames — a space is a place, not an identity, and no post is
+attributed to one in a way a rename could falsify. What that needs is a redirect, and it is **one
+nullable `moved_to_id`**, not a history table. Renaming rewrites the row's path; if the old URL
+should keep working, a tombstone row is left behind pointing at the new one. The lookup that
+resolves any path already finds it, so a redirect costs **zero extra queries** — and an instance
+that does not care lets old paths 404 and stores nothing.
 
 #### Stored paths carry a trailing separator
 
-Not cosmetic. A slug may contain `-` (0x2D), which sorts **below** `/` (0x2F), so the obvious
-range over untrailed paths silently swallows siblings:
+Not cosmetic. A key may contain `-` (0x2D), which sorts **below** `/` (0x2F), so the obvious range
+over untrailed paths silently swallows siblings:
 
 ```
 ['sports', 'sports0')    ->  sports, sports-betting, sports/hockey   WRONG
 ['sports/', 'sports0')   ->  sports/, sports/hockey/                 right
 ```
 
-`subtree_range_bug_would_swallow_siblings` pins it.
+#### There is no `space.slug` column
 
-#### A slug is not an id, and that drives the rest
+The key is the last segment of the path; storing it twice invites drift. An inline
+`slug TEXT UNIQUE` would also be *globally* unique, which directly contradicts the per-parent
+rule — verified: it rejects `music/general` once `sports/general` exists, and because SQLite
+builds an unnameable auto-index for an inline `UNIQUE`, it cannot be dropped later without
+rebuilding the table.
 
-Three differences, each with a consequence:
-
-- **Mutable.** People rename. `space_path_history` keeps every old path redirecting; the internal
-  integer id never moved, so nothing else has to.
-- **Reusable.** This is the dangerous one. A released username must **never** be reclaimable —
-  every old link, mention and quote naming it would silently start pointing at whoever picked it
-  up. That is impersonation, not a broken link. `username_history` is a tombstone as much as a
-  redirect: a row there blocks the name permanently, even after the account is deleted.
-- **Chosen, not generated.** So it can be chosen adversarially. Two defences, in `core/slug.rs`:
-  ASCII-only, which kills Cyrillic homoglyphs outright, and a reserved list.
-
-#### Normalization is case, and only case
-
-`Slug::parse` lowercases and otherwise rejects rather than rewrites. Two names differing by
-anything more than case are two different names — `test-user` and `testuser` may both be claimed,
-as they may on GitHub.
-
-An earlier draft folded separators and `0`/`o`, `1`/`l` into a "skeleton" and enforced uniqueness
-on that. It is gone. Folding buys a little impersonation resistance and costs real names:
-`ice-hockey` and `icehockey` collapse into one space, and whoever wanted the second gets an error
-they cannot act on. Because the stored slug is already lowercase, there is no separate canonical
-column anywhere in the schema — the stored text *is* the canonical text.
-
-What still holds the line:
-
-- **ASCII only** — a rejection, not a fold, and the one that matters. Every Cyrillic and Greek
-  homoglyph attack dies here, and those are the invisible ones. `аdmin` with a Cyrillic а does
-  not parse.
-- **`RESERVED`** — names implying authority or colliding with a route. This list still folds
-  leetspeak (`adm1n`, `m0d3rator`), because against forty-odd words nobody needs, a false positive
-  costs nothing and it is how reserved names actually get claimed.
-- **Display-time signals** — account age, a "new account" marker. A naming rule cannot tell `rn`
-  from `m`; a UI can say "created today".
-
-This direction is one-way. Once `testuser` and `test-user` both exist, deciding later that they
-collide means renaming somebody. Loosening is easy; tightening is not.
-
-#### One SQLite footgun, avoided
-
-Uniqueness is indexed on the full path, not on `(parent_id, slug)`. SQLite treats NULLs as
-**distinct** in a unique index, so `UNIQUE(parent_id, slug)` allows two top-level spaces with the
-same slug — both have `parent_id IS NULL`. Verified, not assumed. The path already encodes the
-parent, so indexing it sidesteps the problem.
+Uniqueness is indexed on the full path rather than `(parent_id, key)` for a related reason:
+SQLite treats NULLs as **distinct** in a unique index, so the latter allows two top-level spaces
+with the same key. Also verified rather than assumed.
 
 
 ## 5. Moderation pipeline

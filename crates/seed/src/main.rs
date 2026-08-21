@@ -130,8 +130,8 @@ fn main() {
         }
 
         println!(
-            "INSERT INTO space (id, slug, name, ranking, depth_cap) \
-             VALUES (1, 'general', 'General', 'bump', 8);"
+            "INSERT INTO space (id, name, ranking, depth_cap, path) \
+             VALUES (1, 'General', 'bump', 8, 'general/');"
         );
         println!(
             "INSERT INTO thread (id, public_id, space_id, kind, title, author_id, created_at, \
@@ -253,7 +253,7 @@ fn main() {
 
     if json_mode {
         println!(
-            "{{\"space\":{{\"id\":1,\"slug\":\"general\",\"name\":\"General\",\
+            "{{\"space\":{{\"id\":1,\"path\":\"general/\",\"name\":\"General\",\
              \"parent_id\":null,\"ranking\":\"bump\",\"depth_cap\":8}},\
              \"thread\":{{\"id\":1,\"public_id\":\"{}\",\"space_id\":1,\"kind\":\"discussion\",\
              \"title\":\"Is a Rust forum on a free Cloudflare account actually viable?\",\

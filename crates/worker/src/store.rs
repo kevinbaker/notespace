@@ -21,7 +21,7 @@ use worker::D1Database;
 const THREAD_SQL: &str = "\
 SELECT t.id, t.public_id, t.space_id, t.kind, t.title, t.url, t.author_id, u.name AS author_name, \
 t.created_at, t.bumped_at, t.post_count, t.state, t.cache_version, \
-s.slug AS space_slug, s.name AS space_name, s.ranking AS space_ranking, \
+s.path AS space_path, s.name AS space_name, s.ranking AS space_ranking, \
 s.depth_cap AS space_depth_cap \
 FROM thread t \
 JOIN user u ON u.id = t.author_id \
@@ -68,7 +68,7 @@ struct ThreadRow {
     post_count: i64,
     state: String,
     cache_version: i64,
-    space_slug: String,
+    space_path: String,
     space_name: String,
     space_ranking: String,
     space_depth_cap: i64,
@@ -192,7 +192,7 @@ impl D1Store {
 
         let space = Space {
             id: tr.space_id,
-            slug: tr.space_slug,
+            path: tr.space_path,
             name: tr.space_name,
             parent_id: None,
             ranking: ranking(&tr.space_ranking),

@@ -19,7 +19,11 @@ pub type Timestamp = i64;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Space {
     pub id: SpaceId,
-    pub slug: String,
+    /// Materialized URL path, stored with a trailing separator: `"sports/hockey/"`. This is the
+    /// identifier -- there is no separate key column, since the key is the last segment. See
+    /// [`crate::space_key::SpacePath`].
+    pub path: String,
+    /// Display name, e.g. `"Ice Hockey"`. Never appears in a URL.
     pub name: String,
     pub parent_id: Option<SpaceId>,
     pub ranking: Ranking,

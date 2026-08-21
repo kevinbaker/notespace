@@ -17,7 +17,10 @@ CREATE TABLE IF NOT EXISTS user (
 
 CREATE TABLE IF NOT EXISTS space (
   id            INTEGER PRIMARY KEY,
-  slug          TEXT    NOT NULL UNIQUE,
+  -- Display name only. The URL identifier is `path`, added in 0003 -- there is no `slug`
+  -- column here, because the key is the last segment of the path and storing it twice invites
+  -- drift. An inline `slug TEXT UNIQUE` would also be GLOBALLY unique, which contradicts the
+  -- per-parent rule: `sports/general` and `music/general` are different spaces.
   name          TEXT    NOT NULL,
   parent_id     INTEGER REFERENCES space(id),
   ranking       TEXT    NOT NULL DEFAULT 'bump',   -- bump|gravity|best|score_threshold

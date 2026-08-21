@@ -37,7 +37,7 @@ pub fn thread_page(space: &Space, page: &ThreadPage) -> Markup {
                 header class="site" {
                     a href="/" { "notespace" }
                     " / "
-                    a href={ "/s/" (space.slug) } { (space.name) }
+                    a href={ "/s/" (space.path.trim_end_matches('/')) } { (space.name) }
                 }
                 main {
                     h1 class="thread-title" { (t.title) }
@@ -144,7 +144,7 @@ mod tests {
     fn space() -> Space {
         Space {
             id: 1,
-            slug: "general".into(),
+            path: "general/".into(),
             name: "General".into(),
             parent_id: None,
             ranking: Ranking::Bump,
