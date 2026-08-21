@@ -11,13 +11,9 @@ cargo install worker-build
 wrangler login
 ```
 
-Then put the database id into `wrangler.toml`, replacing `REPLACE_ME`:
-
-```bash
-wrangler d1 info notespace-dev        # prints the uuid
-```
-
-It is an identifier, not a secret, and belongs in version control. **The bindings in
+The database id is already in `wrangler.toml` (`wrangler d1 info notespace-dev` prints it if it
+ever needs re-checking). It is an identifier, not a secret, and belongs in version control.
+**The bindings in
 `wrangler.toml` replace whatever the dashboard has when you deploy**, so a wrong or missing id
 here points the deployed Worker at the wrong database — every page 500s with the route and
 binding both looking correct in the UI.

@@ -24,9 +24,8 @@ cwd = "crates/worker"
 # at the wrong database and every page 500s.
 binding = "DATABASE"
 database_name = "notespace-dev"
-# TODO: replace with the id from `wrangler d1 info notespace-dev`.
-# The other database (notespace, 343f5c82-f316-4538-b2e2-0fb9f1be8d64) is now unused.
-database_id = "REPLACE_ME"
+# The earlier `notespace` database (343f5c82-...) is unused; this is the dev one.
+database_id = "b8eef966-34ce-43e3-abd2-739e56d622d5"
 migrations_dir = "migrations"
 
 
