@@ -64,9 +64,14 @@ printf 'wasm:        %8.1f KB (%.1f KB gzipped)\n' \
   "$(gzip -c "$WASM" | wc -c | awk '{print $1/1024}')"
 
 step "Applying migrations + seed to local D1"
-for m in migrations/*.sql; do
-  $WRANGLER d1 execute notespace --local --file="$m" >/dev/null
-done
+# The local D1 is disposable, and this script must be re-runnable. Reset it rather than
+# replaying migrations over an existing schema: `ALTER TABLE ... ADD COLUMN` is not idempotent,
+# so a second run used to die on "duplicate column name".
+rm -rf .wrangler/state/v3/d1
+# Use wrangler's tracked migration runner, not a raw loop over the files. It applies each
+# migration once and records it, which is also what a real deploy does -- so this exercises the
+# `migrations_dir` config rather than working around it.
+$WRANGLER d1 migrations apply notespace --local >/dev/null
 cargo run -q -p notespace-seed -- "$POSTS" sql mixed > seed.sql
 $WRANGLER d1 execute notespace --local --file=seed.sql >/dev/null
 echo "seeded $POSTS posts"
