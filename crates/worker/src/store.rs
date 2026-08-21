@@ -42,7 +42,7 @@ WHERE t.public_id = ?1";
 /// statements in one `batch()`: the subquery is a single probe of `idx_thread_public_id`,
 /// which is the "+1 row read per pageview" that DESIGN.md §4.2 budgets for.
 const POSTS_SQL: &str = "\
-SELECT p.id, p.thread_id, p.parent_id, p.path, p.depth, p.author_id, \
+SELECT p.id, p.public_id, p.thread_id, p.parent_id, p.path, p.depth, p.author_id, \
 u.name AS author_name, p.body_html, p.created_at, p.edited_at, p.score, p.state \
 FROM post p \
 JOIN user u ON u.id = p.author_id \
@@ -96,9 +96,23 @@ struct ThreadRow {
     space_depth_cap: i64,
 }
 
+/// Where a post currently lives.
+#[derive(Debug, Clone)]
+pub struct PostLocation {
+    pub thread: PublicId,
+    pub path: Path,
+}
+
+#[derive(Deserialize)]
+struct PostLocationRow {
+    thread_public_id: String,
+    post_path: String,
+}
+
 #[derive(Deserialize)]
 struct PostRow {
     id: i64,
+    public_id: String,
     thread_id: i64,
     parent_id: Option<i64>,
     path: String,
@@ -208,6 +222,34 @@ impl D1Store {
         }
     }
 
+    /// Resolve a post's public id to the thread it currently lives in, and its page cursor.
+    ///
+    /// One query. The point of this indirection is that a post's thread can CHANGE -- splitting
+    /// and merging threads is routine moderation -- so a permalink cannot bake in a thread id
+    /// and stay correct. `/p/{id}` asks where the post is *now*.
+    pub async fn locate_post(&self, post: &PublicId) -> StoreResult<PostLocation> {
+        let stmt = self
+            .db
+            .prepare(
+                "SELECT t.public_id AS thread_public_id, p.path AS post_path \
+                 FROM post p JOIN thread t ON t.id = p.thread_id \
+                 WHERE p.public_id = ?1",
+            )
+            .bind(&[post.as_str().into()])
+            .map_err(backend)?;
+        let res = stmt.all().await.map_err(backend)?;
+        self.last_stats.set(collect_stats(&[&res]));
+        let rows: Vec<PostLocationRow> = res.results().map_err(backend)?;
+        let row = rows.into_iter().next().ok_or(StoreError::NotFound)?;
+        Ok(PostLocation {
+            thread: PublicId::parse(&row.thread_public_id).map_err(|e| {
+                StoreError::Backend(format!("thread has an unparseable public_id: {e}"))
+            })?,
+            path: Path::parse(&row.post_path)
+                .map_err(|e| StoreError::Backend(format!("post has an unparseable path: {e}")))?,
+        })
+    }
+
     /// Stats from the most recent query on this store.
     pub fn last_stats(&self) -> QueryStats {
         self.last_stats.get()
@@ -313,7 +355,12 @@ impl D1Store {
             let path = Path::parse(&r.path).map_err(|e| {
                 StoreError::Corrupt(format!("post {} has invalid path {:?}: {e}", r.id, r.path))
             })?;
+            let public_id = PublicId::parse(&r.public_id).map_err(|e| {
+                // A row that cannot round-trip its own id is corrupt, not merely unexpected.
+                StoreError::Backend(format!("post {} has an unparseable public_id: {e}", r.id))
+            })?;
             posts.push(Post {
+                public_id,
                 id: r.id,
                 thread_id: r.thread_id,
                 parent_id: r.parent_id,

@@ -94,6 +94,17 @@ fn json_string(s: &str) -> String {
     out
 }
 
+/// Deterministic public id for seeded post `i`.
+///
+/// One millisecond apart so the ids sort in the same order as the posts, which is what a real
+/// instance produces and what M0's index-locality result depends on.
+fn post_public_id(i: usize) -> String {
+    const SEED_BASE_MS: u64 = 1_735_689_600_000;
+    notespace_core::PublicId::new(SEED_BASE_MS + i as u64, 0x5EED_0000 ^ i as u32)
+        .expect("seed timestamp is in range")
+        .encode()
+}
+
 fn main() {
     let post_count: usize = std::env::args()
         .nth(1)
@@ -236,10 +247,11 @@ fn main() {
                 None => "NULL".to_string(),
             };
             println!(
-                "INSERT INTO post (id, thread_id, parent_id, path, depth, author_id, body_md, \
-                 body_html, created_at, score, state) VALUES ({}, 1, {}, '{}', {}, {}, '{}', '{}', \
-                 {}, 0, 'visible');",
+                "INSERT INTO post (id, public_id, thread_id, parent_id, path, depth, author_id, \
+                 body_md, body_html, created_at, score, state) VALUES ({}, '{}', 1, {}, '{}', {}, \
+                 {}, '{}', '{}', {}, 0, 'visible');",
                 i + 1,
+                post_public_id(*i),
                 parent_sql,
                 path.as_str(),
                 path.depth(),

@@ -52,7 +52,11 @@ pub fn thread_page(space: &Space, page: &ThreadPage) -> Markup {
                     ol class="posts" {
                         @for post in &page.posts {
                             @let indent = post.path.render_depth(space.depth_cap).min(MAX_INDENT);
-                            li class="post" id={ "p" (post.id) }
+                            // Anchors and permalinks use the PUBLIC id. An earlier version
+                            // emitted post.id here, which put the internal sequential integer
+                            // into every baked page -- leaking the post count and making the
+                            // table enumerable, which is the whole thing §4.2 exists to avoid.
+                            li class="post" id={ "p" (post.public_id) }
                                style={ "--indent:" (indent) }
                                data-depth=(indent) {
                                 div class="post-head" {
@@ -60,7 +64,10 @@ pub fn thread_page(space: &Space, page: &ThreadPage) -> Markup {
                                         (post.author_name)
                                     }
                                     " "
-                                    a class="permalink" href={ "#p" (post.id) } {
+                                    // A durable, thread-independent URL: /p/{id} keeps
+                                    // resolving after a split or merge moves the post, which
+                                    // an anchor scoped to this page would not.
+                                    a class="permalink" href={ "/p/" (post.public_id) } {
                                         time datetime=(post.created_at) { (post.created_at) }
                                     }
                                     @if post.edited_at.is_some() { span class="edited" { " (edited)" } }
@@ -83,7 +90,7 @@ pub fn thread_page(space: &Space, page: &ThreadPage) -> Markup {
                                     },
                                 }
                                 div class="post-actions" {
-                                    a href={ "/p/" (post.id) "/reply" } { "reply" }
+                                    a href={ "/p/" (post.public_id) "/reply" } { "reply" }
                                 }
                             }
                         }
@@ -174,6 +181,7 @@ mod tests {
         let path = Path::parse(path).unwrap();
         Post {
             id,
+            public_id: PublicId::new(1_735_689_600_000 + id as u64, id as u32).unwrap(),
             thread_id: 42,
             parent_id: None,
             depth: path.depth() as u32,
@@ -202,7 +210,41 @@ mod tests {
         let p = page(vec![post(1, "0001", PostState::Visible, "<p>hi</p>")]);
         let html = thread_page(&space(), &p).into_string();
         assert!(html.contains("<p>hi</p>"));
-        assert!(html.contains(r#"id="p1""#));
+        let pid = p.posts[0].public_id.as_str();
+        assert!(html.contains(&format!(r#"id="p{pid}""#)));
+    }
+
+    /// Internal row ids are not for publication. A baked page carrying sequential integers
+    /// would leak the post count and make the table enumerable, which is exactly what the
+    /// two-tier id scheme in DESIGN.md §4.2 exists to prevent. This caught a real leak: the
+    /// permalink anchor used to be `id="p{post.id}"`.
+    #[test]
+    fn baked_page_never_exposes_internal_row_ids() {
+        let mut posts = Vec::new();
+        for i in 1..=4i64 {
+            posts.push(post(i, &format!("{i:04}"), PostState::Visible, "<p>x</p>"));
+        }
+        let p = page(posts);
+        let html = thread_page(&space(), &p).into_string();
+        for post in &p.posts {
+            assert!(
+                html.contains(post.public_id.as_str()),
+                "public id {} missing from the page",
+                post.public_id
+            );
+            for pattern in [
+                format!(r#"id="p{}""#, post.id),
+                format!(r#"href="/p/{}""#, post.id),
+                format!(r##"href="#p{}""##, post.id),
+            ] {
+                assert!(
+                    !html.contains(&pattern),
+                    "internal row id leaked: {pattern}"
+                );
+            }
+        }
+        // The thread's own internal id likewise.
+        assert!(!html.contains(&format!(r#"/t/{}"#, p.thread.id)));
     }
 
     #[test]

@@ -503,6 +503,67 @@ SQLite treats NULLs as **distinct** in a unique index, so the latter allows two 
 with the same key. Also verified rather than assumed.
 
 
+### 4.7 Posts get a public id too
+
+Every post carries one, at the same 16-character width threads use.
+
+A post's other address is `(thread_id, path)` — and both halves encode *which thread*. Splitting
+and merging threads is routine moderation, so a permalink built on either breaks the moment a
+moderator acts. A global id survives the move. Same argument as a thread id surviving a retitle,
+one level down.
+
+`GET /p/{id}` resolves where the post lives *now* (one query) and 302s to that thread page,
+anchored. 302 rather than 301 because the target legitimately changes when a post moves.
+
+**Known limitation:** the redirect lands on page 1 and relies on the fragment, so on a thread
+longer than one page the reader arrives at the top. The obvious shortcut — deriving a cursor by
+truncating the post's path — is wrong, because an earlier sibling with a large subtree can still
+push the post off the page. Proper "which page contains this path" belongs with pagination in M2.
+
+Measured cost, at 200k posts: **+46 B per post**, ~17 B in the row and ~29 B in the unique
+index. Against a row that still holds its body that is +2.6%; against a metadata-only row it is
++53%. Read path is unaffected — `rows_read` for a 200-post page stays at 404 either way, since
+nothing on the read path consults the index.
+
+Not nullable-and-promoted. Minting on first use would save ~50 B on posts nobody links to, at
+the cost of a write on the read path and a race between two simultaneous linkers — and the
+saving disappears entirely under §4.8 anyway.
+
+An earlier revision of this document argued *against* post ids, on the grounds that 5M posts
+would cost 135 MB of a 500 MB ceiling. The arithmetic was right and the premise was wrong: 5M
+posts of body text alone is 5 GB, ten times over the ceiling, so that scenario cannot occur.
+
+### 4.8 D1 holds the working set, R2 holds the corpus
+
+The above only works because D1 stops being where everything lives.
+
+Rendered HTML is already baked to R2 (§3.3). Extending that to whole archived threads — rather
+than only their bodies — changes the capacity picture entirely:
+
+| model | B/post | posts on the free tier | limit |
+|---|---|---|---|
+| D1 only, bodies inline | 1077 | 486,804 | 500 MB D1 |
+| R2 archive, html + markdown | 1112 | 9,651,612 | 10 GB R2 |
+| **R2 archive, gzipped** | **441** | **24,355,895** | 10 GB R2 |
+
+**50x the corpus.** Forum HTML compresses extraordinarily well — the measured 200-post page goes
+from 145,926 to 8,720 bytes, **16.3x** — because it is mostly repeated markup.
+
+An archived thread keeps a stub row in D1 so it still appears in listings and search. Stubs are
+cheap: 5M posts' worth is ~24 MB, under 5% of the D1 ceiling.
+
+The read path for an archived thread is *cheaper* than for a live one, not more expensive: if
+the R2 key is derived from the thread's public id, resolving one is Cache API → R2, with **zero
+D1 queries**. That is the strongest argument for public ids doing double duty as storage keys.
+
+What this costs, and what still has to be designed (M6):
+
+- **Search.** FTS5 lives in D1. Archived bodies are not in it unless an index is kept behind.
+- **Replies to an archived thread** need rehydration, or the thread is closed on archive.
+- **R2 class-A operations** are 1M/month free; one write per bake is comfortable, but a
+  rebake-everything migration is not.
+
+
 ## 5. Moderation pipeline
 
 Runs asynchronously off the request path. You do not have 10ms to spare for an LLM call.

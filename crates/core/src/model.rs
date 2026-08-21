@@ -105,6 +105,12 @@ pub struct Thread {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Post {
     pub id: PostId,
+    /// Opaque, time-sortable public id (DESIGN.md §4.7).
+    ///
+    /// A post's other address, `(thread_id, path)`, encodes which thread it is in, so a split
+    /// or merge invalidates it. This one survives the move, which is what makes a permalink
+    /// durable.
+    pub public_id: PublicId,
     pub thread_id: ThreadId,
     pub parent_id: Option<PostId>,
     pub path: Path,

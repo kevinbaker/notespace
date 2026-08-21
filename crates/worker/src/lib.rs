@@ -45,6 +45,7 @@ fn router(env: Env) -> Router {
         .route("/healthz", get(healthz))
         .route("/t/{id}", get(thread_page))
         .route("/t/{id}/{slug}", get(thread_page_slug))
+        .route("/p/{id}", get(post_permalink))
         .with_state(env)
 }
 
@@ -68,6 +69,49 @@ async fn thread_page(
     query: Query<PageQuery>,
 ) -> Response {
     render_thread(state, id, None, query).await
+}
+
+/// A durable permalink to a single post.
+///
+/// Resolves where the post lives *now* and redirects to that thread page, anchored at the post.
+/// The indirection is the point: splitting or merging threads moves a post between threads, and
+/// a link that baked in the thread id would break. This one does not.
+///
+/// 302 rather than 301 -- the target legitimately changes when a post is moved, so this must
+/// not be cached permanently by browsers.
+#[worker::send]
+async fn post_permalink(State(env): State<Env>, UrlPath(id): UrlPath<String>) -> Response {
+    let post_id = match PublicId::parse(&id) {
+        Ok(p) => p,
+        Err(e) => return error(StatusCode::BAD_REQUEST, &format!("bad post id: {e}")),
+    };
+    let db = match env.d1(DB_BINDING) {
+        Ok(db) => db,
+        Err(e) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("no D1 binding: {e}"),
+            )
+        }
+    };
+    match D1Store::new(db).locate_post(&post_id).await {
+        Ok(loc) => {
+            // KNOWN LIMITATION: this lands on page 1 and relies on the fragment. For a thread
+            // longer than one page the anchor will not be present and the reader arrives at
+            // the top.
+            //
+            // Doing better needs "which page contains this path?", and the obvious shortcut --
+            // deriving a cursor by truncating the post's path -- is wrong: an earlier sibling
+            // with a large subtree can still push the post off the page. That belongs with
+            // real pagination in M2, not a cursor trick that fails on exactly the deep threads
+            // permalinks matter most for.
+            let _ = &loc.path;
+            let target = format!("/t/{}#p{post_id}", loc.thread);
+            (StatusCode::FOUND, [(header::LOCATION, target)]).into_response()
+        }
+        Err(StoreError::NotFound) => error(StatusCode::NOT_FOUND, "no such post"),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
 }
 
 /// `#[worker::send]` wraps the future so axum's `Send` bound is satisfied. Workers are
