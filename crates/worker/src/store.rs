@@ -10,12 +10,14 @@
 //! `D1Database::batch` sends both in one request, so the invocation costs two queries
 //! against the 50 budget and one network round trip against the CPU budget.
 
+use core::cell::Cell;
 use notespace_core::id::PublicId;
 use notespace_core::model::*;
 use notespace_core::path::Path;
 use notespace_core::store::{async_trait, Page, Store, StoreError, StoreResult};
+
 use serde::Deserialize;
-use worker::D1Database;
+use worker::{D1Database, D1Result, D1ResultMeta};
 
 /// Columns for the thread header. Deliberately narrow.
 const THREAD_SQL: &str = "\
@@ -52,6 +54,26 @@ LIMIT ?3";
 /// Using a sentinel keeps the SQL identical for the first page and every later page, which
 /// keeps D1's prepared-statement cache warm.
 const PATH_START: &str = "";
+
+/// Sum D1's per-statement meta into one figure per request.
+///
+/// A statement whose meta is absent contributes nothing rather than zero, so a partial report
+/// cannot masquerade as a complete one: if any statement is missing a field, the total for that
+/// field stays `None`.
+fn collect_stats(results: &[&D1Result]) -> QueryStats {
+    let metas: Vec<_> = results.iter().map(|r| r.meta().ok().flatten()).collect();
+    let all = |f: fn(&D1ResultMeta) -> Option<f64>| -> Option<f64> {
+        metas
+            .iter()
+            .map(|m| m.as_ref().and_then(f))
+            .try_fold(0.0, |acc, v| v.map(|v| acc + v))
+    };
+    QueryStats {
+        statements: results.len() as u32,
+        rows_read: all(|m| m.rows_read.map(|v| v as f64)).map(|v| v as usize),
+        duration_ms: all(|m| m.duration),
+    }
+}
 
 #[derive(Deserialize)]
 struct ThreadRow {
@@ -134,13 +156,61 @@ fn backend<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(e.to_string())
 }
 
+/// What D1 reported about the queries behind one page render.
+///
+/// `rows_read` is the number M0 could only *derive* from the query plan: D1 reports it in
+/// production and leaves it `None` under `wrangler dev --local`, where the database is an
+/// in-process SQLite rather than a service. `duration` is likewise the real round trip,
+/// which local mode cannot show at all because there is no network in the path.
+///
+/// Reported per request via `Server-Timing`, so the first production deploy answers the
+/// open questions in docs/M0-findings.md instead of restating the local numbers.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QueryStats {
+    /// Statements in the batch. Must stay at 2 — the D1 free tier allows 50 per invocation,
+    /// and the whole read-path design rests on not going per-post.
+    pub statements: u32,
+    /// Summed across statements. `None` under local dev.
+    pub rows_read: Option<usize>,
+    /// Summed across statements, in milliseconds. `None` under local dev.
+    pub duration_ms: Option<f64>,
+}
+
+impl QueryStats {
+    /// `Server-Timing` value, readable in browser devtools and by `curl -D-`.
+    pub fn server_timing(&self) -> String {
+        let mut out = format!("d1;desc=\"statements={}\"", self.statements);
+        if let Some(rows) = self.rows_read {
+            out.push_str(&format!(", d1_rows;desc=\"rows_read={rows}\""));
+        }
+        if let Some(ms) = self.duration_ms {
+            out.push_str(&format!(", d1_query;dur={ms}"));
+        }
+        out
+    }
+}
+
 pub struct D1Store {
     db: D1Database,
+    /// Stats from the most recent query, for the handler to read afterwards.
+    ///
+    /// Interior mutability rather than a return-value change on purpose: `Store` is the seam
+    /// the dual-target promise rests on (DESIGN.md §3.1), and D1's telemetry has no business
+    /// in its signatures. A native SQLite adapter reports different things, or nothing.
+    last_stats: Cell<QueryStats>,
 }
 
 impl D1Store {
     pub fn new(db: D1Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            last_stats: Cell::new(QueryStats::default()),
+        }
+    }
+
+    /// Stats from the most recent query on this store.
+    pub fn last_stats(&self) -> QueryStats {
+        self.last_stats.get()
     }
 
     /// The `Space` the last-fetched thread belongs to, carried alongside the thread so the
@@ -186,6 +256,11 @@ impl D1Store {
         let thread_res = results.pop().ok_or_else(|| {
             StoreError::Backend("batch returned fewer results than statements".into())
         })?;
+
+        // Record what D1 reported before consuming the results. Both fields are None under
+        // local dev; in production they are the real numbers.
+        self.last_stats
+            .set(collect_stats(&[&thread_res, &posts_res]));
 
         let thread_rows: Vec<ThreadRow> = thread_res.results().map_err(backend)?;
         let tr = thread_rows.into_iter().next().ok_or(StoreError::NotFound)?;

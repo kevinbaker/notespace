@@ -71,13 +71,13 @@ rm -rf .wrangler/state/v3/d1
 # Use wrangler's tracked migration runner, not a raw loop over the files. It applies each
 # migration once and records it, which is also what a real deploy does -- so this exercises the
 # `migrations_dir` config rather than working around it.
-$WRANGLER d1 migrations apply notespace --local >/dev/null
+$WRANGLER d1 migrations apply notespace-dev --local >/dev/null
 cargo run -q -p notespace-seed -- "$POSTS" sql mixed > seed.sql
-$WRANGLER d1 execute notespace --local --file=seed.sql >/dev/null
+$WRANGLER d1 execute notespace-dev --local --file=seed.sql >/dev/null
 echo "seeded $POSTS posts"
 
 step "Query plan for the thread-page read (index range scan + covering-index id probe)"
-$WRANGLER d1 execute notespace --local --json --command="EXPLAIN QUERY PLAN \
+$WRANGLER d1 execute notespace-dev --local --json --command="EXPLAIN QUERY PLAN \
   SELECT p.id FROM post p JOIN user u ON u.id=p.author_id \
   WHERE p.thread_id=(SELECT id FROM thread WHERE public_id=(SELECT public_id FROM thread LIMIT 1)) \
   AND p.path>'' ORDER BY p.path LIMIT 201" \

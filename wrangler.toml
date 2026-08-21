@@ -1,19 +1,48 @@
-name = "notespace"
+# Matches the Worker already created in the dashboard and wired to dev.notespace.org.
+# `wrangler deploy` targets the Worker with THIS name -- deploying under a different name
+# creates a second Worker and leaves the routed one serving its placeholder.
+name = "notespace-dev"
 main = "crates/worker/build/worker/shim.mjs"
 compatibility_date = "2025-08-01"
 
-# The M0 spike. `wrangler dev` runs this against a local SQLite-backed D1.
+# Runs on `wrangler dev` and `wrangler deploy` from a machine that has Rust.
+#
+# It does NOT run in Cloudflare's own build environment (Workers Builds / the dashboard's Git
+# integration): that image ships Node, not rustup, cargo or worker-build, so a dashboard-driven
+# build of this project fails and the Worker keeps serving whatever it had. Deploy from a
+# developer machine or from CI that installs Rust. See docs/DEPLOY.md.
 [build]
 command = "worker-build --release"
 cwd = "crates/worker"
 
 [[d1_databases]]
-binding = "DB"
-database_name = "notespace"
-# Placeholder: replace with the real id from `wrangler d1 create notespace` before deploying.
-database_id = "00000000-0000-0000-0000-000000000000"
+# `binding` must match DB_BINDING in crates/worker/src/lib.rs. A mismatch fails at runtime with
+# "no D1 binding", not at build time.
+#
+# These bindings REPLACE whatever is configured in the dashboard when you `wrangler deploy`, so
+# database_id below must be the real notespace-dev id -- a stale one points the deployed Worker
+# at the wrong database and every page 500s.
+binding = "DATABASE"
+database_name = "notespace-dev"
+# TODO: replace with the id from `wrangler d1 info notespace-dev`.
+# The other database (notespace, 343f5c82-f316-4538-b2e2-0fb9f1be8d64) is now unused.
+database_id = "REPLACE_ME"
 migrations_dir = "migrations"
 
+
+# Also expose <name>.<subdomain>.workers.dev alongside the custom domain. Useful for comparing
+# numbers, and it works even if the custom domain is misconfigured.
+workers_dev = true
+
+# dev.notespace.org is currently attached to this Worker via the dashboard, and is left that
+# way deliberately: wrangler only manages routes it is told about, so an undeclared route
+# survives a deploy untouched. To bring it under version control instead, uncomment below --
+# but only once a deploy has succeeded, since a custom_domain that already exists elsewhere
+# makes the deploy fail rather than adopt it.
+#
+# routes = [
+#   { pattern = "dev.notespace.org", custom_domain = true }
+# ]
 
 [observability]
 enabled = true

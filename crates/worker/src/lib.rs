@@ -19,7 +19,9 @@ use tower_service::Service;
 use worker::{event, Context, Env, HttpRequest, Result as WorkerResult};
 
 /// Name of the D1 binding in wrangler.toml.
-const DB_BINDING: &str = "DB";
+/// Must match the `binding` name in `wrangler.toml` (and any binding configured in the
+/// dashboard). A mismatch surfaces at runtime as "no D1 binding", never at build time.
+const DB_BINDING: &str = "DATABASE";
 
 /// Posts per page. 200 is the number DESIGN.md §8 names as the spike target: if a page this
 /// size does not fit the budget, the free-tier premise fails.
@@ -129,7 +131,10 @@ async fn render_thread(
     match store.thread_page_with_space(thread_id, page).await {
         Ok((space, page)) => {
             let html = notespace_render::thread_page(&space, &page).into_string();
-            (
+            // What D1 actually reported for this request. Empty-ish locally, real in
+            // production -- see QueryStats.
+            let stats = store.last_stats();
+            let mut resp = (
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, "text/html; charset=utf-8"),
@@ -149,7 +154,14 @@ async fn render_thread(
                 ],
                 Html(html),
             )
-                .into_response()
+                .into_response();
+            // Inserted after building rather than in the array above, which is homogeneous
+            // over &'static str while this value is per-request.
+            if let Ok(v) = stats.server_timing().parse() {
+                resp.headers_mut()
+                    .insert(header::HeaderName::from_static("server-timing"), v);
+            }
+            resp
         }
         Err(StoreError::NotFound) => error(StatusCode::NOT_FOUND, "no such thread"),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),

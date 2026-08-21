@@ -17,7 +17,7 @@ size budget**.
 | Worker CPU / request | 10 ms | **0.048 ms** p50, 0.109 ms p99 | ~90x at p99 |
 | Worker script size | 3 MB | **139.6 KB** gzipped | 22x |
 | D1 queries / invocation | 50 | **2**, in one batched round trip | 25x |
-| D1 rows read / page | — | ~403 (derived, see caveats) | — |
+| D1 rows read / page | 5M/day | **404** (observed via `Server-Timing`) | — |
 
 Rendering a 200-post thread page costs roughly **one two-hundredth** of the per-request CPU
 allowance. The original worry behind M0 — that wasm rendering would blow the 10 ms limit —
@@ -261,26 +261,32 @@ order and stops at `LIMIT`. Confirmed against the trace, which shows exactly **o
 span per request**, not one per post. The N+1 failure mode DESIGN.md §3.1 warns about is
 absent, and there is now a query-plan assertion in `scripts/spike.sh` to keep it that way.
 
-### Caveat on rows read
+### Rows read
 
-**`rows_read` was not measured.** D1 only reports it in production; local D1 returns just
-`duration`. The estimate below is derived from the query plan, not observed:
+**Measured: 404 rows per uncached 200-post pageview.** The Worker now reports D1's own
+`rows_read` and `duration` on every response via `Server-Timing` (see `QueryStats` in
+`crates/worker/src/store.rs`), so this is observed rather than inferred.
+
+An earlier revision of this document claimed D1 reports `rows_read` only in production and
+estimated ~403 from the query plan. The first half was wrong — miniflare populates it locally
+too — and the estimate turned out to be right to within one row:
 
 - posts query: ~200 post rows + ~200 `user` rowid lookups
 - thread query: ~3 rows (thread + author + space)
-- **~403 rows per uncached 200-post pageview**
+- estimated **~403**, measured **404**
 
 Against the 5M rows/day free allowance that is ~12,400 such pageviews/day. Most real threads
 are far smaller: at ~30 posts a page costs ~65 rows, or ~77,000 pageviews/day — at which
 point the **100k Worker requests/day cap binds first**.
 
-So for a small forum the free tier is limited by request count, not by CPU or by D1. Verify
-`rows_read` on a real D1 instance before treating those numbers as firm.
+So for a small forum the free tier is limited by request count, not by CPU or by D1. Still
+worth confirming against a deployed instance that Cloudflare's accounting matches the
+emulator's; `docs/DEPLOY.md` covers how.
 
 **Cheap win available:** denormalising `author_name` onto `post` would drop the `user` join
 and roughly halve rows read per page. Not done yet — it trades correctness-on-rename for
-budget, and should be decided with a real `rows_read` figure in hand rather than this
-estimate.
+budget, and now has a real `rows_read` figure to be decided against: the `user` join is
+roughly half of the 404.
 
 ## What this means for the free tier
 
