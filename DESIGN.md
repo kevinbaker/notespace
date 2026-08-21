@@ -420,6 +420,79 @@ put the timestamp in the high bits. A hard switch to canonical ULID would still 
 operationally; it would only forfeit a property nothing uses. The append rule is what keeps the
 option open for free.
 
+### 4.4 Spaces and users are addressed by name
+
+Threads get an opaque id; spaces and users do not. `/s/sports/hockey`, `/u/testuser`. `/s/` and
+`/u/` are route prefixes — the slug is everything after them.
+
+**Space slugs are unique per parent**, so `sports/general` and `music/general` coexist and the URL
+carries the whole path. Resolution is one indexed lookup on a materialized `space.path`, the same
+trick `post.path` uses. Measured at depth 3:
+
+| resolution strategy | time | D1 queries |
+|---|---|---|
+| one query per level (naive walk) | 32.9 µs | **3** (scales with depth) |
+| **materialized path** | **1.6 µs** | **1** |
+| flat global slug | 1.7 µs | 1 |
+| load whole tree, resolve in memory | 79.6 µs | 1 |
+
+Per-parent uniqueness therefore costs nothing at read time — the materialized path is exactly as
+fast as a flat global slug, and the walk is what §9's "no per-request query without justification"
+rule exists to prevent. Nesting is capped at 3 levels (`MAX_SPACE_DEPTH`).
+
+Listing a subtree is a range scan over the path, not a recursive CTE:
+
+| subtree listing | time |
+|---|---|
+| own threads only | 17 µs |
+| **path prefix range** | **294 µs** |
+| recursive CTE | 2634 µs (9x slower; builds throwaway indexes at runtime) |
+
+#### Stored paths carry a trailing separator
+
+Not cosmetic. A slug may contain `-` (0x2D), which sorts **below** `/` (0x2F), so the obvious
+range over untrailed paths silently swallows siblings:
+
+```
+['sports', 'sports0')    ->  sports, sports-betting, sports/hockey   WRONG
+['sports/', 'sports0')   ->  sports/, sports/hockey/                 right
+```
+
+`subtree_range_bug_would_swallow_siblings` pins it.
+
+#### A slug is not an id, and that drives the rest
+
+Three differences, each with a consequence:
+
+- **Mutable.** People rename. `space_path_history` keeps every old path redirecting; the internal
+  integer id never moved, so nothing else has to.
+- **Reusable.** This is the dangerous one. A released username must **never** be reclaimable —
+  every old link, mention and quote naming it would silently start pointing at whoever picked it
+  up. That is impersonation, not a broken link. `username_history` is a tombstone as much as a
+  redirect: a row there blocks the name permanently, even after the account is deleted.
+- **Chosen, not generated.** So it can be chosen adversarially. Three defences, in `core/slug.rs`:
+  ASCII-only (which kills Cyrillic homoglyphs outright), a reserved list, and uniqueness enforced
+  on a *confusable-folded skeleton* rather than on the text.
+
+#### Uniqueness is by skeleton
+
+`test-user`, `test_user` and `testuser` are one name, not three; so are `notespace` and
+`n0tespace`. The skeleton strips separators and folds `0`→`o`, `1`→`l`.
+
+Deliberately excluded from the general skeleton: leetspeak (`3`→`e`, `4`→`a`) and `rn`→`m`. Both
+are real vectors, but folding them for every name takes legitimate ones down too — `web3` would
+collide with `webe`, `corner` with `comer` — and a rule that blocks real names gets switched off.
+`is_reserved` applies the leet folding anyway, because against forty-odd words nobody needs, the
+false positives are bounded and `adm1n` is exactly how a reserved name gets claimed.
+
+#### One SQLite footgun, avoided
+
+Uniqueness is indexed on the full path, not on `(parent_id, slug)`. SQLite treats NULLs as
+**distinct** in a unique index, so `UNIQUE(parent_id, slug)` allows two top-level spaces with the
+same slug — both have `parent_id IS NULL`. Verified, not assumed. The path already encodes the
+parent, so indexing it sidesteps the problem.
+
+
 ## 5. Moderation pipeline
 
 Runs asynchronously off the request path. You do not have 10ms to spare for an LLM call.

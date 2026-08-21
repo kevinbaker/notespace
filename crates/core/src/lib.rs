@@ -13,3 +13,4 @@ pub use id::{IdError, PublicId, ID_CHARS, MAX_TIMESTAMP_MS};
 pub use model::{Post, PostState, Space, Thread, ThreadKind, ThreadPage, ThreadState, User};
 pub use path::{Path, PathError, MAX_DEPTH, MAX_ORDINAL, SEGMENT_WIDTH};
 pub use store::{Page, Store, StoreError, StoreResult};
+pub mod slug;
