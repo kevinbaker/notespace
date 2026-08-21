@@ -15,27 +15,36 @@
 //! This module handles what can be handled in pure logic — the third problem, and the shape of
 //! the first two. Retention and redirect policy is schema, and lives in `migrations/0003`.
 //!
-//! # Uniqueness is by skeleton, not by text
+//! # Normalization is case, and only case
 //!
-//! Two names that render differently but *read* the same must not both exist. Uniqueness is
-//! therefore enforced on [`Slug::skeleton`] rather than on the slug itself:
+//! [`Slug::parse`] lowercases and otherwise rejects rather than rewrites. Two names that differ
+//! by anything more than case are two different names:
 //!
 //! ```text
-//!   test-user  test_user  testuser   ->  testuser     one name, not three
-//!   n0tespace  notespace              ->  notespace    zero/oh collapsed
-//!   webl       web1                   ->  webl         one/ell collapsed
+//!   TestUser  testuser   ->  same name
+//!   test-user testuser   ->  DIFFERENT names
+//!   n0tespace notespace  ->  DIFFERENT names
 //! ```
 //!
-//! Note what that last line does *not* do: `adm1n` folds to `admln`, not to `admin`. Reading a
-//! `1` as an `i` is leetspeak rather than a homoglyph, and folding it for every name would take
-//! `web3` down with it. [`is_reserved`] applies that stricter folding anyway, because against a
-//! fixed list of forty-odd words the false positives are bounded and `adm1n` is precisely how a
-//! reserved name gets claimed.
+//! An earlier draft folded separators and `0`/`o`, `1`/`l` into a "skeleton" and enforced
+//! uniqueness on that. It is gone. Folding buys a little impersonation resistance and costs
+//! real names — `ice-hockey` and `icehockey` become one space, and the person who wanted the
+//! second one gets an error they cannot act on. Systems people know behave this way: on GitHub,
+//! `foo-bar` and `foobar` are two accounts.
 //!
-//! Deliberately *not* collapsed: `rn` -> `m`, the classic `rnoderator` trick. It is a real
-//! vector, but folding it costs real words — `corner` would collide with `comer`, `learn` with
-//! `leam` — and a rule that blocks legitimate names gets turned off. That vector wants a
-//! display-time defence (account age, a "new account" marker) rather than a naming rule.
+//! What still holds the line:
+//!
+//! - **ASCII only.** This is the important one, and it is not a fold — it is a rejection. Every
+//!   Cyrillic and Greek homoglyph attack dies here, and those are the ones that are genuinely
+//!   invisible. `аdmin` with a Cyrillic а does not parse.
+//! - **[`RESERVED`]**, for names that imply authority or collide with a route.
+//! - Display-time signals — account age, a "new account" marker — which are where the remaining
+//!   lookalike cases belong. A naming rule cannot tell `rn` from `m`; a UI can say "created
+//!   today".
+//!
+//! Worth knowing that this direction is one-way. Once `testuser` and `test-user` both exist,
+//! deciding later that they collide means renaming somebody. Loosening is easy; tightening is
+//! not.
 //!
 //! # Space paths
 //!
@@ -133,17 +142,17 @@ pub const RESERVED: &[&str] = &[
 
 /// Whether `s` is reserved.
 ///
-/// Checked more aggressively than ordinary collisions are. Three readings must all miss: the
-/// text itself, its homoglyph [`Slug::skeleton`], and a leetspeak folding that also collapses
-/// `3`->`e`, `4`->`a` and friends.
+/// This is the one place a folding still happens, and it is a different trade from the one the
+/// module docs reject. Uniqueness between *users* must not fold, because a false collision
+/// blocks a real name with no recourse. This list is forty-odd words nobody legitimately needs,
+/// so blocking `adm1n` and `m0d3rator` alongside `admin` costs nothing and closes the way
+/// reserved names actually get claimed.
 ///
-/// The leet folding is deliberately confined to this function. Applied to *every* name it would
-/// be intolerable — `web3` would collide with `webe` — but against a list of forty-odd words
-/// nobody legitimately needs, the false positives are bounded and the win is real: `adm1n` and
-/// `m0d3rator` are exactly how a reserved name gets claimed in practice.
+/// If that still feels like too much, deleting the `leet_of` line leaves an exact-match check
+/// and nothing else breaks.
 pub fn is_reserved(s: &str) -> bool {
     let hit = |c: &str| RESERVED.binary_search(&c).is_ok();
-    hit(s) || hit(&skeleton_of(s)) || hit(&leet_of(s))
+    hit(s) || hit(&leet_of(s))
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -213,36 +222,12 @@ impl Slug {
         Ok(Slug(out))
     }
 
-    /// The form uniqueness is enforced on. See the module docs.
-    ///
-    /// Never displayed — it exists only to answer "does this read as a name we already have?".
-    pub fn skeleton(&self) -> String {
-        skeleton_of(&self.0)
-    }
-
     pub fn as_str(&self) -> &str {
         &self.0
     }
-
-    /// Whether two slugs would be confusable with one another.
-    pub fn collides_with(&self, other: &Slug) -> bool {
-        self.skeleton() == other.skeleton()
-    }
 }
 
-fn skeleton_of(s: &str) -> String {
-    s.chars()
-        .filter(|c| *c != '-' && *c != '_')
-        .map(|c| match c.to_ascii_lowercase() {
-            '0' => 'o',
-            '1' => 'l',
-            other => other,
-        })
-        .collect()
-}
-
-/// Leetspeak folding, for [`is_reserved`] only. See the note there on why it is not the
-/// general-purpose skeleton.
+/// Leetspeak folding. Used by [`is_reserved`] and nowhere else — see the note there.
 fn leet_of(s: &str) -> String {
     s.chars()
         .filter(|c| *c != '-' && *c != '_')
@@ -457,24 +442,24 @@ mod tests {
         );
     }
 
+    /// Case is folded; nothing else is. Uniqueness is plain equality on the parsed slug, so
+    /// this is also the whole of the collision rule.
     #[test]
-    fn confusable_names_collide() {
-        let base = slug("testuser");
-        for other in ["test-user", "test_user", "TestUser", "testuser"] {
-            assert!(base.collides_with(&slug(other)), "{other} should collide");
+    fn only_case_is_folded() {
+        assert_eq!(slug("TestUser"), slug("testuser"));
+        assert_eq!(slug("ICE-HOCKEY"), slug("ice-hockey"));
+
+        // Everything else stays distinct -- these are separate names, and both may be claimed.
+        for (a, b) in [
+            ("testuser", "test-user"),
+            ("testuser", "test_user"),
+            ("ice-hockey", "icehockey"),
+            ("notespace-team", "n0tespace-team"),
+            ("well", "we11"),
+            ("web3", "webe"),
+        ] {
+            assert_ne!(slug(a), slug(b), "{a} and {b} must stay distinct");
         }
-        for other in ["testusers", "test-users", "tester"] {
-            assert!(
-                !base.collides_with(&slug(other)),
-                "{other} should not collide"
-            );
-        }
-        // Digit/letter substitution, the impersonation case that matters.
-        assert!(slug("notespace-team").collides_with(&slug("n0tespace-team")));
-        assert!(slug("well").collides_with(&slug("we11")));
-        // Leetspeak is NOT folded for ordinary names: that is what keeps `web3` claimable.
-        assert!(!slug("web3").collides_with(&slug("webe")));
-        assert!(Slug::parse("web3").is_ok());
     }
 
     #[test]

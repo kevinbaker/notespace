@@ -5,6 +5,11 @@
 --
 -- A slug is not an id, and the difference drives everything below: it is mutable, reusable,
 -- and chosen by the person claiming it.
+--
+-- Slugs are stored in their parsed form, which is lowercase. Normalization is case and ONLY
+-- case: `test-user` and `testuser` are two different names, as they are on GitHub. There is
+-- therefore no separate "canonical" column anywhere in this file -- the stored text is already
+-- the canonical text.
 
 PRAGMA foreign_keys = ON;
 
@@ -25,18 +30,13 @@ PRAGMA foreign_keys = ON;
 -- See crates/core/src/slug.rs::subtree_range and its test.
 ALTER TABLE space ADD COLUMN path TEXT;
 
--- Confusable-folded path: separators stripped, 0->o, 1->l. Uniqueness is enforced HERE rather
--- than on `path`, so `ice-hockey` and `icehockey` cannot both exist under one parent.
-ALTER TABLE space ADD COLUMN path_canonical TEXT;
-
--- SQLite cannot ADD COLUMN ... UNIQUE, so uniqueness comes from these indexes.
+-- SQLite cannot ADD COLUMN ... UNIQUE, so uniqueness comes from the index below.
 --
 -- Note these are on the full path, not on (parent_id, slug). That is deliberate: SQLite treats
 -- NULLs as DISTINCT in a unique index, so UNIQUE(parent_id, slug) would happily allow two
 -- top-level spaces with the same slug, since both have parent_id IS NULL. The path already
 -- encodes the parent, so indexing it sidesteps the footgun entirely.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_space_path ON space(path);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_space_path_canonical ON space(path_canonical);
 
 -- Threads carry their space's path so that "everything under /s/sports" is a single range scan.
 -- Denormalized on purpose: the alternative is a recursive CTE, measured at 2634 us against
@@ -49,9 +49,9 @@ CREATE INDEX IF NOT EXISTS idx_thread_subtree ON thread(space_path, rank DESC);
 -- Usernames
 -- ---------------------------------------------------------------------------
 
--- Same folding as space paths, so `test-user` and `testuser` are one name.
-ALTER TABLE user ADD COLUMN name_canonical TEXT;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_user_name_canonical ON user(name_canonical);
+-- Nothing to add: `user.name` is already UNIQUE from 0001, and slugs are stored in their
+-- parsed form, which is lowercase. Normalization is case and only case (core/slug.rs), so the
+-- stored text IS the canonical text and a separate folded column would be a copy of it.
 
 -- ---------------------------------------------------------------------------
 -- Rename, and why released names are never recycled

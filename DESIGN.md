@@ -470,20 +470,34 @@ Three differences, each with a consequence:
   every old link, mention and quote naming it would silently start pointing at whoever picked it
   up. That is impersonation, not a broken link. `username_history` is a tombstone as much as a
   redirect: a row there blocks the name permanently, even after the account is deleted.
-- **Chosen, not generated.** So it can be chosen adversarially. Three defences, in `core/slug.rs`:
-  ASCII-only (which kills Cyrillic homoglyphs outright), a reserved list, and uniqueness enforced
-  on a *confusable-folded skeleton* rather than on the text.
+- **Chosen, not generated.** So it can be chosen adversarially. Two defences, in `core/slug.rs`:
+  ASCII-only, which kills Cyrillic homoglyphs outright, and a reserved list.
 
-#### Uniqueness is by skeleton
+#### Normalization is case, and only case
 
-`test-user`, `test_user` and `testuser` are one name, not three; so are `notespace` and
-`n0tespace`. The skeleton strips separators and folds `0`→`o`, `1`→`l`.
+`Slug::parse` lowercases and otherwise rejects rather than rewrites. Two names differing by
+anything more than case are two different names — `test-user` and `testuser` may both be claimed,
+as they may on GitHub.
 
-Deliberately excluded from the general skeleton: leetspeak (`3`→`e`, `4`→`a`) and `rn`→`m`. Both
-are real vectors, but folding them for every name takes legitimate ones down too — `web3` would
-collide with `webe`, `corner` with `comer` — and a rule that blocks real names gets switched off.
-`is_reserved` applies the leet folding anyway, because against forty-odd words nobody needs, the
-false positives are bounded and `adm1n` is exactly how a reserved name gets claimed.
+An earlier draft folded separators and `0`/`o`, `1`/`l` into a "skeleton" and enforced uniqueness
+on that. It is gone. Folding buys a little impersonation resistance and costs real names:
+`ice-hockey` and `icehockey` collapse into one space, and whoever wanted the second gets an error
+they cannot act on. Because the stored slug is already lowercase, there is no separate canonical
+column anywhere in the schema — the stored text *is* the canonical text.
+
+What still holds the line:
+
+- **ASCII only** — a rejection, not a fold, and the one that matters. Every Cyrillic and Greek
+  homoglyph attack dies here, and those are the invisible ones. `аdmin` with a Cyrillic а does
+  not parse.
+- **`RESERVED`** — names implying authority or colliding with a route. This list still folds
+  leetspeak (`adm1n`, `m0d3rator`), because against forty-odd words nobody needs, a false positive
+  costs nothing and it is how reserved names actually get claimed.
+- **Display-time signals** — account age, a "new account" marker. A naming rule cannot tell `rn`
+  from `m`; a UI can say "created today".
+
+This direction is one-way. Once `testuser` and `test-user` both exist, deciding later that they
+collide means renaming somebody. Loosening is easy; tightening is not.
 
 #### One SQLite footgun, avoided
 
