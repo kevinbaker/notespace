@@ -5,6 +5,7 @@
 
 #[cfg(feature = "password")]
 mod auth_config;
+mod cache;
 mod ids;
 mod startup;
 mod store;
@@ -100,20 +101,22 @@ async fn healthz() -> &'static str {
 
 async fn thread_page_slug(
     state: State<Env>,
+    headers: axum::http::HeaderMap,
     UrlPath((id, slug)): UrlPath<(String, String)>,
     query: Query<PageQuery>,
 ) -> Response {
     // The slug is decorative: it exists for readability and for search engines, and is never
     // used to resolve the thread. Retitling a thread therefore cannot break its links.
-    render_thread(state, id, Some(slug), query).await
+    render_thread(state, headers, id, Some(slug), query).await
 }
 
 async fn thread_page(
     state: State<Env>,
+    headers: axum::http::HeaderMap,
     UrlPath(id): UrlPath<String>,
     query: Query<PageQuery>,
 ) -> Response {
-    render_thread(state, id, None, query).await
+    render_thread(state, headers, id, None, query).await
 }
 
 /// The login form.
@@ -580,6 +583,7 @@ async fn post_permalink(State(env): State<Env>, UrlPath(id): UrlPath<String>) ->
 #[worker::send]
 async fn render_thread(
     State(env): State<Env>,
+    headers: axum::http::HeaderMap,
     id: String,
     slug: Option<String>,
     Query(q): Query<PageQuery>,
@@ -607,16 +611,6 @@ async fn render_thread(
             .into_response();
     }
 
-    let db = match env.d1(DB_BINDING) {
-        Ok(db) => db,
-        Err(e) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("no D1 binding: {e}"),
-            )
-        }
-    };
-
     // A malformed cursor is a client error, not a reason to scan from the top: silently
     // resetting to page 1 would turn a typo into a full-thread read.
     let after = match q.after.as_deref().filter(|s| !s.is_empty()) {
@@ -625,6 +619,29 @@ async fn render_thread(
             Err(e) => return error(StatusCode::BAD_REQUEST, &format!("bad cursor: {e}")),
         },
         None => None,
+    };
+
+    // Keyed after canonicalisation and parsed cursor, so one page has exactly one entry
+    // whatever else is in the query string. Checked before the D1 binding is even opened: a
+    // hit must cost no database work at all, or caching has bought nothing.
+    let key = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|host| cache::thread_key(host, &canonical, after.as_ref().map(|p| p.as_str())));
+    if let Some(k) = &key {
+        if let Some(hit) = cache::get(k).await {
+            return hit;
+        }
+    }
+
+    let db = match env.d1(DB_BINDING) {
+        Ok(db) => db,
+        Err(e) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("no D1 binding: {e}"),
+            )
+        }
     };
 
     let store = D1Store::new(db);
@@ -639,32 +656,27 @@ async fn render_thread(
             // What D1 actually reported for this request. Empty-ish locally, real in
             // production -- see QueryStats.
             let stats = store.last_stats();
-            let mut resp = (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-                    // The document is user-agnostic, so it is safe to
-                    // share one cached copy across every reader. M6 replaces this with a
-                    // baked R2 object keyed by the thread's cache_version.
-                    (header::CACHE_CONTROL, "public, max-age=0, s-maxage=60"),
-                    // Server-rendered HTML with no inline script; blocks stored-XSS
-                    // payloads that survive a future sanitizer regression.
-                    (
-                        header::CONTENT_SECURITY_POLICY,
-                        "default-src 'self'; img-src https: data:; style-src 'unsafe-inline'; \
-                         script-src 'self'; frame-ancestors 'none'; base-uri 'none'",
-                    ),
-                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-                    (header::REFERRER_POLICY, "strict-origin-when-cross-origin"),
-                ],
-                Html(html),
-            )
-                .into_response();
-            // Inserted after building rather than in the array above, which is homogeneous
-            // over &'static str while this value is per-request.
-            if let Ok(v) = stats.server_timing().parse() {
-                resp.headers_mut()
-                    .insert(header::HeaderName::from_static("server-timing"), v);
+            let timing = format!("{}, cache;desc=\"miss\"", stats.server_timing());
+
+            // Store before responding. The page is user-agnostic, so one render serves every
+            // reader for the TTL; without this the `s-maxage` header above is inert, because
+            // Cloudflare does not cache a Worker's own response.
+            if let Some(k) = &key {
+                cache::put(k, &html, &timing).await;
+            }
+
+            let mut resp = (StatusCode::OK, Html(html)).into_response();
+            let h = resp.headers_mut();
+            for (name, value) in cache::PAGE_HEADERS {
+                if let (Ok(n), Ok(v)) = (
+                    header::HeaderName::from_bytes(name.as_bytes()),
+                    value.parse(),
+                ) {
+                    h.insert(n, v);
+                }
+            }
+            if let Ok(v) = timing.parse() {
+                h.insert(header::HeaderName::from_static("server-timing"), v);
             }
             resp
         }

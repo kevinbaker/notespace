@@ -39,7 +39,7 @@ The migration list has a completeness guard in `crates/store-sqlite/tests/confor
 | Write-time rendering | `crates/render/src/markdown.rs` |
 | Read-time assembly | `crates/render/src/page.rs` — `thread_page` |
 | The user-agnostic invariant | `baked_page_contains_no_viewer_identity` in `page.rs` |
-| Cache headers | `render_thread` in `crates/worker/src/lib.rs` |
+| Cache headers and edge caching | `crates/worker/src/cache.rs`; key logic in `crates/core/src/cache_key.rs` |
 
 ## §3.5 What the client may and may not do
 

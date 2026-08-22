@@ -4,6 +4,7 @@
 //! dependency that cannot compile to `wasm32-unknown-unknown`. Everything
 //! here is unit-testable without a database or a network.
 
+pub mod cache_key;
 pub mod conformance;
 pub mod cookie;
 pub mod csrf;

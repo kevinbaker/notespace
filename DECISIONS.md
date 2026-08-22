@@ -301,6 +301,43 @@ production-only was wrong. Local 404 matched the derived ~403.
 
 ---
 
+## `crates/worker/src/cache.rs`
+
+A Worker's response goes straight to the client; Cloudflare's CDN only caches `fetch()`
+subrequests the Worker makes, or what it explicitly stores through the Cache API. So the
+`s-maxage=60` the thread page had been sending since M0 was inert — confirmed on the deployed
+instance, where the response carried no `cf-cache-status` at all while an ordinary Cloudflare
+asset returned `HIT`.
+
+That made D1 rows the binding constraint rather than requests:
+
+| | |
+|---|---|
+| rows read per thread pageview | 404 |
+| D1 free tier | 5,000,000 rows/day |
+| → thread pageviews/day | **12,376** |
+| Workers free tier | 100,000 requests/day (8.1× more than D1 allowed) |
+
+**The key is built, not taken from the URL.** Keying on the raw request URL would let `?x=1`,
+`?x=2`, … miss forever, and each miss is the full 404-row read — a few thousand requests to
+exhaust a day's budget, from one client. Only the canonical thread id and the parsed cursor
+reach the key.
+
+**Bounded staleness is the accepted cost.** A write is now invisible for up to 60 s. Purging
+properly is not available here: `Cache::delete` only affects the colo that served the request,
+and cache tags are Enterprise. M6's baked R2 objects keyed by `cache_version` are the real fix;
+until then the TTL is the invalidation strategy.
+
+Only sound because the baked page is user-agnostic. `baked_page_contains_no_viewer_identity`
+is the test holding that invariant, and caching is applied to the thread page alone — `/login`
+cannot be reached by this path at all.
+
+Measured locally: first request `rows_read=404, cache;desc="miss"`, every subsequent request
+`cache;desc="hit"` with no D1 work, junk query parameters hitting the same entry, and a distinct
+cursor correctly getting its own.
+
+---
+
 ## `crates/render/src/page.rs`
 
 The permalink anchor used to emit `id="p{post.id}"`, baking the internal sequential integer into
