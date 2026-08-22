@@ -10,9 +10,10 @@ use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use notespace_core::conformance::{run_all, Fixture};
 use notespace_core::id::PublicId;
 use notespace_core::path::Path as TreePath;
-use notespace_core::store::{Page, StoreError};
+use notespace_core::store::{Page, Store, StoreError, StoreResult};
 use serde::Deserialize;
 use store::D1Store;
 use tower_service::Service;
@@ -33,6 +34,12 @@ struct PageQuery {
     after: Option<String>,
 }
 
+/// Which thread `/__conformance` should exercise.
+#[derive(Deserialize, Default)]
+struct ConformanceQuery {
+    thread: Option<String>,
+}
+
 #[event(fetch)]
 async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> WorkerResult<Response> {
     // Without this a wasm panic surfaces as an opaque 1101 with no stack.
@@ -46,6 +53,7 @@ fn router(env: Env) -> Router {
         .route("/t/{id}", get(thread_page))
         .route("/t/{id}/{slug}", get(thread_page_slug))
         .route("/p/{id}", get(post_permalink))
+        .route("/__conformance", get(conformance))
         .with_state(env)
 }
 
@@ -71,6 +79,114 @@ async fn thread_page(
     render_thread(state, id, None, query).await
 }
 
+/// Runs the shared conformance suite against D1 and reports it as plain text.
+///
+/// The other half of `crates/store-sqlite/tests/conformance.rs`: the same
+/// [`notespace_core::conformance::run_all`], the same checks, a different adapter. A `#[test]`
+/// cannot reach D1 — there is no Worker runtime in `cargo test` — so the suite is exposed as a
+/// route and run against a deployed instance instead.
+///
+/// Takes the thread to exercise as `?thread=<public id>`, rather than assuming an id the seed
+/// generator happened to pick. An earlier revision hard-coded one and 503'd against a perfectly
+/// good database — a fixture constant duplicated across two crates is exactly the kind of drift
+/// this suite exists to catch, so it should not have one.
+///
+/// Reads only that thread, and writes nothing.
+#[worker::send]
+async fn conformance(State(env): State<Env>, Query(q): Query<ConformanceQuery>) -> Response {
+    let db = match env.d1(DB_BINDING) {
+        Ok(db) => db,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &format!("no D1: {e}")),
+    };
+    let store = D1Store::new(db);
+
+    let Some(raw) = q.thread.as_deref().filter(|s| !s.is_empty()) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "pass ?thread=<public id> -- a seeded thread to run the suite against",
+        );
+    };
+    let thread = match PublicId::parse(raw) {
+        Ok(t) => t,
+        Err(e) => return error(StatusCode::BAD_REQUEST, &format!("bad thread id: {e}")),
+    };
+    // A well-formed id that is not in the database. Derived from the thread's own timestamp so
+    // it stays plausible, with randomness no generated id would produce.
+    let Ok(absent) = PublicId::new(thread.timestamp_ms(), 0xDEAD_BEEF) else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "fixture id out of range");
+    };
+
+    // Post count and a real post path come from the database rather than from a constant: a
+    // fixture duplicated across two crates is the drift this suite exists to catch.
+    let probe = match store.thread_page(&thread, &Page::first(4)).await {
+        Ok(p) => p,
+        Err(e) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("thread {thread} not found: {e}"),
+            )
+        }
+    };
+    let Some(known) = probe.posts.get(3).or_else(|| probe.posts.last()) else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "seeded thread has no posts",
+        );
+    };
+
+    let fixture = Fixture {
+        thread: thread.clone(),
+        post_count: probe.thread.post_count,
+        known_post: known.public_id.clone(),
+        known_post_path: known.path.clone(),
+        absent,
+    };
+    let checks = run_all(&store, &fixture).await;
+    let failed = checks.iter().filter(|c| !c.passed()).count();
+    let mut body = format!(
+        "notespace conformance suite -- D1 adapter\nthread {} / {} posts\n\n",
+        fixture.thread, fixture.post_count
+    );
+    for c in &checks {
+        match &c.failure {
+            None => body.push_str(&format!("ok    {}\n", c.name)),
+            Some(why) => body.push_str(&format!("FAIL  {}\n        {why}\n", c.name)),
+        }
+    }
+    body.push_str(&format!(
+        "\n{} passed, {failed} failed\n",
+        checks.len() - failed
+    ));
+    let code = if failed == 0 {
+        StatusCode::OK
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (
+        code,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        body,
+    )
+        .into_response()
+}
+
+/// Storage access goes through [`Store`], never through a concrete adapter.
+///
+/// These two functions exist to make that structural: they are generic, so anything they can do
+/// the native adapter can do too. An earlier revision called inherent methods on `D1Store` while
+/// the trait sat unused with a different signature -- the seam compiled and carried nothing.
+async fn fetch_page<S: Store>(
+    store: &S,
+    thread: &PublicId,
+    page: &Page,
+) -> StoreResult<notespace_core::ThreadPage> {
+    store.thread_page(thread, page).await
+}
+
+async fn locate<S: Store>(store: &S, post: &PublicId) -> StoreResult<notespace_core::PostLocation> {
+    store.locate_post(post).await
+}
+
 /// A durable permalink to a single post.
 ///
 /// Resolves where the post lives *now* and redirects to that thread page, anchored at the post.
@@ -94,7 +210,7 @@ async fn post_permalink(State(env): State<Env>, UrlPath(id): UrlPath<String>) ->
             )
         }
     };
-    match D1Store::new(db).locate_post(&post_id).await {
+    match locate::<D1Store>(&D1Store::new(db), &post_id).await {
         Ok(loc) => {
             // KNOWN LIMITATION: this lands on page 1 and relies on the fragment. For a thread
             // longer than one page the anchor will not be present and the reader arrives at
@@ -172,9 +288,9 @@ async fn render_thread(
         limit: PAGE_SIZE,
     };
 
-    match store.thread_page_with_space(thread_id, page).await {
-        Ok((space, page)) => {
-            let html = notespace_render::thread_page(&space, &page).into_string();
+    match fetch_page::<D1Store>(&store, &thread_id, &page).await {
+        Ok(page) => {
+            let html = notespace_render::thread_page(&page).into_string();
             // What D1 actually reported for this request. Empty-ish locally, real in
             // production -- see QueryStats.
             let stats = store.last_stats();

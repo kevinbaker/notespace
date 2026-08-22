@@ -10,7 +10,7 @@
 //!   output buffer.
 
 use maud::{html, Markup, PreEscaped, DOCTYPE};
-use notespace_core::model::{PostState, Space, ThreadPage};
+use notespace_core::model::{PostState, ThreadPage};
 
 /// Deepest visual indent. Beyond this, replies stop nesting further so a deep subthread
 /// cannot squeeze the text column to nothing on a phone.
@@ -20,7 +20,8 @@ const MAX_INDENT: u32 = 8;
 ///
 /// `space` supplies `depth_cap`, which is what makes a flat board and a threaded board the
 /// same code path (DESIGN.md §6: presets are data, not code).
-pub fn thread_page(space: &Space, page: &ThreadPage) -> Markup {
+pub fn thread_page(page: &ThreadPage) -> Markup {
+    let space = &page.space;
     let t = &page.thread;
     html! {
         (DOCTYPE)
@@ -199,6 +200,7 @@ mod tests {
 
     fn page(posts: Vec<Post>) -> ThreadPage {
         ThreadPage {
+            space: space(),
             thread: thread(),
             posts,
             next_cursor: None,
@@ -208,7 +210,7 @@ mod tests {
     #[test]
     fn renders_post_bodies() {
         let p = page(vec![post(1, "0001", PostState::Visible, "<p>hi</p>")]);
-        let html = thread_page(&space(), &p).into_string();
+        let html = thread_page(&p).into_string();
         assert!(html.contains("<p>hi</p>"));
         let pid = p.posts[0].public_id.as_str();
         assert!(html.contains(&format!(r#"id="p{pid}""#)));
@@ -225,7 +227,7 @@ mod tests {
             posts.push(post(i, &format!("{i:04}"), PostState::Visible, "<p>x</p>"));
         }
         let p = page(posts);
-        let html = thread_page(&space(), &p).into_string();
+        let html = thread_page(&p).into_string();
         for post in &p.posts {
             assert!(
                 html.contains(post.public_id.as_str()),
@@ -254,11 +256,12 @@ mod tests {
         let mut t = thread();
         t.title = "<script>alert(1)</script>".into();
         let p = ThreadPage {
+            space: space(),
             thread: t,
             posts: vec![],
             next_cursor: None,
         };
-        let html = thread_page(&space(), &p).into_string();
+        let html = thread_page(&p).into_string();
         assert!(!html.contains("<script>alert"), "got: {html}");
         assert!(html.contains("&lt;script&gt;"), "got: {html}");
     }
@@ -267,14 +270,14 @@ mod tests {
     fn author_names_are_escaped() {
         let mut pst = post(1, "0001", PostState::Visible, "<p>hi</p>");
         pst.author_name = "<img onerror=x>".into();
-        let html = thread_page(&space(), &page(vec![pst])).into_string();
+        let html = thread_page(&page(vec![pst])).into_string();
         assert!(!html.contains("<img onerror"), "got: {html}");
     }
 
     #[test]
     fn deleted_posts_render_as_tombstones_not_content() {
         let p = page(vec![post(1, "0001", PostState::Deleted, "<p>secret</p>")]);
-        let html = thread_page(&space(), &p).into_string();
+        let html = thread_page(&p).into_string();
         assert!(!html.contains("secret"), "deleted body leaked: {html}");
         assert!(html.contains("[deleted]"));
     }
@@ -286,7 +289,7 @@ mod tests {
             (PostState::Pending, "[awaiting review]"),
         ] {
             let p = page(vec![post(1, "0001", state, "<p>secret</p>")]);
-            let html = thread_page(&space(), &p).into_string();
+            let html = thread_page(&p).into_string();
             assert!(!html.contains("secret"), "{state:?} leaked: {html}");
             assert!(html.contains(marker));
         }
@@ -299,7 +302,7 @@ mod tests {
             post(2, "0001.0001", PostState::Visible, "<p>b</p>"),
             post(3, "0001.0001.0001", PostState::Visible, "<p>c</p>"),
         ]);
-        let html = thread_page(&space(), &p).into_string();
+        let html = thread_page(&p).into_string();
         assert!(html.contains(r#"data-depth="0""#));
         assert!(html.contains(r#"data-depth="1""#));
         assert!(html.contains(r#"data-depth="2""#));
@@ -309,11 +312,13 @@ mod tests {
     fn flat_board_renders_every_post_at_depth_zero() {
         let mut s = space();
         s.depth_cap = 0; // Classic BB preset
-        let p = page(vec![
+        let mut p = page(vec![
             post(1, "0001", PostState::Visible, "<p>a</p>"),
             post(2, "0001.0001", PostState::Visible, "<p>b</p>"),
         ]);
-        let html = thread_page(&s, &p).into_string();
+        // depth_cap 0 is the Classic BB preset: the page must flatten regardless of the paths.
+        p.space = s;
+        let html = thread_page(&p).into_string();
         assert!(
             !html.contains(r#"data-depth="1""#),
             "flat board indented: {html}"
@@ -325,7 +330,7 @@ mod tests {
         // The cache-sharing invariant from DESIGN.md §3.3. If this ever fails, every
         // reader gets their own cache entry and the read path stops being free.
         let p = page(vec![post(1, "0001", PostState::Visible, "<p>hi</p>")]);
-        let html = thread_page(&space(), &p).into_string();
+        let html = thread_page(&p).into_string();
         for marker in ["logged in", "csrf", "session", "Sign out", "your vote"] {
             assert!(
                 !html.to_lowercase().contains(&marker.to_lowercase()),
@@ -337,11 +342,9 @@ mod tests {
     #[test]
     fn pager_appears_only_when_there_is_a_next_page() {
         let mut p = page(vec![post(1, "0001", PostState::Visible, "<p>a</p>")]);
-        assert!(!thread_page(&space(), &p)
-            .into_string()
-            .contains("next page"));
+        assert!(!thread_page(&p).into_string().contains("next page"));
         p.next_cursor = Some(Path::parse("0009").unwrap());
-        let html = thread_page(&space(), &p).into_string();
+        let html = thread_page(&p).into_string();
         assert!(html.contains("next page"));
         assert!(html.contains("after=0009"));
     }

@@ -14,46 +14,14 @@ use core::cell::Cell;
 use notespace_core::id::PublicId;
 use notespace_core::model::*;
 use notespace_core::path::Path;
-use notespace_core::store::{async_trait, Page, Store, StoreError, StoreResult};
+use notespace_core::sql;
+use notespace_core::store::{async_trait, Page, PostLocation, Store, StoreError, StoreResult};
 
 use serde::Deserialize;
 use worker::{D1Database, D1Result, D1ResultMeta};
 
-/// Columns for the thread header. Deliberately narrow.
-const THREAD_SQL: &str = "\
-SELECT t.id, t.public_id, t.space_id, t.kind, t.title, t.url, t.author_id, u.name AS author_name, \
-t.created_at, t.bumped_at, t.post_count, t.state, t.cache_version, \
-s.path AS space_path, s.name AS space_name, s.ranking AS space_ranking, \
-s.depth_cap AS space_depth_cap \
-FROM thread t \
-JOIN user u ON u.id = t.author_id \
-JOIN space s ON s.id = t.space_id \
-WHERE t.public_id = ?1";
-
-/// The read-path query. `path > ?2` is an indexed range scan on `idx_post_thread_path`,
-/// not a sort: SQLite walks the index in order and stops at LIMIT.
-///
-/// `body_md` is intentionally absent; see the note on [`Post::body_md`].
-/// Note the subquery rather than a literal thread id.
-///
-/// The URL carries a `public_id`, but posts are keyed by the integer `thread_id`. Resolving
-/// the public id in the Worker first would mean a second round trip, undoing the batching this
-/// module exists to protect. Folding the resolution into a scalar subquery keeps both
-/// statements in one `batch()`: the subquery is a single probe of `idx_thread_public_id`,
-/// which is the "+1 row read per pageview" that DESIGN.md §4.2 budgets for.
-const POSTS_SQL: &str = "\
-SELECT p.id, p.public_id, p.thread_id, p.parent_id, p.path, p.depth, p.author_id, \
-u.name AS author_name, p.body_html, p.created_at, p.edited_at, p.score, p.state \
-FROM post p \
-JOIN user u ON u.id = p.author_id \
-WHERE p.thread_id = (SELECT id FROM thread WHERE public_id = ?1) AND p.path > ?2 \
-ORDER BY p.path \
-LIMIT ?3";
-
-/// Sorts below every valid path, so it means "start at the beginning of the thread".
-/// Using a sentinel keeps the SQL identical for the first page and every later page, which
-/// keeps D1's prepared-statement cache warm.
-const PATH_START: &str = "";
+// The SQL lives in `notespace_core::sql`, shared verbatim with the native adapter so the two
+// cannot drift. What is target-specific is binding and row decoding, below.
 
 /// Sum D1's per-statement meta into one figure per request.
 ///
@@ -94,13 +62,6 @@ struct ThreadRow {
     space_name: String,
     space_ranking: String,
     space_depth_cap: i64,
-}
-
-/// Where a post currently lives.
-#[derive(Debug, Clone)]
-pub struct PostLocation {
-    pub thread: PublicId,
-    pub path: Path,
 }
 
 #[derive(Deserialize)]
@@ -227,14 +188,10 @@ impl D1Store {
     /// One query. The point of this indirection is that a post's thread can CHANGE -- splitting
     /// and merging threads is routine moderation -- so a permalink cannot bake in a thread id
     /// and stay correct. `/p/{id}` asks where the post is *now*.
-    pub async fn locate_post(&self, post: &PublicId) -> StoreResult<PostLocation> {
+    async fn fetch_post_location(&self, post: &PublicId) -> StoreResult<PostLocation> {
         let stmt = self
             .db
-            .prepare(
-                "SELECT t.public_id AS thread_public_id, p.path AS post_path \
-                 FROM post p JOIN thread t ON t.id = p.thread_id \
-                 WHERE p.public_id = ?1",
-            )
+            .prepare(sql::LOCATE_POST)
             .bind(&[post.as_str().into()])
             .map_err(backend)?;
         let res = stmt.all().await.map_err(backend)?;
@@ -255,18 +212,12 @@ impl D1Store {
         self.last_stats.get()
     }
 
-    /// The `Space` the last-fetched thread belongs to, carried alongside the thread so the
-    /// page render does not need a third query for `depth_cap`.
-    pub async fn thread_page_with_space(
-        &self,
-        thread: PublicId,
-        page: Page,
-    ) -> StoreResult<(Space, ThreadPage)> {
+    async fn fetch_thread_page(&self, thread: &PublicId, page: &Page) -> StoreResult<ThreadPage> {
         let cursor = page
             .after
             .as_ref()
             .map(|p| p.as_str())
-            .unwrap_or(PATH_START);
+            .unwrap_or(sql::PATH_START);
         // Over-fetch by one to detect "is there a next page?" without a second COUNT query.
         let fetch = page.limit.saturating_add(1);
 
@@ -276,12 +227,12 @@ impl D1Store {
         let public = thread.encode();
         let thread_stmt = self
             .db
-            .prepare(THREAD_SQL)
+            .prepare(sql::THREAD)
             .bind(&[public.as_str().into()])
             .map_err(backend)?;
         let posts_stmt = self
             .db
-            .prepare(POSTS_SQL)
+            .prepare(sql::POSTS)
             .bind(&[public.as_str().into(), cursor.into(), (fetch as f64).into()])
             .map_err(backend)?;
 
@@ -383,22 +334,22 @@ impl D1Store {
             None
         };
 
-        Ok((
+        Ok(ThreadPage {
             space,
-            ThreadPage {
-                thread: t,
-                posts,
-                next_cursor,
-            },
-        ))
+            thread: t,
+            posts,
+            next_cursor,
+        })
     }
 }
 
 #[async_trait(?Send)]
 impl Store for D1Store {
-    async fn thread_page(&self, thread: PublicId, page: Page) -> StoreResult<ThreadPage> {
-        self.thread_page_with_space(thread, page)
-            .await
-            .map(|(_, page)| page)
+    async fn thread_page(&self, thread: &PublicId, page: &Page) -> StoreResult<ThreadPage> {
+        self.fetch_thread_page(thread, page).await
+    }
+
+    async fn locate_post(&self, post: &PublicId) -> StoreResult<PostLocation> {
+        self.fetch_post_location(post).await
     }
 }

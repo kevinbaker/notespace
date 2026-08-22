@@ -1,0 +1,15 @@
+[package]
+name = "notespace-store-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+notespace-core = { path = "../core" }
+async-trait = "0.1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+[dev-dependencies]
+notespace-render = { path = "../render" }
+tokio = { version = "1", features = ["macros", "rt"] }
+rusqlite = { version = "0.37", features = ["bundled"] }

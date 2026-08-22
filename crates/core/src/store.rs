@@ -59,15 +59,40 @@ impl Page {
     }
 }
 
+/// Where a post currently lives.
+///
+/// A post's thread can change — splitting and merging threads is routine moderation — so a
+/// permalink has to resolve this at request time rather than bake it in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostLocation {
+    pub thread: PublicId,
+    pub path: Path,
+}
+
+/// Everything the application needs from storage.
+///
+/// This trait is the whole of it: if a handler reaches past this into a concrete adapter, the
+/// dual-target promise is already broken, because the other target has no such method. An
+/// earlier revision had one method here that nothing called, while the Worker used two inherent
+/// methods on `D1Store` — a trait that compiled and carried no weight. Keep every storage call
+/// on this side of the line.
+///
+/// Query budgets are part of the contract, not advice. D1 allows 50 statements per Worker
+/// invocation on the free plan, and the read path's whole design is not going per-post.
 #[async_trait(?Send)]
 pub trait Store {
-    /// Fetch one page of a thread.
+    /// One page of a thread, with the space it belongs to.
     ///
-    /// Threads are addressed by their public id, not their internal integer id: the integer
-    /// never leaves the database (DESIGN.md §4.2).
+    /// Threads are addressed by public id; the internal integer never leaves the database
+    /// (DESIGN.md §4.2).
     ///
-    /// **Budget: at most 2 D1 queries.** One for thread metadata, one indexed range scan
-    /// over `(thread_id, path)` for the posts. Implementations that issue a query per post
-    /// violate DESIGN.md §3.1 and will not survive the free tier.
-    async fn thread_page(&self, thread: PublicId, page: Page) -> StoreResult<ThreadPage>;
+    /// **Budget: 2 statements**, ideally in one round trip — thread header, and an indexed
+    /// range scan over `(thread_id, path)`. Measured in production at 2.52 ms p50 for both
+    /// together; one statement per post would be 0.5 s.
+    async fn thread_page(&self, thread: &PublicId, page: &Page) -> StoreResult<ThreadPage>;
+
+    /// Resolve a post's public id to the thread it is in now.
+    ///
+    /// **Budget: 1 statement.**
+    async fn locate_post(&self, post: &PublicId) -> StoreResult<PostLocation>;
 }

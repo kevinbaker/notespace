@@ -134,6 +134,9 @@ pub struct Post {
 /// One page of a thread: metadata plus a preorder-contiguous run of posts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ThreadPage {
+    /// The space the thread lives in, joined in the same query rather than fetched separately.
+    /// The render needs `depth_cap`, and a second round trip for one integer is not in budget.
+    pub space: Space,
     pub thread: Thread,
     /// Already in tree preorder: the store returns them `ORDER BY path`.
     pub posts: Vec<Post>,
@@ -176,5 +179,128 @@ mod tests {
             2,
             "clamps to actual depth, not the cap"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// String representations
+// ---------------------------------------------------------------------------
+//
+// Each of these enums crosses the database boundary as text, and every `Store` implementation
+// has to agree on that text. The D1 adapter arrives at it through serde's `rename_all`; a
+// SQLite adapter reading a `String` out of a column needs the same mapping by another route.
+//
+// Two routes to one mapping is a drift vector: nothing would fail to compile if serde said
+// "score_threshold" and a hand-written parser said "scorethreshold" -- the page would just
+// silently rank wrongly on one target. So the mapping is written once here, and
+// `string_forms_match_serde` asserts the serde representation agrees with it.
+//
+// Unknown input falls back to `Default` rather than erroring. A row written by a newer version
+// with a state this build has never heard of is a reason to render conservatively, not to fail
+// the request.
+
+macro_rules! string_enum {
+    ($ty:ty { $($variant:ident => $text:literal),+ $(,)? }) => {
+        impl $ty {
+            pub const fn as_str(&self) -> &'static str {
+                match self { $(Self::$variant => $text),+ }
+            }
+        }
+        impl core::str::FromStr for $ty {
+            type Err = core::convert::Infallible;
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Ok(match s { $($text => Self::$variant,)+ _ => Self::default() })
+            }
+        }
+        impl core::fmt::Display for $ty {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+    };
+}
+
+string_enum!(Ranking {
+    Bump => "bump",
+    Gravity => "gravity",
+    Best => "best",
+    ScoreThreshold => "score_threshold",
+});
+
+string_enum!(ThreadKind {
+    Discussion => "discussion",
+    Link => "link",
+    Question => "question",
+    Poll => "poll",
+    Announcement => "announcement",
+});
+
+string_enum!(ThreadState {
+    Visible => "visible",
+    Locked => "locked",
+    Pinned => "pinned",
+    Hidden => "hidden",
+    Deleted => "deleted",
+});
+
+string_enum!(PostState {
+    Visible => "visible",
+    Pending => "pending",
+    Hidden => "hidden",
+    Deleted => "deleted",
+});
+
+#[cfg(test)]
+mod string_form_tests {
+    use super::*;
+
+    /// The two routes to the same mapping must agree, or the adapters disagree silently.
+    macro_rules! check {
+        ($ty:ty, [$($variant:expr),+ $(,)?]) => {
+            for v in [$($variant),+] {
+                let via_serde = serde_json::to_string(&v).unwrap();
+                let via_serde = via_serde.trim_matches('"');
+                assert_eq!(
+                    v.as_str(), via_serde,
+                    "as_str and serde disagree for {v:?}"
+                );
+                assert_eq!(
+                    v.to_string().parse::<$ty>().unwrap(), v,
+                    "round trip failed for {v:?}"
+                );
+                assert_eq!(
+                    serde_json::from_str::<$ty>(&format!("\"{}\"", v.as_str())).unwrap(), v,
+                    "serde could not read back as_str for {v:?}"
+                );
+            }
+        };
+    }
+
+    #[test]
+    fn string_forms_match_serde() {
+        use Ranking::*;
+        check!(Ranking, [Bump, Gravity, Best, ScoreThreshold]);
+        use ThreadKind::*;
+        check!(ThreadKind, [Discussion, Link, Question, Poll, Announcement]);
+        use ThreadState::*;
+        check!(ThreadState, [Visible, Locked, Pinned, Hidden, Deleted]);
+        check!(
+            PostState,
+            [
+                PostState::Visible,
+                PostState::Pending,
+                PostState::Hidden,
+                PostState::Deleted
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_values_fall_back_to_default() {
+        assert_eq!(
+            "who_knows".parse::<PostState>().unwrap(),
+            PostState::Visible
+        );
+        assert_eq!("".parse::<Ranking>().unwrap(), Ranking::Bump);
     }
 }

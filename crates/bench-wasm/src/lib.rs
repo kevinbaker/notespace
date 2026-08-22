@@ -31,7 +31,7 @@ struct Fixture {
 }
 
 thread_local! {
-    static FIXTURE: RefCell<Option<(Space, ThreadPage)>> = const { RefCell::new(None) };
+    static FIXTURE: RefCell<Option<ThreadPage>> = const { RefCell::new(None) };
 }
 
 /// Parse the fixture. Deliberately outside the timed region: a real Worker gets its posts
@@ -41,11 +41,12 @@ pub fn load(json: &str) -> Result<usize, JsError> {
     let f: Fixture = serde_json::from_str(json).map_err(|e| JsError::new(&e.to_string()))?;
     let n = f.posts.len();
     let page = ThreadPage {
+        space: f.space,
         thread: f.thread,
         posts: f.posts,
         next_cursor: None,
     };
-    FIXTURE.with(|c| *c.borrow_mut() = Some((f.space, page)));
+    FIXTURE.with(|c| *c.borrow_mut() = Some(page));
     Ok(n)
 }
 
@@ -58,8 +59,8 @@ pub fn load(json: &str) -> Result<usize, JsError> {
 pub fn render_read_path() -> usize {
     FIXTURE.with(|c| {
         let b = c.borrow();
-        let (space, page) = b.as_ref().expect("load() must run first");
-        thread_page(space, page).into_string().len()
+        let page = b.as_ref().expect("load() must run first");
+        thread_page(page).into_string().len()
     })
 }
 
@@ -71,7 +72,7 @@ pub fn render_read_path() -> usize {
 pub fn render_write_path() -> usize {
     FIXTURE.with(|c| {
         let b = c.borrow();
-        let (_, page) = b.as_ref().expect("load() must run first");
+        let page = b.as_ref().expect("load() must run first");
         page.posts
             .iter()
             .filter_map(|p| p.body_md.as_deref())
@@ -85,7 +86,7 @@ pub fn render_write_path() -> usize {
 pub fn depth_stats() -> Vec<f64> {
     FIXTURE.with(|c| {
         let b = c.borrow();
-        let (_, page) = b.as_ref().expect("load() must run first");
+        let page = b.as_ref().expect("load() must run first");
         let depths: Vec<f64> = page.posts.iter().map(|p| p.path.depth() as f64).collect();
         let mean = depths.iter().sum::<f64>() / depths.len().max(1) as f64;
         let max = depths.iter().cloned().fold(0.0, f64::max);
@@ -100,7 +101,7 @@ pub fn depth_stats() -> Vec<f64> {
 pub fn bench_path_parse() -> usize {
     FIXTURE.with(|c| {
         let b = c.borrow();
-        let (_, page) = b.as_ref().expect("load() must run first");
+        let page = b.as_ref().expect("load() must run first");
         page.posts
             .iter()
             .filter_map(|p| notespace_core::path::Path::parse(p.path.as_str()).ok())
@@ -115,7 +116,7 @@ pub fn bench_path_parse() -> usize {
 pub fn bench_path_build() -> usize {
     FIXTURE.with(|c| {
         let b = c.borrow();
-        let (_, page) = b.as_ref().expect("load() must run first");
+        let page = b.as_ref().expect("load() must run first");
         page.posts
             .iter()
             .filter_map(|p| p.path.child(1).ok())
@@ -130,7 +131,7 @@ pub fn bench_path_build() -> usize {
 pub fn bench_path_sort() -> usize {
     FIXTURE.with(|c| {
         let b = c.borrow();
-        let (_, page) = b.as_ref().expect("load() must run first");
+        let page = b.as_ref().expect("load() must run first");
         let mut paths: Vec<&str> = page.posts.iter().map(|p| p.path.as_str()).collect();
         paths.sort_unstable();
         paths.iter().map(|p| p.len()).sum()
@@ -142,7 +143,7 @@ pub fn bench_path_sort() -> usize {
 pub fn bench_path_descendant() -> usize {
     FIXTURE.with(|c| {
         let b = c.borrow();
-        let (_, page) = b.as_ref().expect("load() must run first");
+        let page = b.as_ref().expect("load() must run first");
         let anchors: Vec<_> = page.posts.iter().take(16).map(|p| &p.path).collect();
         page.posts
             .iter()
@@ -161,7 +162,7 @@ pub fn bench_path_descendant() -> usize {
 pub fn path_bytes() -> usize {
     FIXTURE.with(|c| {
         let b = c.borrow();
-        let (_, page) = b.as_ref().expect("load() must run first");
+        let page = b.as_ref().expect("load() must run first");
         page.posts.iter().map(|p| p.path.as_str().len()).sum()
     })
 }

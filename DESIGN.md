@@ -672,6 +672,36 @@ script, demo instance, import from phpBB/Discourse dumps.
 
 ---
 
+### 8.1 M1 status — the `Store` seam
+
+`Store` is the trait everything above storage depends on, and for a while it was decorative: one
+method, one implementation, **zero call sites**. The Worker used two inherent methods on
+`D1Store` that were not on the trait at all, so the trait compiled and carried nothing.
+
+Closed:
+
+- The trait carries what the application actually uses — `thread_page` and `locate_post` — and
+  handlers reach storage only through it.
+- `ThreadPage` carries its `Space`, so the trait is one method returning one type rather than a
+  tuple the render had to reassemble.
+- The SQL lives once, in `core::sql`, and both adapters send the same statements. Sharing it
+  makes "identical dialect on both targets" structural rather than aspirational.
+- Enum string forms live once, in `core::model`, with a test asserting `as_str` agrees with
+  serde. Two routes to one mapping was a live drift vector: nothing would have failed to compile
+  if serde said `score_threshold` and a hand-written parser said `scorethreshold` — one target
+  would just have ranked wrongly.
+- A second implementation exists: `crates/store-sqlite`, native rusqlite.
+- One conformance suite, `core::conformance`, runs against both. Natively via `cargo test`; against
+  D1 via `GET /__conformance?thread=<id>`, because no `#[test]` can reach a Worker runtime.
+
+Both adapters pass all ten checks. They cover what SQL does not enforce and where adapters
+actually drift: cursor exclusivity, tree order, paging visiting every post exactly once, absent
+rows being `NotFound` rather than an empty page, and the read path never loading `body_md`.
+
+Still open for M1: no write path, so the suite is read-only, and `crates/server` does not exist —
+the native adapter is exercised by tests rather than shipping a binary. That is M5.
+
+
 ## 9. Conventions for implementers
 
 - **Every dependency must compile to `wasm32-unknown-unknown`.** Check before adding. This rules
