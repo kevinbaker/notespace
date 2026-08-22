@@ -27,11 +27,15 @@
 //!
 //! - **OIDC is the answer for a Workers deployment.** Verifying a signed assertion is a
 //!   signature check, sub-millisecond, and the CPU problem disappears entirely.
-//! - **The self-hosted target has no such limit** and uses [`Params::OWASP`] unchanged.
-//! - [`Params::CONSTRAINED`] exists for a free Worker that insists on passwords. It is the
-//!   strongest setting measured to fit (8 MiB, t=1, 5.98 ms) and it is **below OWASP**. It is
-//!   never the default, and [`Params::is_below_recommended`] exists so a deployment can say so
-//!   out loud.
+//! - **The self-hosted target has no such limit** and uses [`Scheme::OWASP`] unchanged.
+//! - [`Scheme::CONSTRAINED`] exists for a free Worker that insists on passwords. It is the
+//!   strongest setting measured to fit (4 MiB, t=1, 4.33 ms at p95) and it is **below OWASP**.
+//!   It is never the default, and [`Scheme::is_below_recommended`] exists so a deployment can
+//!   say so out loud.
+//! - [`Scheme::CLIENT_ARGON`] is the third option: the constraint is the *Worker's* CPU, and
+//!   the browser's is not scarce. Running OWASP-grade Argon2id there and peppering the result
+//!   here restores the work factor that [`Scheme::CONSTRAINED`] gives up, at the cost of
+//!   requiring a client that performs the derivation.
 //!
 //! # Hashes carry their own parameters
 //!
@@ -235,19 +239,45 @@ fn looks_unrandom(s: &str) -> bool {
         || s.to_ascii_lowercase().contains("your-secret")
 }
 
-fn split_stored(stored: &str) -> Result<(Option<u32>, &str), PasswordError> {
-    if stored.starts_with('$') {
-        return Ok((None, stored));
+/// What a stored credential records about how it was made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stored<'a> {
+    /// True when the record was written under a [`Scheme::Client`] deployment.
+    client: bool,
+    /// `None` means the hash is unpeppered.
+    pepper_id: Option<u32>,
+    phc: &'a str,
+}
+
+/// Parse `[c][<pepper-id>]$<phc>`.
+///
+/// The leading `c` marks a client-derived record. Server records are unprefixed, so every hash
+/// written before the marker existed still parses to exactly what it meant.
+fn split_stored(stored: &str) -> Result<Stored<'_>, PasswordError> {
+    let (client, rest) = match stored.strip_prefix('c') {
+        Some(rest) => (true, rest),
+        None => (false, stored),
+    };
+    if rest.starts_with('$') {
+        return Ok(Stored {
+            client,
+            pepper_id: None,
+            phc: rest,
+        });
     }
-    let (id, phc) = stored
+    let (id, phc) = rest
         .split_once('$')
         .ok_or_else(|| PasswordError::MalformedHash("no PHC section".into()))?;
     let id: u32 = id
         .parse()
         .map_err(|_| PasswordError::MalformedHash(format!("bad pepper id {id:?}")))?;
     // `split_once` ate the `$` that PHC needs to start with.
-    let start = stored.len() - phc.len() - 1;
-    Ok((Some(id), &stored[start..]))
+    let start = rest.len() - phc.len() - 1;
+    Ok(Stored {
+        client,
+        pepper_id: Some(id),
+        phc: &rest[start..],
+    })
 }
 
 /// Why a verification succeeded, and whether the stored hash should be rewritten.
@@ -316,13 +346,204 @@ impl Params {
         p: 1,
     };
 
+    /// Server-side cost applied to an *already* memory-hard client key, under
+    /// [`Scheme::CLIENT_ARGON`].
+    ///
+    /// Deliberately tiny, and that is not a weakness: the input is 32 bytes of CSPRNG-grade
+    /// output from an OWASP-parameter Argon2id run. Guessing it directly is not a search anyone
+    /// can mount, so grinding it slowly buys nothing. This step exists for one reason only --
+    /// to apply the [`Pepper`], so a stolen database does not hand over keys that can be
+    /// replayed straight back at the login form.
+    ///
+    /// Measured in wasm over 15 samples: **1.25 ms at p95, 12% of the 10 ms budget** — against
+    /// 4.18 ms (42%) for [`Params::CONSTRAINED`]. So moving the work to the client buys back
+    /// 3.3x of the request's CPU as well as the work factor.
+    ///
+    /// Sampled the same way [`Params::CONSTRAINED`] was, and on the same development machine
+    /// rather than Cloudflare's. Treat the ratio as the durable result and the absolute figures
+    /// as needing a re-check on a deployed instance: OWASP's 19 MiB re-measured at 48.5 ms p50
+    /// on this run against the 25.2 ms recorded in the table at the top of this module, which is
+    /// machine noise, not a change in the code.
+    pub const HANDOFF: Params = Params {
+        m_kib: 1024,
+        t: 1,
+        p: 1,
+    };
+
     /// Whether these parameters are weaker than OWASP's minimum.
     ///
     /// Not advisory: a deployment using [`Params::CONSTRAINED`] should surface this at startup.
     /// A weakened KDF that nobody mentions is how it stays weakened.
+    ///
+    /// Read this on the *client* half of [`Scheme::CLIENT_ARGON`], never the server half --
+    /// [`Params::HANDOFF`] is below OWASP by design and says nothing about the work actually
+    /// done. [`Scheme::is_below_recommended`] applies it to the right half.
     pub const fn is_below_recommended(&self) -> bool {
         self.m_kib < Params::OWASP.m_kib || self.t < Params::OWASP.t
     }
+}
+
+/// Where the memory-hard work happens.
+///
+/// A free Worker cannot afford OWASP-grade Argon2id ([`Params::CONSTRAINED`] is the strongest
+/// setting that fits, at ~4.7x below OWASP in memory). The browser can: it has no 10 ms budget.
+/// [`Scheme::CLIENT_ARGON`] moves the expensive half there and leaves the server applying only
+/// [`Params::HANDOFF`] to the result.
+///
+/// # Why this is a scheme and not another `Params` constant
+///
+/// The two produce stored records that look alike -- both end in a cheap Argon2id PHC string --
+/// but mean opposite things. Under [`Scheme::CLIENT_ARGON`] a cheap hash is sound, because its
+/// input already cost 19 MiB to compute. Applied to a plaintext password the same record is
+/// close to worthless. If one `verify` accepted both, then a config flipped back to
+/// [`Scheme::CONSTRAINED`], or one non-JS client posting a raw password, would silently write
+/// the worthless kind alongside the sound kind and nothing would ever say so.
+///
+/// So the two are kept non-interchangeable by construction, twice over:
+///
+/// - Stored client records carry a `c` marker, and [`verify`] refuses a record whose marker
+///   disagrees with the configured scheme rather than guessing.
+/// - The hashed input is domain-separated ([`CLIENT_KEY_DOMAIN`]), so even if a marker were
+///   forged the digests could not collide.
+///
+/// Both failures are closed: a mismatch rejects the login. Neither can quietly downgrade one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scheme {
+    /// The server receives the password and does the whole KDF.
+    Server(Params),
+    /// The client runs Argon2id at `client` and sends the derived key; the server applies
+    /// `server` to it.
+    Client { client: Params, server: Params },
+}
+
+impl Scheme {
+    /// Everything server-side, at OWASP's minimum. The default off-Worker.
+    pub const OWASP: Scheme = Scheme::Server(Params::OWASP);
+
+    /// Everything server-side, at the strongest setting a free Worker can afford. Below OWASP.
+    pub const CONSTRAINED: Scheme = Scheme::Server(Params::CONSTRAINED);
+
+    /// OWASP-grade Argon2id in the browser; the server only peppers the result.
+    ///
+    /// The honest trade, stated plainly:
+    ///
+    /// - **Gained.** A stolen database costs an attacker a full 19 MiB Argon2id run per guess,
+    ///   which no free-Worker server-side scheme can charge them.
+    /// - **Lost.** Login now requires a client that performs the derivation; a plaintext
+    ///   password posted to this scheme is rejected, not accepted weakly. It also needs the
+    ///   salt before submit, so the salt lookup must answer for unknown accounts too or it
+    ///   becomes the account-enumeration oracle that [`crate::login`] exists to avoid.
+    /// - **Unchanged.** Anyone who can read the client key in flight has a password-equivalent
+    ///   for that account -- exactly the position they would be in with the password itself.
+    ///
+    /// No browser client ships with notespace yet, so today this serves callers that implement
+    /// [`CLIENT_KEY_BYTES`]-byte derivation themselves. Deployments are warned at startup.
+    pub const CLIENT_ARGON: Scheme = Scheme::Client {
+        client: Params::OWASP,
+        server: Params::HANDOFF,
+    };
+
+    /// The parameters this process actually runs.
+    pub const fn server_params(&self) -> Params {
+        match self {
+            Scheme::Server(p) => *p,
+            Scheme::Client { server, .. } => *server,
+        }
+    }
+
+    /// The parameters a client must run, if any. `None` when the server does the work.
+    pub const fn client_params(&self) -> Option<Params> {
+        match self {
+            Scheme::Server(_) => None,
+            Scheme::Client { client, .. } => Some(*client),
+        }
+    }
+
+    /// Whether the memory-hard work -- wherever it happens -- is below OWASP's minimum.
+    pub const fn is_below_recommended(&self) -> bool {
+        match self {
+            Scheme::Server(p) => p.is_below_recommended(),
+            // The server half is cheap on purpose; the client half is the one that counts.
+            Scheme::Client { client, .. } => client.is_below_recommended(),
+        }
+    }
+
+    const fn marker(&self) -> &'static str {
+        match self {
+            Scheme::Server(_) => "",
+            Scheme::Client { .. } => "c",
+        }
+    }
+
+    const fn is_client(&self) -> bool {
+        matches!(self, Scheme::Client { .. })
+    }
+}
+
+impl Default for Scheme {
+    fn default() -> Self {
+        Scheme::OWASP
+    }
+}
+
+/// Bytes of client-derived key [`Scheme::CLIENT_ARGON`] expects, hex-encoded on the wire.
+pub const CLIENT_KEY_BYTES: usize = 32;
+
+/// Domain prefix mixed into a client key before the server hashes it.
+///
+/// Keeps a client-scheme digest from ever equalling a server-scheme one over the same bytes,
+/// independently of the stored marker.
+pub const CLIENT_KEY_DOMAIN: &[u8] = b"notespace/client-argon/v1\0";
+
+/// The bytes fed to Argon2id for `secret` under `scheme`, after checking the shape is right.
+///
+/// Under [`Scheme::Server`] that is the password, length-checked. Under [`Scheme::Client`] it is
+/// the domain prefix plus the decoded key -- and `MIN_PASSWORD_CHARS` deliberately does *not*
+/// apply, because the server never sees the password and cannot judge it. Enforcing password
+/// length is the client's job there, and saying so is the point of this branch.
+fn kdf_input(secret: &str, scheme: Scheme) -> Result<Vec<u8>, PasswordError> {
+    match scheme {
+        Scheme::Server(_) => {
+            if secret.chars().count() < MIN_PASSWORD_CHARS {
+                return Err(PasswordError::TooShort);
+            }
+            Ok(secret.as_bytes().to_vec())
+        }
+        Scheme::Client { .. } => {
+            let key = decode_client_key(secret)?;
+            let mut input = CLIENT_KEY_DOMAIN.to_vec();
+            input.extend_from_slice(&key);
+            Ok(input)
+        }
+    }
+}
+
+/// Decode a hex client key, rejecting anything that is not exactly [`CLIENT_KEY_BYTES`].
+///
+/// A plaintext password reaching a [`Scheme::Client`] deployment lands here and is rejected.
+/// That is the intended outcome: failing the login is recoverable, storing a cheap hash of a
+/// real password is not.
+fn decode_client_key(hex: &str) -> Result<Vec<u8>, PasswordError> {
+    let b = hex.as_bytes();
+    if b.len() != CLIENT_KEY_BYTES * 2 {
+        return Err(PasswordError::BadClientKey(format!(
+            "expected {} hex characters, got {}",
+            CLIENT_KEY_BYTES * 2,
+            b.len()
+        )));
+    }
+    let nybble = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    };
+    b.chunks(2)
+        .map(|p| match (nybble(p[0]), nybble(p[1])) {
+            (Some(h), Some(l)) => Ok(h << 4 | l),
+            _ => Err(PasswordError::BadClientKey("not hexadecimal".into())),
+        })
+        .collect()
 }
 
 impl Default for Params {
@@ -351,6 +572,17 @@ pub enum PasswordError {
     UnknownPepper(u32),
     #[error("PASSWORD_PEPPER is malformed: {0}")]
     BadPepperSpec(String),
+    #[error("client-derived key is malformed: {0}")]
+    BadClientKey(String),
+    #[error(
+        "stored credential was written for a {} deployment but this one is {}",
+        if *.stored_client { "client-side" } else { "server-side" },
+        if *.configured_client { "client-side" } else { "server-side" }
+    )]
+    SchemeMismatch {
+        stored_client: bool,
+        configured_client: bool,
+    },
 }
 
 /// Hash a password with the ring's current pepper.
@@ -358,14 +590,12 @@ pub enum PasswordError {
 /// `salt_b64` must be at least 16 bytes of CSPRNG output, base64 unpadded. The salt is a
 /// parameter because `core` has no RNG on wasm — the same reason ids and timestamps are.
 pub fn hash(
-    password: &str,
+    secret: &str,
     salt_b64: &str,
-    params: Params,
+    scheme: Scheme,
     peppers: &PepperSet,
 ) -> Result<String, PasswordError> {
-    if password.chars().count() < MIN_PASSWORD_CHARS {
-        return Err(PasswordError::TooShort);
-    }
+    let input = kdf_input(secret, scheme)?;
     let salt = Salt::from_b64(salt_b64).map_err(|e| PasswordError::BadSalt(e.to_string()))?;
     let current = peppers.current;
     let pepper = match current {
@@ -373,14 +603,14 @@ pub fn hash(
         None => None,
     };
     let phc = peppers
-        .argon2_for(pepper, params)?
-        .hash_password(password.as_bytes(), salt)
+        .argon2_for(pepper, scheme.server_params())?
+        .hash_password(&input, salt)
         .map(|h| h.to_string())
         .map_err(|e| PasswordError::Hash(e.to_string()))?;
-    // Record which pepper made this, so verification tries exactly one.
+    // Record the scheme and which pepper made this, so verification tries exactly one of each.
     Ok(match current {
-        Some(id) => format!("{id}{phc}"),
-        None => phc,
+        Some(id) => format!("{}{id}{phc}", scheme.marker()),
+        None => format!("{}{phc}", scheme.marker()),
     })
 }
 
@@ -403,24 +633,35 @@ pub fn encode_salt(bytes: &[u8]) -> Result<String, PasswordError> {
 /// The work factor is read from the hash, so an account written under old parameters still
 /// verifies after the defaults change.
 pub fn verify(
-    password: &str,
+    secret: &str,
     stored: &str,
-    want: Params,
+    want: Scheme,
     peppers: &PepperSet,
 ) -> Result<Verified, PasswordError> {
-    let (hash_pepper_id, phc) = split_stored(stored)?;
-    let parsed = PasswordHash::new(phc).map_err(|e| PasswordError::MalformedHash(e.to_string()))?;
+    let rec = split_stored(stored)?;
+    // Never guess across schemes. A client record verified as a server one would be checking a
+    // plaintext password against a 1 MiB hash; the reverse would reject every valid login with
+    // no explanation. Both are bugs worth naming rather than absorbing.
+    if rec.client != want.is_client() {
+        return Err(PasswordError::SchemeMismatch {
+            stored_client: rec.client,
+            configured_client: want.is_client(),
+        });
+    }
+    let input = kdf_input(secret, want)?;
+    let parsed =
+        PasswordHash::new(rec.phc).map_err(|e| PasswordError::MalformedHash(e.to_string()))?;
 
     // Exactly one lookup, and therefore exactly one Argon2 run, however many peppers are held.
-    let pepper = match hash_pepper_id {
+    let pepper = match rec.pepper_id {
         Some(id) => Some(peppers.get(id).ok_or(PasswordError::UnknownPepper(id))?),
         None => None,
     };
-    let argon = peppers.argon2_for(pepper, want)?;
+    let argon = peppers.argon2_for(pepper, want.server_params())?;
 
-    match argon.verify_password(password.as_bytes(), &parsed) {
+    match argon.verify_password(&input, &parsed) {
         Ok(()) => {
-            let stale_pepper = hash_pepper_id != peppers.current;
+            let stale_pepper = rec.pepper_id != peppers.current;
             Ok(if stale_pepper || needs_rehash(stored, want) {
                 Verified::YesRehash
             } else {
@@ -435,11 +676,18 @@ pub fn verify(
 /// Whether a stored hash was made with weaker parameters than `want`.
 ///
 /// Does not consider the pepper — [`verify`] knows which one the hash names and folds that in.
-pub fn needs_rehash(stored: &str, want: Params) -> bool {
-    let Ok((_, phc)) = split_stored(stored) else {
+pub fn needs_rehash(stored: &str, want: Scheme) -> bool {
+    let Ok(rec) = split_stored(stored) else {
         return true;
     };
-    let Ok(parsed) = PasswordHash::new(phc) else {
+    if rec.client != want.is_client() {
+        // Not a rehash: the plaintext under one scheme cannot produce the other's record.
+        // `verify` rejects this before we are reached; returning true here would invite a
+        // caller to "fix" it by writing a record it has no valid input for.
+        return false;
+    }
+    let want = want.server_params();
+    let Ok(parsed) = PasswordHash::new(rec.phc) else {
         // Unreadable: rewriting it is the only way it becomes readable.
         return true;
     };
@@ -456,11 +704,12 @@ pub fn needs_rehash(stored: &str, want: Params) -> bool {
 mod tests {
     use super::*;
 
-    const FAST: Params = Params {
+    /// Cheap server-side scheme: these tests are about pepper and format handling, not cost.
+    const FAST: Scheme = Scheme::Server(Params {
         m_kib: 64,
         t: 1,
         p: 1,
-    };
+    });
     const SALT: &str = "c29tZXNhbHR2YWx1ZTE";
     const PW: &str = "correct horse battery staple";
 
@@ -510,11 +759,11 @@ mod tests {
     fn the_stored_hash_names_its_pepper() {
         let h = hash(PW, SALT, FAST, &PepperSet::single(7, pepper(7))).unwrap();
         assert!(h.starts_with("7$argon2id$"), "no pepper id in {h}");
-        assert_eq!(split_stored(&h).unwrap().0, Some(7));
+        assert_eq!(split_stored(&h).unwrap().pepper_id, Some(7));
         // Unpeppered hashes are plain PHC and stay recognisable as such.
         let plain = hash(PW, SALT, FAST, &PepperSet::none()).unwrap();
         assert!(plain.starts_with("$argon2id$"));
-        assert_eq!(split_stored(&plain).unwrap().0, None);
+        assert_eq!(split_stored(&plain).unwrap().pepper_id, None);
     }
 
     /// Holding many peppers must not cost anything at verify time — one lookup, one Argon2 run.
@@ -546,7 +795,7 @@ mod tests {
             verify("wrong password here", &h, FAST, &set),
             Ok(Verified::No)
         );
-        assert_eq!(split_stored(&h).unwrap().0, Some(3));
+        assert_eq!(split_stored(&h).unwrap().pepper_id, Some(3));
     }
 
     /// Reusing an id for a different secret strands accounts, so it must not silently pass.
@@ -597,11 +846,11 @@ mod tests {
     fn weaker_stored_parameters_ask_for_a_rehash() {
         let set = PepperSet::none();
         let weak = hash(PW, SALT, FAST, &set).unwrap();
-        assert!(needs_rehash(&weak, Params::OWASP));
+        assert!(needs_rehash(&weak, Scheme::OWASP));
         assert!(!needs_rehash(&weak, FAST));
-        assert!(needs_rehash("garbage", Params::OWASP));
+        assert!(needs_rehash("garbage", Scheme::OWASP));
         assert_eq!(
-            verify(PW, &weak, Params::OWASP, &set),
+            verify(PW, &weak, Scheme::OWASP, &set),
             Ok(Verified::YesRehash)
         );
     }
@@ -726,5 +975,141 @@ mod tests {
             "pepper leaked: {shown}"
         );
         assert!(format!("{:?}", PepperSet::single(1, pepper(1))).contains("redacted"));
+    }
+}
+
+#[cfg(test)]
+mod client_scheme_tests {
+    use super::*;
+
+    const SALT: &str = "c29tZXNhbHR2YWx1ZTE";
+    const PW: &str = "correct horse battery staple";
+    /// 32 bytes, as a client would send after running Argon2id.
+    const KEY: &str = "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0";
+
+    /// Server params only, so the tests stay fast; the scheme logic is what is under test.
+    const CHEAP: Params = Params {
+        m_kib: 64,
+        t: 1,
+        p: 1,
+    };
+    fn client_scheme() -> Scheme {
+        Scheme::Client {
+            client: Params::OWASP,
+            server: CHEAP,
+        }
+    }
+    fn server_scheme() -> Scheme {
+        Scheme::Server(CHEAP)
+    }
+    fn peppers() -> PepperSet {
+        PepperSet::parse(&format!("1={}", "a1b2c3d4".repeat(8))).unwrap()
+    }
+
+    #[test]
+    fn a_client_record_is_marked_and_a_server_record_is_not() {
+        let p = peppers();
+        let c = hash(KEY, SALT, client_scheme(), &p).unwrap();
+        let s = hash(PW, SALT, server_scheme(), &p).unwrap();
+        assert!(c.starts_with("c1$"), "client record marked: {c}");
+        assert!(s.starts_with("1$"), "server record unmarked: {s}");
+    }
+
+    /// The property the whole `Scheme` split exists for. Without it, flipping a deployment back
+    /// to `constrained` would start fast-hashing plaintext passwords into records that look
+    /// exactly like the sound ones.
+    #[test]
+    fn a_password_cannot_be_verified_against_a_client_record() {
+        let p = peppers();
+        let stored = hash(KEY, SALT, client_scheme(), &p).unwrap();
+        assert!(matches!(
+            verify(PW, &stored, server_scheme(), &p),
+            Err(PasswordError::SchemeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_client_key_cannot_be_verified_against_a_server_record() {
+        let p = peppers();
+        let stored = hash(PW, SALT, server_scheme(), &p).unwrap();
+        assert!(matches!(
+            verify(KEY, &stored, client_scheme(), &p),
+            Err(PasswordError::SchemeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn the_right_key_verifies_and_a_wrong_one_does_not() {
+        let p = peppers();
+        let stored = hash(KEY, SALT, client_scheme(), &p).unwrap();
+        assert_eq!(
+            verify(KEY, &stored, client_scheme(), &p).unwrap(),
+            Verified::Yes
+        );
+        let wrong = KEY.replace("9f8e", "0000");
+        assert_eq!(
+            verify(&wrong, &stored, client_scheme(), &p).unwrap(),
+            Verified::No
+        );
+    }
+
+    /// A plaintext password posted to a client-scheme deployment must fail closed, not be
+    /// accepted and stored under a 1 MiB hash.
+    #[test]
+    fn a_plaintext_password_is_refused_by_a_client_scheme() {
+        let p = peppers();
+        assert!(matches!(
+            hash(PW, SALT, client_scheme(), &p),
+            Err(PasswordError::BadClientKey(_))
+        ));
+        assert!(matches!(
+            hash(&"z".repeat(64), SALT, client_scheme(), &p),
+            Err(PasswordError::BadClientKey(_))
+        ));
+    }
+
+    /// Domain separation, checked independently of the marker: even stripping the `c` must not
+    /// let the two schemes collide over the same bytes.
+    #[test]
+    fn the_two_schemes_do_not_collide_over_identical_input() {
+        let p = peppers();
+        let as_client = hash(KEY, SALT, client_scheme(), &p).unwrap();
+        let as_server = hash(KEY, SALT, server_scheme(), &p).unwrap();
+        let unmarked = as_client.strip_prefix('c').unwrap();
+        assert_ne!(unmarked, as_server, "domain prefix must change the digest");
+        // And with the marker filed off it still does not verify, because the input differed.
+        assert_eq!(
+            verify(KEY, unmarked, server_scheme(), &p).unwrap(),
+            Verified::No
+        );
+    }
+
+    /// `MIN_PASSWORD_CHARS` is meaningless server-side here: the server sees a key, never the
+    /// password. This pins that the check is skipped deliberately rather than by accident.
+    #[test]
+    fn client_keys_are_not_subject_to_the_password_length_rule() {
+        let p = peppers();
+        assert!(hash(KEY, SALT, client_scheme(), &p).is_ok());
+        assert!(matches!(
+            hash("short", SALT, server_scheme(), &p),
+            Err(PasswordError::TooShort)
+        ));
+    }
+
+    #[test]
+    fn client_argon_is_not_below_recommended_but_constrained_is() {
+        assert!(!Scheme::CLIENT_ARGON.is_below_recommended());
+        assert!(Scheme::CONSTRAINED.is_below_recommended());
+        assert!(!Scheme::OWASP.is_below_recommended());
+        // The server half being cheap is the point, and must not be read as the work factor.
+        assert!(Scheme::CLIENT_ARGON.server_params().is_below_recommended());
+    }
+
+    #[test]
+    fn a_cross_scheme_record_is_never_reported_as_needing_a_rehash() {
+        let p = peppers();
+        let stored = hash(KEY, SALT, client_scheme(), &p).unwrap();
+        assert!(!needs_rehash(&stored, server_scheme()));
+        assert!(!needs_rehash(&stored, client_scheme()));
     }
 }

@@ -104,6 +104,24 @@ accounts. Any parse error refuses login outright rather than loading part of the
 
 Then build with the feature: `worker-build --release -- --features password`.
 
+### Choosing where the hashing happens
+
+Optional var `PASSWORD_SCHEME`, default `constrained`:
+
+| value | meaning | server CPU (p95) |
+|---|---|---|
+| `constrained` | Server hashes the password at 4 MiB, t=1. Below OWASP; the pepper is what makes it tolerable. | 4.18 ms (42% of budget) |
+| `client-argon` | Client runs OWASP-grade Argon2id and posts the 32-byte key as hex; the Worker only peppers it. | 1.25 ms (12%) |
+
+An unrecognised value **refuses** login rather than falling back — an operator who asked for the
+stronger scheme and silently got the weaker one is the failure this is guarding against.
+
+**`client-argon` has no browser client yet.** The stock login form posts a plaintext password,
+which that scheme rejects. Use it only if your client performs the derivation itself; the Worker
+warns loudly at startup either way. Credentials written under the two schemes are not
+interchangeable — client records are stored with a leading `c` and `verify` refuses a mismatch —
+so switching schemes means existing accounts must set a new password, not merely log in again.
+
 Create an account:
 
 ```bash

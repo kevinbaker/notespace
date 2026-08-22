@@ -32,8 +32,18 @@
 //! run, writing it to a mode-0600 file beside the database. That belongs in `crates/server`
 //! (M5), which does not exist yet.
 
-use notespace_core::password::{Params, PepperSet};
-use worker::Env;
+use notespace_core::password::{PepperSet, Scheme};
+use worker::{console_error, Env};
+
+/// Optional var selecting where the memory-hard work happens.
+///
+/// `constrained` (default) hashes server-side at the strongest setting that fits the CPU budget.
+/// `client-argon` expects the client to have run OWASP-grade Argon2id already and to post the
+/// derived key; the Worker only peppers it.
+///
+/// A var rather than a secret: which scheme is in use is not a secret, and every stored
+/// credential names it anyway.
+pub const SCHEME_BINDING: &str = "PASSWORD_SCHEME";
 
 /// Secret holding every pepper the deployment has ever used.
 ///
@@ -53,7 +63,7 @@ pub enum AuthConfig {
     /// Password login is compiled out. Authentication is external (OIDC).
     External,
     /// Password login is available.
-    Passwords { peppers: PepperSet, params: Params },
+    Passwords { peppers: PepperSet, scheme: Scheme },
     /// Password login is compiled in but refuses to run. Auth routes must answer 503.
     Refused(&'static str),
 }
@@ -84,11 +94,29 @@ impl AuthConfig {
                 )
             }
         };
-        AuthConfig::Passwords {
-            peppers,
+        let scheme = match env
+            .var(SCHEME_BINDING)
+            .ok()
+            .map(|v| v.to_string())
+            .as_deref()
+        {
             // The Worker cannot afford OWASP parameters (DESIGN.md §4.10). The pepper above is
             // what makes that tolerable, which is why it is mandatory rather than advised.
-            params: Params::CONSTRAINED,
-        }
+            None | Some("constrained") => Scheme::CONSTRAINED,
+            Some("client-argon") => Scheme::CLIENT_ARGON,
+            Some(other) => {
+                // Not a fallback to the default. An operator who asked for a stronger scheme and
+                // silently got the weaker one is the exact failure this whole module is about.
+                console_error!(
+                    "{SCHEME_BINDING}={other:?} is not a known scheme. Expected \
+                     \"constrained\" or \"client-argon\". Password login is disabled."
+                );
+                return AuthConfig::Refused(
+                    "PASSWORD_SCHEME is not a known scheme. Expected \"constrained\" or \
+                     \"client-argon\".",
+                );
+            }
+        };
+        AuthConfig::Passwords { peppers, scheme }
     }
 }

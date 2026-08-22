@@ -111,12 +111,12 @@ fn post_public_id(i: usize) -> String {
 /// PASSWORD_PEPPER, so the hash written here verifies against the running deployment — a fixture
 /// hashed under a different pepper would fail login for reasons that look like a code bug.
 fn user_sql(name: &str, password: &str, pepper_spec: &str) -> String {
-    use notespace_core::password::{self, Params, PepperSet};
+    use notespace_core::password::{self, PepperSet, Scheme};
     let peppers = PepperSet::parse(pepper_spec).expect("valid pepper spec");
     // Deterministic salt: this is a seeding tool, and a reproducible fixture is worth more than
     // unpredictability no attacker is present for.
     let salt = password::encode_salt(b"notespace-seed01").expect("salt encodes");
-    let hash = password::hash(password, &salt, Params::CONSTRAINED, &peppers).expect("hash");
+    let hash = password::hash(password, &salt, Scheme::CONSTRAINED, &peppers).expect("hash");
     format!(
         // Upsert: the base seed already creates accounts without credentials, so a plain
         // INSERT collides with the unique name and silently leaves them unable to log in.

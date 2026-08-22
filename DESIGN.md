@@ -678,10 +678,39 @@ What follows:
   check — sub-millisecond — and the problem disappears. Already the intended direction.
 - **The self-hosted target has no 10 ms limit** and uses `Params::OWASP` unchanged. The
   dual-target design turns out to matter here for a reason nobody planned.
-- **`Params::CONSTRAINED`** exists for a free Worker that insists on passwords: 4 MiB, t=1. It
+- **`Scheme::CONSTRAINED`** exists for a free Worker that insists on passwords: 4 MiB, t=1. It
   is never the default, and the Worker logs a `console_error` at startup when it is in use. A
   weakened KDF nobody mentions is how it stays weakened.
+- **`Scheme::CLIENT_ARGON`** takes the other way out: the scarce CPU is the *Worker's*, and the
+  browser's is not scarce. The client runs OWASP-grade Argon2id and posts the 32-byte result;
+  the Worker applies `Params::HANDOFF` (1 MiB, t=1 — **1.25 ms p95, 12% of budget**, against
+  4.18 ms / 42% for `CONSTRAINED`) purely to pepper it. See §4.10.1.
 - **A paid plan** raises the limit to 30 s, at which point all of this is moot.
+
+##### 4.10.1 Client-side Argon2id
+
+Selected with `PASSWORD_SCHEME=client-argon`. The honest trade:
+
+| | |
+|---|---|
+| **Gained** | A stolen database costs a full 19 MiB Argon2id run *per guess* — the work factor no free-Worker server-side scheme can charge. Plus 3.3× of the request's CPU back. |
+| **Lost** | Login requires a client that performs the derivation. The salt must be fetched before submit, so that endpoint has to answer for unknown accounts too or it becomes the enumeration oracle §4.11 exists to avoid. |
+| **Unchanged** | Anyone reading the derived key in flight holds a password-equivalent — exactly their position with the password itself. |
+
+The danger is not the cryptography, it is that a client record and a server record *look alike*:
+both end in a cheap Argon2id PHC string. Cheap is sound over a key that cost 19 MiB to derive and
+close to worthless over a plaintext password. So the two are made non-interchangeable twice over:
+stored client records carry a `c` marker and `verify` refuses a mismatch rather than guessing,
+and the hashed input is domain-separated so the digests cannot collide even if a marker were
+forged. Both failures are closed — a mismatch rejects the login. Neither can silently downgrade.
+
+`MIN_PASSWORD_CHARS` does not apply server-side under this scheme, because the server never sees
+the password. Enforcing length becomes the client's job, and that is a real transfer of
+responsibility rather than a detail.
+
+**No browser client ships yet.** The scheme is usable today only by a caller that derives the key
+itself; the stock login form posts a plaintext password, which this scheme rejects (closed, not
+weakly accepted). The Worker says so at startup. Building the browser half is the remaining work.
 
 Hashes are PHC strings — `$argon2id$v=19$m=19456,t=2,p=1$salt$hash` — so cost travels with the
 hash and `verify` can report `YesRehash` to upgrade an account on its next login, the one moment

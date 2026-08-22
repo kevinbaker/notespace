@@ -170,7 +170,7 @@ fn migrations_apply_to_plain_sqlite() {
 // ---------------------------------------------------------------------------
 
 use notespace_core::login::{attempt, Attempt, LoginConfig, Outcome};
-use notespace_core::password::{self, Params, Pepper, PepperSet};
+use notespace_core::password::{self, Params, Pepper, PepperSet, Scheme};
 use notespace_core::ratelimit::Limit;
 use notespace_core::session::{SessionPolicy, SessionToken, TOKEN_BYTES};
 use notespace_core::store::Store;
@@ -178,16 +178,16 @@ use notespace_core::store::Store;
 const NOW: i64 = 1_800_000_000_000;
 const PW: &str = "correct horse battery staple";
 /// Cheap on purpose: these tests exercise the flow, not the work factor.
-const FAST: Params = Params {
+const FAST: Scheme = Scheme::Server(Params {
     m_kib: 64,
     t: 1,
     p: 1,
-};
+});
 
 fn config() -> LoginConfig {
     let peppers = PepperSet::single(0, Pepper::new(&[9u8; 32]).unwrap());
     LoginConfig {
-        params: FAST,
+        scheme: FAST,
         dummy_hash: LoginConfig::dummy_hash_for(FAST, &peppers),
         peppers,
         sessions: SessionPolicy::default(),
@@ -204,7 +204,7 @@ fn config() -> LoginConfig {
 
 async fn with_account(store: &SqliteStore, cfg: &LoginConfig, name: &str, pw: Option<&str>) {
     let hash =
-        pw.map(|p| password::hash(p, "c29tZXNhbHR2YWx1ZTE", cfg.params, &cfg.peppers).unwrap());
+        pw.map(|p| password::hash(p, "c29tZXNhbHR2YWx1ZTE", cfg.scheme, &cfg.peppers).unwrap());
     store
         .create_user(name, NOW, hash.as_deref())
         .await

@@ -23,14 +23,14 @@
 //! them hands an attacker the account list.
 
 use crate::model::{Timestamp, User};
-use crate::password::{self, Params, PepperSet, Verified};
+use crate::password::{self, PepperSet, Scheme, Verified};
 use crate::ratelimit::{AttemptKeys, Limit};
 use crate::session::{Session, SessionPolicy, SessionToken};
 use crate::store::{Store, StoreResult};
 
 /// What a deployment's login path is configured with.
 pub struct LoginConfig {
-    pub params: Params,
+    pub scheme: Scheme,
     pub peppers: PepperSet,
     pub sessions: SessionPolicy,
     pub per_identity: Limit,
@@ -48,14 +48,27 @@ impl LoginConfig {
     ///
     /// The password hashed here is never a valid credential: it is not reachable through any
     /// form, and the salt is fixed because nothing about this hash is secret — only its cost.
-    pub fn dummy_hash_for(params: Params, peppers: &PepperSet) -> String {
-        password::hash(
-            "\0not-a-password\0dummy-for-timing-only",
-            "ZHVtbXlzYWx0Zm9ydGltaW5n",
-            params,
-            peppers,
-        )
-        .unwrap_or_default()
+    ///
+    /// The input has to satisfy the scheme's own shape rules, or `hash` fails and the dummy
+    /// becomes `""` — which verifies instantly against everything and silently removes the
+    /// timing cover this exists to provide. Under a client scheme that means a well-formed
+    /// 32-byte key, not a passphrase. [`Self::dummy_hash_is_real`] is the assertion that it
+    /// worked; startup should refuse rather than serve logins with a hollow dummy.
+    pub fn dummy_hash_for(scheme: Scheme, peppers: &PepperSet) -> String {
+        let secret = match scheme {
+            Scheme::Server(_) => "\0not-a-password\0dummy-for-timing-only",
+            // 32 bytes, fixed: nothing here is secret except the cost of hashing it.
+            Scheme::Client { .. } => {
+                "64756d6d792d636c69656e742d6b65792d666f722d74696d696e672d6f6e6c7900"
+            }
+        };
+        password::hash(secret, "ZHVtbXlzYWx0Zm9ydGltaW5n", scheme, peppers).unwrap_or_default()
+    }
+
+    /// Whether the dummy hash actually built. A `false` here means every unknown-account login
+    /// returns faster than a real one, which is an account-enumeration oracle.
+    pub fn dummy_hash_is_real(&self) -> bool {
+        !self.dummy_hash.is_empty()
     }
 }
 
@@ -117,7 +130,7 @@ pub async fn attempt<S: Store>(
         .as_ref()
         .and_then(|c| c.password_hash.as_deref())
         .unwrap_or(cfg.dummy_hash.as_str());
-    let verdict = password::verify(a.password, stored, cfg.params, &cfg.peppers)
+    let verdict = password::verify(a.password, stored, cfg.scheme, &cfg.peppers)
         // A hash this deployment cannot read is not a login failure to report to the visitor,
         // but it is also not a reason to let them in.
         .unwrap_or(Verified::No);
@@ -143,7 +156,7 @@ pub async fn attempt<S: Store>(
     // 4. Upgrade the stored hash while the plaintext is in hand — the only moment it is.
     if verdict == Verified::YesRehash {
         if let Ok(salt) = password::encode_salt(&a.token.hash().as_str().as_bytes()[..16]) {
-            if let Ok(fresh) = password::hash(a.password, &salt, cfg.params, &cfg.peppers) {
+            if let Ok(fresh) = password::hash(a.password, &salt, cfg.scheme, &cfg.peppers) {
                 store.set_password_hash(credential.user.id, &fresh).await?;
             }
         }

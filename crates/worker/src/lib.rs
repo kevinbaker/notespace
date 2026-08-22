@@ -70,6 +70,9 @@ fn posture(env: &Env) -> startup::Posture {
     match auth_config::AuthConfig::resolve(env) {
         auth_config::AuthConfig::External => startup::Posture::External,
         auth_config::AuthConfig::Refused(why) => startup::Posture::Refused(why),
+        auth_config::AuthConfig::Passwords { scheme, .. } if scheme.client_params().is_some() => {
+            startup::Posture::PasswordsClientArgon
+        }
         auth_config::AuthConfig::Passwords { .. } => startup::Posture::PasswordsWithPepper,
     }
 }
@@ -209,9 +212,9 @@ async fn login_submit(
         auth_config::AuthConfig::External => {
             return error(StatusCode::NOT_FOUND, "password login is disabled")
         }
-        auth_config::AuthConfig::Passwords { peppers, params } => (peppers, params),
+        auth_config::AuthConfig::Passwords { peppers, scheme } => (peppers, scheme),
     };
-    let (peppers, params) = cfg;
+    let (peppers, scheme) = cfg;
 
     let form = form_urlencoded::parse(body.as_bytes());
     let (mut username, mut password, mut token, mut next) =
@@ -251,8 +254,8 @@ async fn login_submit(
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
     };
     let login_cfg = login::LoginConfig {
-        dummy_hash: login::LoginConfig::dummy_hash_for(params, &peppers),
-        params,
+        dummy_hash: login::LoginConfig::dummy_hash_for(scheme, &peppers),
+        scheme,
         peppers,
         sessions: notespace_core::session::SessionPolicy::default(),
         per_identity: notespace_core::ratelimit::Limit::PER_IDENTITY,
