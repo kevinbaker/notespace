@@ -5,17 +5,31 @@ name = "notespace-dev"
 main = "crates/worker/build/worker/shim.mjs"
 compatibility_date = "2025-08-01"
 
-# Runs on `wrangler dev` and `wrangler deploy` from a machine that has Rust.
+# Also expose <name>.<subdomain>.workers.dev alongside the custom domain. Useful for comparing
+# numbers, and it works even if the custom domain is misconfigured.
 #
-# It does NOT run in Cloudflare's own build environment (Workers Builds / the dashboard's Git
-# integration): that image ships Node, not rustup, cargo or worker-build, so a dashboard-driven
-# build of this project fails and the Worker keeps serving whatever it had. Deploy from a
-# developer machine or from CI that installs Rust.
+# Must stay above the first [table] header: TOML assigns a bare key to whichever table precedes
+# it, so this sitting below [[d1_databases]] made it a D1 field that wrangler warned about and
+# dropped.
+workers_dev = true
+
+# dev.notespace.org is attached to this Worker via the dashboard, and is left that way
+# deliberately: wrangler only manages routes it is told about, so an undeclared route survives a
+# deploy untouched. To bring it under version control instead, uncomment below -- but only once a
+# deploy has succeeded, since a custom_domain that already exists elsewhere makes the deploy fail
+# rather than adopt it.
+#
+# routes = [
+#   { pattern = "dev.notespace.org", custom_domain = true }
+# ]
+
+# Runs on `wrangler dev` and `wrangler deploy` from a machine that has Rust. It does NOT run in
+# Cloudflare's own build environment (Workers Builds / the dashboard's Git integration), which
+# ships Node but not rustup, cargo or worker-build.
 [build]
-# Wrangler runs this through /bin/sh, which does NOT source your shell profile -- so
-# ~/.cargo/bin is usually absent from PATH even when worker-build is installed, and the build
-# dies with "worker-build: not found" (exit 127). Prepending it here fixes that case; if the
-# tool genuinely is not installed, `cargo install worker-build` still does.
+# Wrangler runs this through /bin/sh, which does not source your shell profile, so ~/.cargo/bin
+# is usually absent from PATH even when worker-build is installed. Prepending it here avoids
+# "worker-build: not found" (exit 127).
 command = 'PATH="$HOME/.cargo/bin:$PATH" worker-build --release'
 cwd = "crates/worker"
 
@@ -24,28 +38,12 @@ cwd = "crates/worker"
 # "no D1 binding", not at build time.
 #
 # These bindings REPLACE whatever is configured in the dashboard when you `wrangler deploy`, so
-# database_id below must be the real notespace-dev id -- a stale one points the deployed Worker
-# at the wrong database and every page 500s.
+# database_id must be the real notespace-dev id -- a stale one points the deployed Worker at the
+# wrong database and every page 500s.
 binding = "DATABASE"
 database_name = "notespace-dev"
-# The earlier `notespace` database (343f5c82-...) is unused; this is the dev one.
 database_id = "b8eef966-34ce-43e3-abd2-739e56d622d5"
 migrations_dir = "migrations"
-
-
-# Also expose <name>.<subdomain>.workers.dev alongside the custom domain. Useful for comparing
-# numbers, and it works even if the custom domain is misconfigured.
-workers_dev = true
-
-# dev.notespace.org is currently attached to this Worker via the dashboard, and is left that
-# way deliberately: wrangler only manages routes it is told about, so an undeclared route
-# survives a deploy untouched. To bring it under version control instead, uncomment below --
-# but only once a deploy has succeeded, since a custom_domain that already exists elsewhere
-# makes the deploy fail rather than adopt it.
-#
-# routes = [
-#   { pattern = "dev.notespace.org", custom_domain = true }
-# ]
 
 [observability]
 enabled = true
