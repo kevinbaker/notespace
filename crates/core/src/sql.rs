@@ -160,3 +160,33 @@ pub const DELETE_SESSION: &str = "DELETE FROM session WHERE token_hash = ?1";
 ///
 /// Binds: `?1` user_id.
 pub const DELETE_USER_SESSIONS: &str = "DELETE FROM session WHERE user_id = ?1";
+
+// ---------------------------------------------------------------------------
+// Login rate limiting (DESIGN.md §4.12)
+// ---------------------------------------------------------------------------
+
+/// Current counters for the two buckets an attempt is checked against.
+///
+/// One statement for both, because the check runs before the password hash on every login and a
+/// second round trip there is a round trip on the attacker's schedule.
+///
+/// Binds: `?1` identity key, `?2` client key.
+pub const LOGIN_ATTEMPTS: &str = "\
+SELECT key, window_start, count FROM login_attempt WHERE key = ?1 OR key = ?2";
+
+/// Record an attempt. Upsert so the first failure in a window creates the row.
+///
+/// Binds: `?1` key, `?2` window_start, `?3` count.
+pub const RECORD_LOGIN_ATTEMPT: &str = "\
+INSERT INTO login_attempt (key, window_start, count) VALUES (?1, ?2, ?3) \
+ON CONFLICT(key) DO UPDATE SET window_start = ?2, count = ?3";
+
+/// Clear a bucket. Used on a successful login so a correct password is never punished.
+///
+/// Binds: `?1` key.
+pub const CLEAR_LOGIN_ATTEMPTS: &str = "DELETE FROM login_attempt WHERE key = ?1";
+
+/// Drop windows that ended long ago.
+///
+/// Binds: `?1` cutoff timestamp.
+pub const SWEEP_LOGIN_ATTEMPTS: &str = "DELETE FROM login_attempt WHERE window_start < ?1";

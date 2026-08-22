@@ -148,16 +148,16 @@ fn auth_status_inner(env: &Env) -> Response {
             format!(
                 "password login is configured but not yet implemented\n\
                  argon2id m={} KiB t={} p={} (below OWASP: {})\n\
-                 pepper: configured{}\n",
+                 peppers held: {} (current id {})\n",
                 params.m_kib,
                 params.t,
                 params.p,
                 params.is_below_recommended(),
-                if peppers.previous.is_some() {
-                    ", rotation in progress"
-                } else {
-                    ""
-                }
+                peppers.len(),
+                peppers
+                    .current_id()
+                    .map(|i| i.to_string())
+                    .unwrap_or_else(|| "none".into())
             ),
         )
             .into_response(),

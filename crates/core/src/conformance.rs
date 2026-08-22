@@ -22,6 +22,7 @@
 use crate::id::PublicId;
 use crate::model::{NewPost, SanitizedHtml};
 use crate::path::Path;
+use crate::ratelimit::{AttemptKeys, Attempts, Limit};
 use crate::session::{Session, SessionPolicy, SessionToken, TOKEN_BYTES};
 use crate::store::{Page, Store, StoreError};
 
@@ -118,7 +119,139 @@ async fn write_checks<S: Store>(store: &S, fx: &Fixture) -> Vec<Check> {
         refresh_extends_a_session(store, fx).await,
         logout_is_immediate_and_idempotent(store, fx).await,
         logout_everywhere_ends_every_session(store, fx).await,
+        rate_limit_counters_round_trip(store, fx).await,
+        a_successful_login_clears_its_bucket(store, fx).await,
+        the_sweep_removes_only_old_windows(store, fx).await,
     ]
+}
+
+fn keys(fx: &Fixture, tag: &str) -> AttemptKeys {
+    let _ = fx;
+    AttemptKeys::new(&format!("user-{tag}"), &format!("198.51.100.{}", tag.len()))
+}
+
+async fn rate_limit_counters_round_trip<S: Store>(store: &S, fx: &Fixture) -> Check {
+    const NAME: &str = "login attempt counters round trip, per bucket";
+    let k = keys(fx, "roundtrip");
+    match store.login_attempts(&k).await {
+        Ok((None, None)) => {}
+        Ok(_) => return Check::fail(NAME, "fresh keys already had counters"),
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    }
+    // Drive the identity bucket to its limit, exactly as a login handler would.
+    let limit = Limit::PER_IDENTITY;
+    let mut state = None;
+    for i in 1..=limit.max {
+        let d = limit.check(state, NOW);
+        if !d.allowed() {
+            return Check::fail(NAME, format!("denied at attempt {i} of {}", limit.max));
+        }
+        let next = d.next().expect("allow carries a counter");
+        if let Err(e) = store.record_login_attempt(&k.identity, next).await {
+            return Check::fail(NAME, format!("record: {e}"));
+        }
+        state = match store.login_attempts(&k).await {
+            Ok((id, _)) => id,
+            Err(e) => return Check::fail(NAME, format!("{e}")),
+        };
+        require!(
+            NAME,
+            state == Some(next),
+            "stored {:?}, read back {:?}",
+            next,
+            state
+        );
+    }
+    require!(
+        NAME,
+        !limit.check(state, NOW).allowed(),
+        "the limit did not bite after {} attempts",
+        limit.max
+    );
+    // The client bucket is independent: it saw nothing.
+    match store.login_attempts(&k).await {
+        Ok((_, None)) => Check::pass(NAME),
+        Ok((_, Some(_))) => Check::fail(NAME, "identity attempts leaked into the client bucket"),
+        Err(e) => Check::fail(NAME, format!("{e}")),
+    }
+}
+
+async fn a_successful_login_clears_its_bucket<S: Store>(store: &S, fx: &Fixture) -> Check {
+    const NAME: &str = "a successful login clears the counter";
+    let k = keys(fx, "cleared");
+    if let Err(e) = store
+        .record_login_attempt(
+            &k.identity,
+            Attempts {
+                window_start: NOW,
+                count: 4,
+            },
+        )
+        .await
+    {
+        return Check::fail(NAME, format!("record: {e}"));
+    }
+    if let Err(e) = store.clear_login_attempts(&k.identity).await {
+        return Check::fail(NAME, format!("clear: {e}"));
+    }
+    match store.login_attempts(&k).await {
+        Ok((None, _)) => {}
+        Ok((Some(a), _)) => return Check::fail(NAME, format!("counter survived: {a:?}")),
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    }
+    // Idempotent: clearing an absent bucket is success, not an error.
+    match store.clear_login_attempts(&k.identity).await {
+        Ok(()) => Check::pass(NAME),
+        Err(e) => Check::fail(NAME, format!("second clear errored: {e}")),
+    }
+}
+
+async fn the_sweep_removes_only_old_windows<S: Store>(store: &S, fx: &Fixture) -> Check {
+    const NAME: &str = "the sweep removes old windows and spares current ones";
+    let old = keys(fx, "sweep-old");
+    let fresh = keys(fx, "sweep-fresh");
+    let day = 24 * 60 * 60 * 1000;
+    if let Err(e) = store
+        .record_login_attempt(
+            &old.identity,
+            Attempts {
+                window_start: NOW - day,
+                count: 3,
+            },
+        )
+        .await
+    {
+        return Check::fail(NAME, format!("{e}"));
+    }
+    if let Err(e) = store
+        .record_login_attempt(
+            &fresh.identity,
+            Attempts {
+                window_start: NOW,
+                count: 3,
+            },
+        )
+        .await
+    {
+        return Check::fail(NAME, format!("{e}"));
+    }
+    match store.sweep_login_attempts(NOW - day / 2).await {
+        Ok(n) => require!(
+            NAME,
+            n >= 1,
+            "swept {n} rows, expected at least the old one"
+        ),
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    }
+    match (
+        store.login_attempts(&old).await,
+        store.login_attempts(&fresh).await,
+    ) {
+        (Ok((None, _)), Ok((Some(_), _))) => Check::pass(NAME),
+        (Ok((Some(_), _)), _) => Check::fail(NAME, "the old window survived the sweep"),
+        (_, Ok((None, _))) => Check::fail(NAME, "the sweep took a current window with it"),
+        (Err(e), _) | (_, Err(e)) => Check::fail(NAME, format!("{e}")),
+    }
 }
 
 const NOW: i64 = 1_800_000_000_000;

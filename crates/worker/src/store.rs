@@ -14,6 +14,7 @@ use core::cell::Cell;
 use notespace_core::id::PublicId;
 use notespace_core::model::*;
 use notespace_core::path::Path;
+use notespace_core::ratelimit::{AttemptKeys, Attempts};
 use notespace_core::session::{Session, TokenHash};
 use notespace_core::sql;
 use notespace_core::store::{
@@ -81,6 +82,13 @@ struct ThreadRow {
     space_name: String,
     space_ranking: String,
     space_depth_cap: i64,
+}
+
+#[derive(Deserialize)]
+struct AttemptRow {
+    key: String,
+    window_start: i64,
+    count: i64,
 }
 
 #[derive(Deserialize)]
@@ -547,6 +555,61 @@ impl Store for D1Store {
 
     async fn insert_post(&self, new: &NewPost) -> StoreResult<Post> {
         self.append_post(new).await
+    }
+
+    async fn login_attempts(
+        &self,
+        keys: &AttemptKeys,
+    ) -> StoreResult<(Option<Attempts>, Option<Attempts>)> {
+        let res = self
+            .db
+            .prepare(sql::LOGIN_ATTEMPTS)
+            .bind(&[keys.identity.as_str().into(), keys.client.as_str().into()])
+            .map_err(backend)?
+            .all()
+            .await
+            .map_err(backend)?;
+        self.last_stats.set(collect_stats(&[&res]));
+        let rows: Vec<AttemptRow> = res.results().map_err(backend)?;
+        let (mut identity, mut client) = (None, None);
+        for r in rows {
+            let a = Attempts {
+                window_start: r.window_start,
+                count: r.count as u32,
+            };
+            if r.key == keys.identity {
+                identity = Some(a);
+            } else if r.key == keys.client {
+                client = Some(a);
+            }
+        }
+        Ok((identity, client))
+    }
+
+    async fn record_login_attempt(&self, key: &str, attempts: Attempts) -> StoreResult<()> {
+        self.run(
+            sql::RECORD_LOGIN_ATTEMPT,
+            vec![
+                key.into(),
+                num(attempts.window_start),
+                num(attempts.count as i64),
+            ],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn clear_login_attempts(&self, key: &str) -> StoreResult<()> {
+        self.run(sql::CLEAR_LOGIN_ATTEMPTS, vec![key.into()])
+            .await
+            .map(|_| ())
+    }
+
+    async fn sweep_login_attempts(&self, cutoff: Timestamp) -> StoreResult<u32> {
+        Ok(self
+            .run(sql::SWEEP_LOGIN_ATTEMPTS, vec![num(cutoff)])
+            .await?
+            .unwrap_or(0))
     }
 
     async fn create_session(&self, session: &Session) -> StoreResult<()> {

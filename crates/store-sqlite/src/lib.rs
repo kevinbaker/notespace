@@ -20,6 +20,7 @@
 use notespace_core::id::PublicId;
 use notespace_core::model::*;
 use notespace_core::path::Path;
+use notespace_core::ratelimit::{AttemptKeys, Attempts};
 use notespace_core::session::{Session, TokenHash};
 use notespace_core::sql;
 use notespace_core::store::{
@@ -335,6 +336,65 @@ impl Store for SqliteStore {
         let n = self
             .conn
             .execute(sql::DELETE_USER_SESSIONS, [user])
+            .map_err(backend)?;
+        Ok(n as u32)
+    }
+
+    async fn login_attempts(
+        &self,
+        keys: &AttemptKeys,
+    ) -> StoreResult<(Option<Attempts>, Option<Attempts>)> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(sql::LOGIN_ATTEMPTS)
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![keys.identity.as_str(), keys.client.as_str()],
+                |r| {
+                    Ok((
+                        r.get::<_, String>("key")?,
+                        Attempts {
+                            window_start: r.get("window_start")?,
+                            count: r.get::<_, i64>("count")? as u32,
+                        },
+                    ))
+                },
+            )
+            .map_err(backend)?;
+        let (mut identity, mut client) = (None, None);
+        for row in rows {
+            let (key, a) = row.map_err(backend)?;
+            if key == keys.identity {
+                identity = Some(a);
+            } else if key == keys.client {
+                client = Some(a);
+            }
+        }
+        Ok((identity, client))
+    }
+
+    async fn record_login_attempt(&self, key: &str, attempts: Attempts) -> StoreResult<()> {
+        self.conn
+            .execute(
+                sql::RECORD_LOGIN_ATTEMPT,
+                rusqlite::params![key, attempts.window_start, attempts.count],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn clear_login_attempts(&self, key: &str) -> StoreResult<()> {
+        self.conn
+            .execute(sql::CLEAR_LOGIN_ATTEMPTS, [key])
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn sweep_login_attempts(&self, cutoff: Timestamp) -> StoreResult<u32> {
+        let n = self
+            .conn
+            .execute(sql::SWEEP_LOGIN_ATTEMPTS, [cutoff])
             .map_err(backend)?;
         Ok(n as u32)
     }

@@ -12,12 +12,13 @@ use notespace_store_sqlite::SqliteStore;
 /// `include_str!` needs literal paths, so this list is maintained by hand — and a migration
 /// added without touching it fails as "no such table" somewhere unrelated.
 /// `migration_list_is_complete` below turns that into a clear failure instead.
-const MIGRATIONS: [&str; 5] = [
+const MIGRATIONS: [&str; 6] = [
     include_str!("../../../migrations/0001_init.sql"),
     include_str!("../../../migrations/0002_thread_public_id.sql"),
     include_str!("../../../migrations/0003_space_paths_and_names.sql"),
     include_str!("../../../migrations/0004_post_public_id.sql"),
     include_str!("../../../migrations/0005_session.sql"),
+    include_str!("../../../migrations/0006_login_attempt.sql"),
 ];
 
 const MIGRATIONS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations");

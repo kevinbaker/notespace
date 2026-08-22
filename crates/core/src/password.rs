@@ -41,6 +41,7 @@
 //! [`needs_rehash`] is what makes that upgrade path real.
 
 use core::fmt;
+use std::collections::BTreeMap;
 
 use argon2::{Algorithm, Argon2, Version};
 use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt, SaltString};
@@ -85,39 +86,71 @@ impl fmt::Debug for Pepper {
     }
 }
 
-/// The peppers a deployment will accept, newest first.
+/// Every pepper a deployment has ever used, keyed by id.
 ///
-/// Rotation is the reason this is a ring rather than a value. A pepper cannot be changed in
-/// place — the hashes depend on it and the plaintexts are gone — so a rotation keeps the old one
-/// for verification while [`verify`] reports that the hash should be rewritten. Logins migrate
-/// accounts one at a time, and the old pepper is dropped once the tail is small enough to force
-/// a reset.
+/// # Why the id, and not just a list
 ///
-/// `None` means unpeppered, which is what the self-hosted default is until an operator sets one.
+/// Verifying a *wrong* password against a list means trying each pepper in turn, and each try is
+/// a full Argon2 run. Measured at [`Params::CONSTRAINED`], that is 3.34 ms per attempt: two
+/// peppers fit the 10 ms budget, three do not (10.03 ms). A list therefore caps rotation at one
+/// generation, on the failed-login path specifically — the path an attacker controls.
+///
+/// So the stored hash records which pepper made it, and verification looks up exactly that one.
+/// Cost is constant no matter how many are held, which is what makes keeping all of them
+/// practical: a pepper never has to be retired on a deadline, and no account is ever stranded by
+/// a rotation that finished before it came back.
+///
+/// # Storage format
+///
+/// `<id>$<phc>`, e.g. `3$argon2id$v=19$m=4096,t=1,p=1$…`. An empty prefix (`$argon2id$…`, which
+/// is what PHC produces on its own) means unpeppered. Unambiguous because a PHC string always
+/// begins with `$`.
 #[derive(Debug, Clone, Default)]
-pub struct PepperRing {
-    pub current: Option<Pepper>,
-    /// Accepted on verify, never used for new hashes.
-    pub previous: Option<Pepper>,
+pub struct PepperSet {
+    peppers: BTreeMap<u32, Pepper>,
+    /// Which one new hashes use. `None` means unpeppered.
+    current: Option<u32>,
 }
 
-impl PepperRing {
+impl PepperSet {
+    /// No peppers. What the self-hosted default is until an operator sets one.
     pub fn none() -> Self {
-        PepperRing::default()
+        PepperSet::default()
     }
 
-    pub fn single(pepper: Pepper) -> Self {
-        PepperRing {
-            current: Some(pepper),
-            previous: None,
+    /// Add a pepper. The highest id added with `make_current` wins for new hashes.
+    ///
+    /// Ids must be stable across deploys: they are recorded in every hash written under them.
+    /// Reusing an id for a different secret strands every account that used the old one.
+    pub fn insert(&mut self, id: u32, pepper: Pepper, make_current: bool) -> &mut Self {
+        self.peppers.insert(id, pepper);
+        if make_current {
+            self.current = Some(id);
         }
+        self
     }
 
-    pub fn rotating(current: Pepper, previous: Pepper) -> Self {
-        PepperRing {
-            current: Some(current),
-            previous: Some(previous),
-        }
+    /// A single pepper, used for new hashes.
+    pub fn single(id: u32, pepper: Pepper) -> Self {
+        let mut s = PepperSet::none();
+        s.insert(id, pepper, true);
+        s
+    }
+
+    pub fn current_id(&self) -> Option<u32> {
+        self.current
+    }
+
+    pub fn len(&self) -> usize {
+        self.peppers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.peppers.is_empty()
+    }
+
+    fn get(&self, id: u32) -> Option<&Pepper> {
+        self.peppers.get(&id)
     }
 
     fn argon2_for<'k>(
@@ -133,6 +166,24 @@ impl PepperRing {
             None => Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, p)),
         }
     }
+}
+
+/// Split a stored value into its pepper id and the PHC string.
+///
+/// `None` id means the hash is unpeppered.
+fn split_stored(stored: &str) -> Result<(Option<u32>, &str), PasswordError> {
+    if stored.starts_with('$') {
+        return Ok((None, stored));
+    }
+    let (id, phc) = stored
+        .split_once('$')
+        .ok_or_else(|| PasswordError::MalformedHash("no PHC section".into()))?;
+    let id: u32 = id
+        .parse()
+        .map_err(|_| PasswordError::MalformedHash(format!("bad pepper id {id:?}")))?;
+    // `split_once` ate the `$` that PHC needs to start with.
+    let start = stored.len() - phc.len() - 1;
+    Ok((Some(id), &stored[start..]))
 }
 
 /// Why a verification succeeded, and whether the stored hash should be rewritten.
@@ -230,6 +281,10 @@ pub enum PasswordError {
     BadSalt(String),
     #[error("hashing failed: {0}")]
     Hash(String),
+    /// The hash names a pepper this deployment does not hold. Not a failed login: the account
+    /// cannot be verified at all and needs a reset.
+    #[error("hash was made with pepper {0}, which is not configured")]
+    UnknownPepper(u32),
 }
 
 /// Hash a password with the ring's current pepper.
@@ -240,17 +295,27 @@ pub fn hash(
     password: &str,
     salt_b64: &str,
     params: Params,
-    peppers: &PepperRing,
+    peppers: &PepperSet,
 ) -> Result<String, PasswordError> {
     if password.chars().count() < MIN_PASSWORD_CHARS {
         return Err(PasswordError::TooShort);
     }
     let salt = Salt::from_b64(salt_b64).map_err(|e| PasswordError::BadSalt(e.to_string()))?;
-    peppers
-        .argon2_for(peppers.current.as_ref(), params)?
+    let current = peppers.current;
+    let pepper = match current {
+        Some(id) => Some(peppers.get(id).ok_or(PasswordError::UnknownPepper(id))?),
+        None => None,
+    };
+    let phc = peppers
+        .argon2_for(pepper, params)?
         .hash_password(password.as_bytes(), salt)
         .map(|h| h.to_string())
-        .map_err(|e| PasswordError::Hash(e.to_string()))
+        .map_err(|e| PasswordError::Hash(e.to_string()))?;
+    // Record which pepper made this, so verification tries exactly one.
+    Ok(match current {
+        Some(id) => format!("{id}{phc}"),
+        None => phc,
+    })
 }
 
 /// Encode raw salt bytes for [`hash`].
@@ -275,43 +340,40 @@ pub fn verify(
     password: &str,
     stored: &str,
     want: Params,
-    peppers: &PepperRing,
+    peppers: &PepperSet,
 ) -> Result<Verified, PasswordError> {
-    let parsed =
-        PasswordHash::new(stored).map_err(|e| PasswordError::MalformedHash(e.to_string()))?;
+    let (hash_pepper_id, phc) = split_stored(stored)?;
+    let parsed = PasswordHash::new(phc).map_err(|e| PasswordError::MalformedHash(e.to_string()))?;
 
-    for (pepper, is_current) in [
-        (peppers.current.as_ref(), true),
-        (peppers.previous.as_ref(), false),
-    ] {
-        // Skip the second attempt when there is no previous pepper, and never try unpeppered
-        // as a fallback -- silently accepting an unpeppered hash would make the pepper optional
-        // in practice.
-        if !is_current && peppers.previous.is_none() {
-            continue;
+    // Exactly one lookup, and therefore exactly one Argon2 run, however many peppers are held.
+    let pepper = match hash_pepper_id {
+        Some(id) => Some(peppers.get(id).ok_or(PasswordError::UnknownPepper(id))?),
+        None => None,
+    };
+    let argon = peppers.argon2_for(pepper, want)?;
+
+    match argon.verify_password(password.as_bytes(), &parsed) {
+        Ok(()) => {
+            let stale_pepper = hash_pepper_id != peppers.current;
+            Ok(if stale_pepper || needs_rehash(stored, want) {
+                Verified::YesRehash
+            } else {
+                Verified::Yes
+            })
         }
-        let argon = peppers.argon2_for(pepper, want)?;
-        match argon.verify_password(password.as_bytes(), &parsed) {
-            Ok(()) => {
-                return Ok(if is_current && !needs_rehash(stored, want) {
-                    Verified::Yes
-                } else {
-                    // Right password, stale hash: either the old pepper or weaker parameters.
-                    Verified::YesRehash
-                });
-            }
-            Err(password_hash::Error::Password) => continue,
-            Err(e) => return Err(PasswordError::MalformedHash(e.to_string())),
-        }
+        Err(password_hash::Error::Password) => Ok(Verified::No),
+        Err(e) => Err(PasswordError::MalformedHash(e.to_string())),
     }
-    Ok(Verified::No)
 }
 
 /// Whether a stored hash was made with weaker parameters than `want`.
 ///
-/// Does not consider the pepper — [`verify`] knows which pepper matched and folds that in.
+/// Does not consider the pepper — [`verify`] knows which one the hash names and folds that in.
 pub fn needs_rehash(stored: &str, want: Params) -> bool {
-    let Ok(parsed) = PasswordHash::new(stored) else {
+    let Ok((_, phc)) = split_stored(stored) else {
+        return true;
+    };
+    let Ok(parsed) = PasswordHash::new(phc) else {
         // Unreadable: rewriting it is the only way it becomes readable.
         return true;
     };
@@ -328,7 +390,6 @@ pub fn needs_rehash(stored: &str, want: Params) -> bool {
 mod tests {
     use super::*;
 
-    // Cheap parameters: these exercise the plumbing, not the work factor.
     const FAST: Params = Params {
         m_kib: 64,
         t: 1,
@@ -341,9 +402,18 @@ mod tests {
         Pepper::new(&[b; 32]).unwrap()
     }
 
+    /// Every pepper ever used, which is the point: none has to be retired on a deadline.
+    fn many() -> PepperSet {
+        let mut s = PepperSet::none();
+        for id in 1..=8u32 {
+            s.insert(id, pepper(id as u8), id == 8);
+        }
+        s
+    }
+
     #[test]
     fn a_password_verifies_against_its_own_hash() {
-        let ring = PepperRing::none();
+        let ring = PepperSet::none();
         let h = hash(PW, SALT, FAST, &ring).unwrap();
         assert_eq!(verify(PW, &h, FAST, &ring), Ok(Verified::Yes));
         assert_eq!(
@@ -352,111 +422,142 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_hash_carries_its_own_parameters() {
-        let h = hash(PW, SALT, FAST, &PepperRing::none()).unwrap();
-        assert!(
-            h.starts_with("$argon2id$v=19$m=64,t=1,p=1$"),
-            "unexpected PHC: {h}"
-        );
-    }
-
     /// The whole point of a pepper: the stored hash is useless without the out-of-band secret.
     #[test]
     fn a_peppered_hash_does_not_verify_without_the_pepper() {
-        let ring = PepperRing::single(pepper(1));
-        let h = hash(PW, SALT, FAST, &ring).unwrap();
-        assert_eq!(verify(PW, &h, FAST, &ring), Ok(Verified::Yes));
-        // A leaked database, without the Worker secret, yields nothing.
-        assert_eq!(verify(PW, &h, FAST, &PepperRing::none()), Ok(Verified::No));
-        // Nor does the wrong pepper.
+        let set = PepperSet::single(1, pepper(1));
+        let h = hash(PW, SALT, FAST, &set).unwrap();
+        assert_eq!(verify(PW, &h, FAST, &set), Ok(Verified::Yes));
+        // A leaked database without the secret names a pepper nobody holds.
+        assert!(matches!(
+            verify(PW, &h, FAST, &PepperSet::none()),
+            Err(PasswordError::UnknownPepper(1))
+        ));
+        // The wrong secret under the right id is simply a failed login.
         assert_eq!(
-            verify(PW, &h, FAST, &PepperRing::single(pepper(2))),
+            verify(PW, &h, FAST, &PepperSet::single(1, pepper(99))),
             Ok(Verified::No)
         );
     }
 
-    /// Peppering must actually change the stored bytes, or it is doing nothing.
     #[test]
-    fn the_pepper_reaches_the_hash() {
-        let plain = hash(PW, SALT, FAST, &PepperRing::none()).unwrap();
-        let a = hash(PW, SALT, FAST, &PepperRing::single(pepper(1))).unwrap();
-        let b = hash(PW, SALT, FAST, &PepperRing::single(pepper(2))).unwrap();
-        assert_ne!(plain, a);
-        assert_ne!(a, b, "different peppers produced the same hash");
+    fn the_stored_hash_names_its_pepper() {
+        let h = hash(PW, SALT, FAST, &PepperSet::single(7, pepper(7))).unwrap();
+        assert!(h.starts_with("7$argon2id$"), "no pepper id in {h}");
+        assert_eq!(split_stored(&h).unwrap().0, Some(7));
+        // Unpeppered hashes are plain PHC and stay recognisable as such.
+        let plain = hash(PW, SALT, FAST, &PepperSet::none()).unwrap();
+        assert!(plain.starts_with("$argon2id$"));
+        assert_eq!(split_stored(&plain).unwrap().0, None);
     }
 
-    /// Rotation: the old pepper still verifies, and says the hash must be rewritten.
+    /// Holding many peppers must not cost anything at verify time — one lookup, one Argon2 run.
     #[test]
-    fn rotation_accepts_the_previous_pepper_and_asks_for_a_rehash() {
-        let old = PepperRing::single(pepper(1));
+    fn any_pepper_in_the_set_verifies_regardless_of_how_many_there_are() {
+        let set = many();
+        assert_eq!(set.len(), 8);
+        // A hash from each historical pepper still opens, including the oldest.
+        for id in 1..=8u32 {
+            let older = PepperSet::single(id, pepper(id as u8));
+            let h = hash(PW, SALT, FAST, &older).unwrap();
+            let expect = if id == set.current_id().unwrap() {
+                Verified::Yes
+            } else {
+                // Right password, old pepper: rewrite it under the current one.
+                Verified::YesRehash
+            };
+            assert_eq!(verify(PW, &h, FAST, &set), Ok(expect), "pepper {id}");
+        }
+    }
+
+    /// A wrong password must not walk the whole set — that is the CPU budget blowing up.
+    #[test]
+    fn a_wrong_password_costs_one_attempt_not_one_per_pepper() {
+        let set = many();
+        let h = hash(PW, SALT, FAST, &PepperSet::single(3, pepper(3))).unwrap();
+        // Only pepper 3 is consulted; the other seven are never touched.
+        assert_eq!(
+            verify("wrong password here", &h, FAST, &set),
+            Ok(Verified::No)
+        );
+        assert_eq!(split_stored(&h).unwrap().0, Some(3));
+    }
+
+    /// Reusing an id for a different secret strands accounts, so it must not silently pass.
+    #[test]
+    fn a_hash_naming_an_absent_pepper_is_an_error_not_a_failed_login() {
+        let h = hash(PW, SALT, FAST, &PepperSet::single(42, pepper(42))).unwrap();
+        let without = PepperSet::single(1, pepper(1));
+        assert!(matches!(
+            verify(PW, &h, FAST, &without),
+            Err(PasswordError::UnknownPepper(42))
+        ));
+    }
+
+    #[test]
+    fn rotation_asks_for_a_rehash_and_settles_after_one() {
+        let old = PepperSet::single(1, pepper(1));
         let stored = hash(PW, SALT, FAST, &old).unwrap();
 
-        let rotating = PepperRing::rotating(pepper(2), pepper(1));
+        let mut rotated = PepperSet::none();
+        rotated
+            .insert(1, pepper(1), false)
+            .insert(2, pepper(2), true);
+
+        assert_eq!(verify(PW, &stored, FAST, &rotated), Ok(Verified::YesRehash));
         assert_eq!(
-            verify(PW, &stored, FAST, &rotating),
-            Ok(Verified::YesRehash)
-        );
-        // A wrong password is still wrong under either pepper.
-        assert_eq!(
-            verify("wrong password here", &stored, FAST, &rotating),
+            verify("wrong password here", &stored, FAST, &rotated),
             Ok(Verified::No)
         );
 
-        // Once rewritten under the new pepper, no further rehash is asked for.
-        let rewritten = hash(PW, SALT, FAST, &rotating).unwrap();
-        assert_eq!(verify(PW, &rewritten, FAST, &rotating), Ok(Verified::Yes));
-        // And the old pepper alone no longer opens it.
-        assert_eq!(verify(PW, &rewritten, FAST, &old), Ok(Verified::No));
+        let rewritten = hash(PW, SALT, FAST, &rotated).unwrap();
+        assert!(rewritten.starts_with("2$"));
+        assert_eq!(verify(PW, &rewritten, FAST, &rotated), Ok(Verified::Yes));
     }
 
-    /// An unpeppered hash must not quietly pass once a pepper is configured, or the pepper is
-    /// optional in practice and every old account stays unprotected.
     #[test]
-    fn an_unpeppered_hash_is_rejected_once_a_pepper_is_set() {
-        let stored = hash(PW, SALT, FAST, &PepperRing::none()).unwrap();
-        assert_eq!(
-            verify(PW, &stored, FAST, &PepperRing::single(pepper(1))),
-            Ok(Verified::No)
+    fn the_pepper_reaches_the_hash() {
+        let plain = hash(PW, SALT, FAST, &PepperSet::none()).unwrap();
+        let a = hash(PW, SALT, FAST, &PepperSet::single(1, pepper(1))).unwrap();
+        let b = hash(PW, SALT, FAST, &PepperSet::single(1, pepper(2))).unwrap();
+        assert_ne!(plain, a);
+        assert_ne!(
+            a, b,
+            "different peppers under the same id produced the same hash"
         );
     }
 
     #[test]
     fn weaker_stored_parameters_ask_for_a_rehash() {
-        let ring = PepperRing::none();
-        let weak = hash(PW, SALT, FAST, &ring).unwrap();
+        let set = PepperSet::none();
+        let weak = hash(PW, SALT, FAST, &set).unwrap();
         assert!(needs_rehash(&weak, Params::OWASP));
         assert!(!needs_rehash(&weak, FAST));
         assert!(needs_rehash("garbage", Params::OWASP));
-        // Verify reports it rather than making the caller ask separately.
         assert_eq!(
-            verify(PW, &weak, Params::OWASP, &ring),
+            verify(PW, &weak, Params::OWASP, &set),
             Ok(Verified::YesRehash)
         );
     }
 
     #[test]
     fn a_wrong_password_is_a_verdict_not_an_error() {
-        let ring = PepperRing::none();
-        let h = hash(PW, SALT, FAST, &ring).unwrap();
-        assert_eq!(verify("nope nope nope", &h, FAST, &ring), Ok(Verified::No));
-        // Whereas an unusable stored hash is a bug and says so.
-        assert!(verify(PW, "not-a-phc-string", FAST, &ring).is_err());
-        assert!(verify(PW, "", FAST, &ring).is_err());
+        let set = PepperSet::none();
+        let h = hash(PW, SALT, FAST, &set).unwrap();
+        assert_eq!(verify("nope nope nope", &h, FAST, &set), Ok(Verified::No));
+        assert!(verify(PW, "not-a-phc-string", FAST, &set).is_err());
+        assert!(verify(PW, "", FAST, &set).is_err());
+        assert!(verify(PW, "notanumber$argon2id$x", FAST, &set).is_err());
     }
 
     #[test]
     fn short_passwords_and_short_peppers_are_refused() {
-        let ring = PepperRing::none();
+        let set = PepperSet::none();
         assert_eq!(
-            hash("short", SALT, FAST, &ring),
+            hash("short", SALT, FAST, &set),
             Err(PasswordError::TooShort)
         );
-        assert_eq!(
-            hash(&"a".repeat(MIN_PASSWORD_CHARS - 1), SALT, FAST, &ring),
-            Err(PasswordError::TooShort)
-        );
-        assert!(hash(&"a".repeat(MIN_PASSWORD_CHARS), SALT, FAST, &ring).is_ok());
+        assert!(hash(&"a".repeat(MIN_PASSWORD_CHARS), SALT, FAST, &set).is_ok());
         assert!(matches!(
             Pepper::new(&[0u8; 31]),
             Err(PasswordError::WeakPepper(31))
@@ -466,9 +567,9 @@ mod tests {
 
     #[test]
     fn the_same_password_hashes_differently_under_different_salts() {
-        let ring = PepperRing::none();
-        let a = hash(PW, SALT, FAST, &ring).unwrap();
-        let b = hash(PW, "ZGlmZmVyZW50c2FsdDEy", FAST, &ring).unwrap();
+        let set = PepperSet::none();
+        let a = hash(PW, SALT, FAST, &set).unwrap();
+        let b = hash(PW, "ZGlmZmVyZW50c2FsdDEy", FAST, &set).unwrap();
         assert_ne!(a, b, "salt is not reaching the hash");
     }
 
@@ -491,6 +592,6 @@ mod tests {
             !shown.contains("171") && !shown.contains("ab"),
             "pepper leaked: {shown}"
         );
-        assert!(format!("{:?}", PepperRing::single(pepper(1))).contains("redacted"));
+        assert!(format!("{:?}", PepperSet::single(1, pepper(1))).contains("redacted"));
     }
 }

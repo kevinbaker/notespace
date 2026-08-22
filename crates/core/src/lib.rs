@@ -12,6 +12,7 @@ pub(crate) mod naming;
 #[cfg(feature = "password")]
 pub mod password;
 pub mod path;
+pub mod ratelimit;
 pub mod session;
 pub mod space_key;
 pub mod sql;

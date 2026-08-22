@@ -712,14 +712,63 @@ A **salt** is not a strength measure and is worth separating from the pepper. It
 stored *with* the hash, and defeats rainbow tables and cracking many accounts at once. It adds
 nothing against a single targeted password. Already mandatory via PHC.
 
-Rotation is why peppers live in a `PepperRing` rather than a variable: a pepper cannot be
-changed in place, since the hashes depend on it and the plaintexts are gone. The ring keeps the
-previous one for verification, `verify` returns `YesRehash` when it matches, and logins migrate
-accounts one at a time.
+#### Every pepper is kept, and the hash names which one
 
-**Still missing, and more important than any of the above for online attacks: rate limiting.**
-A weak KDF is an offline-cracking problem; online guessing is stopped by refusing attempts.
-Nothing implements that yet.
+A pepper cannot be changed in place — the hashes depend on it and the plaintexts are gone — so
+rotation means holding the old ones. The naive form of that is a list tried in turn, and it does
+not survive the CPU budget: a **wrong** password tries every pepper, and at
+`Params::CONSTRAINED` each attempt is 3.34 ms.
+
+| peppers tried | CPU | |
+|---|---|---|
+| 1 | 3.34 ms | 33% |
+| 2 | 6.68 ms | 67%, tight |
+| **3** | **10.03 ms** | **over** |
+
+A list therefore caps rotation at one generation, on precisely the path an attacker controls.
+
+So the stored hash records which pepper made it — `<id>$<phc>`, e.g. `3$argon2id$v=19$…`, with
+an empty prefix meaning unpeppered — and verification looks up exactly that one. **Cost is
+constant however many are held**, which is what makes keeping all of them practical: no pepper
+is retired on a deadline, and no account is stranded by a rotation that finished before its
+owner came back. `PASSWORD_PEPPER` is current; `PASSWORD_PEPPER_<n>` are the historical ones.
+
+Ids are permanent. Reusing one for a different secret strands every account hashed under the
+old one, so a hash naming an absent pepper is an error rather than a failed login — the account
+cannot be verified at all and needs a reset.
+
+### 4.12 Rate limiting is the defence the KDF is not
+
+A weak KDF is an *offline* problem, and the pepper answers it. Online guessing is a different
+attack: the attacker pays nothing for a wrong guess, and **we** pay 3.34 ms of a 10 ms budget —
+so unthrottled login is both a credential attack and a cheap way to exhaust the account's CPU.
+
+The check therefore runs **before** the hash. A refused attempt costs a lookup, not a KDF.
+
+Two buckets, because the attacks differ:
+
+| bucket | attack | limit |
+|---|---|---|
+| per identity | one account, many passwords | 5 / 15 min |
+| per client | one password, many accounts (credential stuffing) | 60 / 15 min |
+
+The client bucket is twelve times looser because a client is not a person — an office, a campus
+or a mobile carrier is one address. It still kills stuffing, which needs thousands of attempts
+to be worth running. An attempt must pass both.
+
+Identities are keyed by **name, not user id**: a login for an account that does not exist has no
+id, and skipping the limiter for unknown names would make enumeration free. Names are lowercased
+into the key, since case would otherwise multiply the limit.
+
+Fixed windows, not sliding. Sliding needs a row per attempt; fixed needs one counter and one
+instant. The approximation lets an attacker straddle a boundary for `2 * limit` in quick
+succession — 10 instead of 5 — which changes nothing, and is not worth a row per attempt against
+a 500 MB ceiling.
+
+**A successful login clears its bucket.** A limiter that punishes success locks out the people
+sharing an address correctly, and gets switched off.
+
+
 
 #### What each costs in the bundle
 

@@ -15,6 +15,7 @@
 use crate::id::PublicId;
 use crate::model::{NewPost, Post, ThreadPage, Timestamp, User, UserId};
 use crate::path::Path;
+use crate::ratelimit::{AttemptKeys, Attempts};
 use crate::session::{Session, TokenHash};
 
 /// `?Send` is required: wasm futures are not `Send` (DESIGN.md §3.1).
@@ -158,6 +159,32 @@ pub trait Store {
     ///
     /// **Budget: 1 statement.**
     async fn delete_session(&self, token: &TokenHash) -> StoreResult<()>;
+
+    /// Current attempt counters for both buckets.
+    ///
+    /// **Budget: 1 statement.** Runs before the password hash on every login attempt, so a
+    /// second round trip here is a round trip on the attacker's schedule.
+    ///
+    /// Returns `(identity, client)`; either is `None` when nothing is recorded.
+    async fn login_attempts(
+        &self,
+        keys: &AttemptKeys,
+    ) -> StoreResult<(Option<Attempts>, Option<Attempts>)>;
+
+    /// Record a failed attempt against one bucket. **Budget: 1 statement.**
+    async fn record_login_attempt(&self, key: &str, attempts: Attempts) -> StoreResult<()>;
+
+    /// Clear a bucket after a successful login. **Budget: 1 statement.**
+    ///
+    /// A limiter that punishes success locks out the people using a shared address correctly,
+    /// and gets switched off.
+    async fn clear_login_attempts(&self, key: &str) -> StoreResult<()>;
+
+    /// Drop windows that ended before `cutoff`. Housekeeping; nothing depends on it having run,
+    /// since expiry is decided by the window in the row rather than by the row's absence.
+    ///
+    /// **Budget: 1 statement.** Returns rows removed.
+    async fn sweep_login_attempts(&self, cutoff: Timestamp) -> StoreResult<u32>;
 
     /// Log out everywhere: after a password change, or when an account is banned.
     ///
