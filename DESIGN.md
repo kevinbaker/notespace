@@ -564,6 +564,67 @@ What this costs, and what still has to be designed (M6):
   rebake-everything migration is not.
 
 
+### 4.9 Sessions live in D1
+
+Cloudflare's own guidance says otherwise, so the reasoning matters more than the conclusion.
+
+> "We recommend using Workers KV for storing session data, credentials (API keys), and/or
+> configuration data." — [Choosing a data or storage product](https://developers.cloudflare.com/workers/platform/storage-options/)
+
+That recommendation comes with a stated premise: such data is "read at high rates (thousands of
+RPS or more), are not typically modified ... and do not need to be immediately consistent."
+Two of those three are false here, and the third is fatal.
+
+**Write budget.** KV's free plan allows **1,000 writes/day**; D1's allows **100,000 rows
+written/day**. Every login is a write, and sliding expiry would make every *request* a write.
+A hundredfold difference in the wrong direction, against a Worker budget of 100k requests/day.
+
+| | KV free | D1 free |
+|---|---|---|
+| writes/day | **1,000** | 100,000 rows |
+| reads/day | 100,000 | 5,000,000 rows |
+| consistency | eventual, "up to 60 seconds or more" | immediate |
+
+**Revocation.** KV is eventually consistent: a change "may take up to 60 seconds or more to be
+visible in other global network locations", and negative lookups are cached the same way. A
+logout, a ban, or a password change would therefore keep working for a minute somewhere in the
+world. For a forum whose pitch is moderation (§5), a banned account that can keep posting for
+another minute is not an acceptable default.
+
+**Dual target.** There is no Workers KV in a self-hosted binary. Goal #1 is one codebase and two
+deploy targets, and a KV session store means a second session implementation for the native
+side — precisely the drift the `Store` seam exists to prevent. A `session` table is just SQL and
+runs unmodified on both.
+
+Cloudflare's recommendation is sound for what it describes: a read-mostly, revocation-tolerant
+credential cache at thousands of RPS. This forum is none of those.
+
+#### The design
+
+- The cookie carries **256 bits from `crypto.getRandomValues`**, base64url. Not a JWT: there is
+  no third party to convince, and a random token needs no signature scheme to get wrong.
+- The table stores **only the SHA-256 of the token**. A leaked database — or a backup, or one of
+  D1's seven days of Time Travel snapshots — then yields no usable sessions.
+- `HttpOnly; Secure; SameSite=Lax; Path=/`. Lax rather than Strict so that following a link into
+  the forum keeps you logged in.
+- **Fixed expiry, not sliding.** Sliding expiry costs a write per request, which is what makes
+  session stores expensive; a fixed window costs one write per login.
+- Revocation is a `DELETE`, effective immediately.
+
+#### Why a per-request lookup is affordable
+
+§9 requires justifying any new per-request query. This one is cheap for a structural reason:
+baked pages are user-agnostic (§3.3), so a cached read consults no session at all.
+Personalisation is a separate small fetch, and writes need a session anyway. When a lookup is
+needed it joins the existing `batch()` — 3 statements in one round trip rather than 2, against a
+limit of 50 and a measured 2.52 ms.
+
+#### Not yet decided
+
+CSRF. `SameSite=Lax` covers cross-site form posts from other origins, but not everything, and
+the reply form is a `POST`. Needs a token, decided when the form is built.
+
+
 ## 5. Moderation pipeline
 
 Runs asynchronously off the request path. You do not have 10ms to spare for an LLM call.
@@ -764,8 +825,7 @@ than shipping a binary. That is M5.
 
 ### Open
 
-3. Auth: sessions in D1, in a DO, or signed stateless cookies? Stateless is cheapest but
-   complicates revocation.
+3. ~~Auth: sessions in D1, in a DO, or signed stateless cookies?~~ **Decided: D1.** See §4.9.
 4. Search on the wasm target — does D1 expose FTS5? If not, an external index or a native-only
    feature flag is needed. **Untested in M0.**
 5. Archive strategy when a D1 database approaches the 500 MB free ceiling.
