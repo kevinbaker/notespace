@@ -261,9 +261,36 @@ order and stops at `LIMIT`. Confirmed against the trace, which shows exactly **o
 span per request**, not one per post. The N+1 failure mode DESIGN.md §3.1 warns about is
 absent, and there is now a query-plan assertion in `scripts/spike.sh` to keep it that way.
 
+### Production numbers
+
+The spike is deployed at `dev.notespace.org`. 40 samples of the 200-post page, read from the
+`Server-Timing` header the Worker now emits:
+
+| metric | p50 | p99 | min | max |
+|---|---|---|---|---|
+| D1 duration | **2.52 ms** | 6.24 ms | 1.34 ms | 6.24 ms |
+| statements | 2 | 2 | 2 | 2 |
+| rows_read | 404 | 404 | 404 | 404 |
+
+Three things this settles:
+
+- **`rows_read` is 404 in production, exactly as it is locally.** Cloudflare's accounting and
+  miniflare's agree, so the local number was never a proxy — it was the answer.
+- **The batch holds under a real network.** `statements=2` on every sample. Had the read path
+  been the N+1 shape DESIGN.md §3.1 warns about, 201 round trips at 2.52 ms would be **0.5 s of
+  D1 wait per pageview**. That single design decision is worth half a second a page.
+- **D1 latency is not the risk it looked like.** ~2.5 ms is a round trip, not CPU: Workers bills
+  CPU time and excludes time blocked on I/O, so this does not eat into the 10 ms budget that
+  M0 existed to protect.
+
+Not measured here: actual billed CPU in production, which is visible in the Worker's dashboard
+metrics rather than in a response header. End-to-end latency was sampled at ~320 ms p50, but
+from a remote container through a proxy to a WNAM database — that number describes the test
+harness, not a reader.
+
 ### Rows read
 
-**Measured: 404 rows per uncached 200-post pageview.** The Worker now reports D1's own
+**Measured: 404 rows per uncached 200-post pageview, locally and in production.** The Worker now reports D1's own
 `rows_read` and `duration` on every response via `Server-Timing` (see `QueryStats` in
 `crates/worker/src/store.rs`), so this is observed rather than inferred.
 
@@ -279,9 +306,8 @@ Against the 5M rows/day free allowance that is ~12,400 such pageviews/day. Most 
 are far smaller: at ~30 posts a page costs ~65 rows, or ~77,000 pageviews/day — at which
 point the **100k Worker requests/day cap binds first**.
 
-So for a small forum the free tier is limited by request count, not by CPU or by D1. Still
-worth confirming against a deployed instance that Cloudflare's accounting matches the
-emulator's; `docs/DEPLOY.md` covers how.
+So for a small forum the free tier is limited by request count, not by CPU or by D1. Confirmed
+against the deployed instance: Cloudflare reports the same 404.
 
 **Cheap win available:** denormalising `author_name` onto `post` would drop the `user` join
 and roughly halve rows read per page. Not done yet — it trades correctness-on-rename for

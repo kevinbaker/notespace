@@ -26,15 +26,19 @@ A Cloudflare Worker that serves a threaded, 200-post forum page from D1:
 | Budget (Cloudflare free plan) | Limit | Measured |
 |---|---|---|
 | Worker CPU / request | 10 ms | **0.048 ms** (200-post page) |
-| Worker script size | 3 MB | **139.6 KB** gzipped |
+| Worker script size | 3 MB | **149 KB** gzipped |
 | D1 queries / invocation | 50 | **2**, one batched round trip |
+| D1 rows read / page | 5M/day | **404** (production) |
+| D1 round trip | — | **2.52 ms** p50, 6.24 ms p99 (production) |
 
 CPU was the thing M0 existed to de-risk, and it turned out to have ~90x headroom at p99. For a
 small forum the binding constraint is the **100k requests/day** cap, not CPU or D1.
 
-Caveat worth reading before relying on this: all of it is `wrangler dev --local`. Nothing has
-been deployed to real Cloudflare, and `rows_read` — which D1 reports only in production — is
-derived from the query plan rather than observed.
+Deployed at `dev.notespace.org`, and the D1 figures above are from there rather than from local
+emulation. `rows_read` came out identical in both, so the emulator was not merely close.
+
+Still unmeasured: billed CPU in production, which appears in the Worker's dashboard metrics
+rather than in a response header.
 
 ## Running it
 
