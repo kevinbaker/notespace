@@ -12,23 +12,12 @@
 //! 000C.0004.0001   that child's 1st child
 //! ```
 //!
-//! # Why base32 rather than decimal
+//! The alphabet is Crockford base32 — `0-9` then `A-Z` minus `I`, `L`, `O` and `U` — shared
+//! with public ids. Four digits address 1,048,576 siblings per level.
 //!
-//! Measured: four base32 digits address 1,048,576
-//! siblings per level, slightly *more* than the 1,000,000 that six decimal digits buy, while
-//! storing 30% fewer bytes. Since the `(thread_id, path)` index is the read path's whole
-//! mechanism and D1's free tier caps the database at 500 MB, a 30% smaller key is worth
-//! having for free.
-//!
-//! The alphabet is Crockford base32 — `0-9` then `A-Z` minus `I`, `L`, `O` and `U`. Excluding
-//! those four keeps the alphabet unambiguous when a human reads an id aloud, which matters
-//! because the same alphabet is used for public ids.
-//!
-//! Base62 was measured too and rejected: it stores the same 4 bytes as base32 at this width,
-//! so its only gain is headroom nothing needs, and it pays for that with case sensitivity.
-//! Anything that lowercases a path — a URL normaliser, a `NOCASE` collation, a careless
-//! `to_lowercase()` — would silently destroy the ordering invariant. Base32 is closed under
-//! case folding; base62 is not.
+//! **The alphabet must stay closed under case folding.** Base62 is not, so anything that
+//! lowercases a path — a URL normaliser, a `NOCASE` collation, a stray `to_lowercase()` —
+//! would silently destroy the ordering invariant below.
 //!
 //! # Why this ordering works
 //!

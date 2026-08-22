@@ -36,7 +36,7 @@ use crate::naming::{self, NameError, Rules};
 pub const MIN_CHARS: usize = 2;
 pub const MAX_CHARS: usize = 24;
 
-/// Names no account may claim. Kept sorted — [`naming::is_reserved`] binary-searches it.
+/// Names no account may claim. Kept sorted — the lookup binary-searches it.
 ///
 /// Two groups: words implying authority or system identity, and words that would shadow a
 /// `/u/` sub-route. Deliberately shorter than the space list, since a username never appears

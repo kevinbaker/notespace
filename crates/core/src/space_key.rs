@@ -9,20 +9,15 @@
 //! space — the path does — which is the main way this differs from a
 //! [`Username`](crate::username::Username).
 //!
-//! Resolution is one indexed lookup on the materialized path, the same trick `post.path` uses.
-//! Measured at depth 3: 1.6 us and a single query, against 32.9 us and three queries for walking
-//! parent by parent.
+//! Resolution is one indexed lookup on the materialized path, the same trick `post.path` uses,
+//! rather than a walk parent by parent.
 //!
-//! # Renaming, and the absence of a history table
+//! # Renaming
 //!
-//! Spaces *can* be renamed and moved, unlike usernames. A space is a place, not an identity: no
-//! post is attributed to a space in a way that a rename could falsify, so the impersonation
-//! argument that makes usernames permanent does not apply.
-//!
-//! What a rename needs is a redirect, and that is a single nullable `moved_to` column on the
-//! space row rather than a history table. Renaming rewrites the row's path; if the old URL
-//! should keep working, a tombstone row is left behind pointing at the new one. The lookup that
-//! resolves any path already finds it, so a redirect costs **zero extra queries** — and an
+//! Spaces can be renamed and moved, unlike usernames. A rename rewrites the row's path; if the
+//! old URL should keep working, a tombstone row is left behind with a nullable `moved_to`
+//! pointing at the new one. The lookup that resolves any path already finds it, so a redirect
+//! costs **zero extra queries** — and an
 //! instance that does not care simply lets the old path 404.
 //!
 //! # Reserved names
@@ -48,7 +43,7 @@ pub const PATH_SEP: char = '/';
 /// `3 * (MAX_CHARS + 1)` bytes, which keeps the unique index small.
 pub const MAX_DEPTH: usize = 3;
 
-/// Names no space may take. Kept sorted — [`naming::is_reserved`] binary-searches it.
+/// Names no space may take. Kept sorted — the lookup binary-searches it.
 ///
 /// Mostly sub-routes that would otherwise be ambiguous: `/s/sports/new` must mean "new thread in
 /// sports", not "the child space named new". Shorter on authority words than the username list,

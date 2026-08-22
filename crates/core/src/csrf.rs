@@ -1,23 +1,13 @@
-//! CSRF tokens: signed, stateless, and cheap.
-//!
-//! Measured at **1.78 µs** to mint or verify — 0.018% of the 10 ms request budget, which is why
-//! this is an HMAC rather than anything stored. A CSRF token in the database would cost a query
-//! on every form render and every submit, for a value that has to be derivable anyway.
-//!
-//! # Shape
+//! CSRF tokens: signed and stateless, so no storage round trip per form.
 //!
 //! `<expiry-ms>.<hex HMAC-SHA256(secret, session_hash || "." || expiry)>`
 //!
-//! The token is bound to the **session**, not just to the server secret. A token minted for one
-//! visitor cannot be replayed by another, which is the failure mode a bare "signed constant"
-//! design has. It carries its own expiry so a token scraped from a cached page stops working.
+//! The token binds to the **session**, not just the server secret, so one visitor's token
+//! cannot be replayed by another. It carries its own expiry, so a token scraped from a cached
+//! page stops working.
 //!
-//! # Why this and not SameSite alone
-//!
-//! `SameSite=Lax` already blocks cross-site *form posts*, which covers the classic attack. It
-//! does not cover same-site subdomain takeover, and it is one browser default away from being
-//! the only thing standing between a forum and a mass-post attack. Defence in depth: the cookie
-//! attribute and the token are independent.
+//! Independent of `SameSite=Lax`, deliberately: that attribute does not cover same-site
+//! subdomain takeover, and neither control should be the only one.
 
 use core::fmt;
 

@@ -1,26 +1,20 @@
-//! The login flow, orchestrated where it can be tested.
+//! The login flow.
 //!
-//! Lives here rather than in a handler because the order of operations *is* the security
-//! property, and an order is worth a test. Handlers translate HTTP; this decides.
+//! The order of operations is the security property:
 //!
 //! ```text
 //!   rate limit  ->  look up  ->  verify  ->  session
 //!        |                          |
 //!        |                          +-- always runs, even for an unknown account
-//!        +-- before the hash, so a refused attempt costs a lookup and not 3.34 ms
+//!        +-- before the hash, so a refused attempt costs a lookup and no Argon2 run
 //! ```
 //!
-//! # Two properties that are easy to lose
+//! Two invariants any change here must preserve:
 //!
-//! **The form must not be a username oracle.** Returning early for an unknown account is
-//! measurably faster than one that reaches Argon2 — a few milliseconds, trivially detectable
-//! over a handful of requests. So an unknown account, and an account with no local password,
-//! both still hash against [`LoginConfig::dummy_hash`] before failing. `verify` is deliberately
-//! given work it will throw away.
-//!
-//! **Every failure looks the same.** [`Outcome::Rejected`] carries no reason. "No such user",
-//! "wrong password" and "that account has no password" are one answer, because distinguishing
-//! them hands an attacker the account list.
+//! - **No username oracle.** An unknown account, and an account with no local password, both
+//!   still hash against [`LoginConfig::dummy_hash`] before failing, so timing does not
+//!   distinguish them from a wrong password.
+//! - **Every failure looks the same.** [`Outcome::Rejected`] carries no reason.
 
 use crate::model::{Timestamp, User};
 use crate::password::{self, PepperSet, Scheme, Verified};
@@ -35,25 +29,19 @@ pub struct LoginConfig {
     pub sessions: SessionPolicy,
     pub per_identity: Limit,
     pub per_client: Limit,
-    /// A real hash of a random value, in this deployment's parameters.
+    /// A real hash of a fixed value, under this deployment's current scheme and pepper.
     ///
     /// Verified against when there is no account, so the failing path costs what the succeeding
-    /// one does. It must use the *current* parameters and pepper, or the timing it is there to
-    /// hide reappears as a difference in cost.
+    /// one does. Must track the current parameters, or the timing difference reappears.
     pub dummy_hash: String,
 }
 
 impl LoginConfig {
-    /// Build the dummy hash. Do this once at startup, not per request.
+    /// Build the dummy hash. Once at startup, not per request.
     ///
-    /// The password hashed here is never a valid credential: it is not reachable through any
-    /// form, and the salt is fixed because nothing about this hash is secret — only its cost.
-    ///
-    /// The input has to satisfy the scheme's own shape rules, or `hash` fails and the dummy
-    /// becomes `""` — which verifies instantly against everything and silently removes the
-    /// timing cover this exists to provide. Under a client scheme that means a well-formed
-    /// 32-byte key, not a passphrase. [`Self::dummy_hash_is_real`] is the assertion that it
-    /// worked; startup should refuse rather than serve logins with a hollow dummy.
+    /// The input must satisfy the scheme's shape rules, or hashing fails and the dummy becomes
+    /// `""`, which verifies instantly against everything. Check
+    /// [`Self::dummy_hash_is_real`] before serving logins.
     pub fn dummy_hash_for(scheme: Scheme, peppers: &PepperSet) -> String {
         let secret = match scheme {
             Scheme::Server(_) => "\0not-a-password\0dummy-for-timing-only",
@@ -65,8 +53,8 @@ impl LoginConfig {
         password::hash(secret, "ZHVtbXlzYWx0Zm9ydGltaW5n", scheme, peppers).unwrap_or_default()
     }
 
-    /// Whether the dummy hash actually built. A `false` here means every unknown-account login
-    /// returns faster than a real one, which is an account-enumeration oracle.
+    /// Whether the dummy hash actually built. `false` means unknown-account logins return
+    /// faster than real ones — an account-enumeration oracle.
     pub fn dummy_hash_is_real(&self) -> bool {
         !self.dummy_hash.is_empty()
     }
@@ -94,9 +82,7 @@ pub enum Outcome {
 
 /// Run one login attempt.
 ///
-/// **Budget: 3-6 statements.** Attempt counters, the account, then on success a session and two
-/// counter clears; on failure one counter write. A rate-limited attempt costs one statement and
-/// no hashing at all.
+/// **Budget: 3-6 statements.** A rate-limited attempt costs one statement and no hashing.
 pub async fn attempt<S: Store>(
     store: &S,
     cfg: &LoginConfig,
@@ -104,8 +90,7 @@ pub async fn attempt<S: Store>(
 ) -> StoreResult<Outcome> {
     let keys = AttemptKeys::new(a.username, a.client);
 
-    // 1. Rate limit, before anything expensive. This is the only step an attacker can force
-    //    repeatedly, so it has to be the cheap one.
+    // 1. Rate limit, before anything expensive.
     let (identity_state, client_state) = store.login_attempts(&keys).await?;
     let identity = cfg.per_identity.check(identity_state, a.now);
     let client = cfg.per_client.check(client_state, a.now);
@@ -121,19 +106,17 @@ pub async fn attempt<S: Store>(
         });
     }
 
-    // 2. Look up the account. Note what does *not* happen here: an early return.
+    // 2. Look up the account. Deliberately no early return on a miss.
     let found = store.user_by_name(&a.username.to_lowercase()).await?;
 
-    // 3. Verify. An absent account, and an account with no local password, both hash the dummy
-    //    so that failing costs what succeeding costs.
+    // 3. Verify. A missing account or credential hashes the dummy instead.
     let stored = found
         .as_ref()
         .and_then(|c| c.password_hash.as_deref())
         .unwrap_or(cfg.dummy_hash.as_str());
-    let verdict = password::verify(a.password, stored, cfg.scheme, &cfg.peppers)
-        // A hash this deployment cannot read is not a login failure to report to the visitor,
-        // but it is also not a reason to let them in.
-        .unwrap_or(Verified::No);
+    // An unreadable stored hash is not a reason to let anyone in.
+    let verdict =
+        password::verify(a.password, stored, cfg.scheme, &cfg.peppers).unwrap_or(Verified::No);
 
     // A banned or deleted account never authenticates, whatever the password was.
     let usable = found
@@ -153,7 +136,7 @@ pub async fn attempt<S: Store>(
 
     let credential = found.expect("usable implies found");
 
-    // 4. Upgrade the stored hash while the plaintext is in hand — the only moment it is.
+    // 4. Upgrade the stored hash while the plaintext is in hand.
     if verdict == Verified::YesRehash {
         if let Ok(salt) = password::encode_salt(&a.token.hash().as_str().as_bytes()[..16]) {
             if let Ok(fresh) = password::hash(a.password, &salt, cfg.scheme, &cfg.peppers) {
@@ -171,7 +154,7 @@ pub async fn attempt<S: Store>(
     };
     store.create_session(&session).await?;
 
-    // 5. Success clears the counters, so a correct password is never punished.
+    // 5. Success clears the counters.
     store.clear_login_attempts(&keys.identity).await?;
     store.clear_login_attempts(&keys.client).await?;
 

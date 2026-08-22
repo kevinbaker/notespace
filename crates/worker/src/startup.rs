@@ -1,7 +1,6 @@
 //! One-time startup checks, reported through the Worker log.
 //!
-//! A deployment running weakened cryptography should say so where an operator will see it. A
-//! weak setting nobody mentions is how it survives to production.
+//! A deployment running weakened cryptography reports it where an operator will see it.
 
 use std::cell::Cell;
 

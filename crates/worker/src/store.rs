@@ -195,17 +195,13 @@ fn backend<E: std::fmt::Display>(e: E) -> StoreError {
 
 /// What D1 reported about the queries behind one page render.
 ///
-/// `rows_read` is the number M0 could only *derive* from the query plan: D1 reports it in
-/// production and leaves it `None` under `wrangler dev --local`, where the database is an
-/// in-process SQLite rather than a service. `duration` is likewise the real round trip,
-/// which local mode cannot show at all because there is no network in the path.
+/// `rows_read` and `duration` come from D1 itself and are `None` under `wrangler dev --local`,
+/// where the database is in-process SQLite with no network in the path.
 ///
-/// Reported per request via `Server-Timing`, so a production deploy answers with its own
-/// numbers instead of leaving the local ones to stand in for them.
+/// Reported per request via `Server-Timing`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct QueryStats {
-    /// Statements in the batch. Must stay at 2 — the D1 free tier allows 50 per invocation,
-    /// and the whole read-path design rests on not going per-post.
+    /// Statements in the batch. **Must stay at 2**: the read path must never go per-post.
     pub statements: u32,
     /// Summed across statements. `None` under local dev.
     pub rows_read: Option<usize>,

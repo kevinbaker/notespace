@@ -396,10 +396,9 @@ async fn logout(State(env): State<Env>, headers: axum::http::HeaderMap) -> Respo
 /// cannot reach D1 — there is no Worker runtime in `cargo test` — so the suite is exposed as a
 /// route and run against a deployed instance instead.
 ///
-/// Takes the thread to exercise as `?thread=<public id>`, rather than assuming an id the seed
-/// generator happened to pick. An earlier revision hard-coded one and 503'd against a perfectly
-/// good database — a fixture constant duplicated across two crates is exactly the kind of drift
-/// this suite exists to catch, so it should not have one.
+/// Takes the thread to exercise as `?thread=<public id>` rather than assuming an id the seed
+/// generator picked: a fixture constant duplicated across crates is the drift this suite is
+/// meant to catch.
 ///
 /// Reads only that thread, and writes nothing.
 #[worker::send]
@@ -519,9 +518,8 @@ async fn run_conformance(
 
 /// Storage access goes through [`Store`], never through a concrete adapter.
 ///
-/// These two functions exist to make that structural: they are generic, so anything they can do
-/// the native adapter can do too. An earlier revision called inherent methods on `D1Store` while
-/// the trait sat unused with a different signature -- the seam compiled and carried nothing.
+/// These two functions make that structural: they are generic, so anything they can do the
+/// native adapter can do too.
 async fn fetch_page<S: Store>(
     store: &S,
     thread: &PublicId,

@@ -16,19 +16,12 @@
 //! ```
 //!
 //! This is a ULID truncated from 26 characters to 16: same 48-bit millisecond prefix, 32 bits
-//! of randomness instead of 80. M0 measured why the prefix matters — a *time-sortable* text id
-//! costs the same as an integer to look up (2 ms per 5000), while a random one costs double,
-//! because random keys scatter across the index instead of appending at its right edge.
+//! of randomness instead of 80. The time prefix is load-bearing — it keeps inserts appending at
+//! the right edge of the index instead of scattering across it.
 //!
-//! # Why 32 random bits is enough
-//!
-//! Two ids can only collide if they share a millisecond, so the birthday bound applies
-//! per-millisecond, not over the database's lifetime. At 32 bits that is ~65,536 ids in the
-//! same millisecond for a 50% chance — six orders of magnitude beyond what a forum generates.
-//! For ten threads in one millisecond the probability is about 1 in 10^8.
-//!
-//! Collisions are also *caught, not silent*: `public_id` carries a UNIQUE index, so a
-//! collision is a failed insert to retry with fresh randomness, never a wrong row.
+//! Two ids can only collide inside one millisecond, so 32 random bits is ample. Collisions are
+//! caught rather than silent: `public_id` carries a UNIQUE index, so one is a failed insert to
+//! retry with fresh randomness, never a wrong row.
 //!
 //! # Typing and reading aloud
 //!
@@ -88,7 +81,7 @@
 //! not the canonical ULID string. That is the deliberate trade: exact value plus prefix-stable
 //! widening, rather than byte-identical text. `imports_a_canonical_ulid_losslessly` pins it.
 //!
-//! This matters for M5 imports (§8) and for anywhere an external system already assigned ids.
+//! This matters for M5 imports and for anywhere an external system already assigned ids.
 //!
 //! [`PublicId::parse`] already accepts any width in [`MIN_CHARS`]`..=`[`MAX_CHARS`], while
 //! [`PublicId::new`] only ever generates [`ID_CHARS`]. That asymmetry is the point: a future
@@ -124,7 +117,7 @@ pub const MIN_CHARS: usize = 16;
 ///
 /// Ids are *parsed* anywhere in `MIN_CHARS..=MAX_CHARS` even though this build only ever
 /// *generates* [`ID_CHARS`]. That asymmetry is deliberate: it means widening the generated id
-/// later (§4.3) needs no change here and cannot strand an existing URL.
+/// later needs no change here and cannot strand an existing URL.
 pub const MAX_CHARS: usize = 26;
 
 /// Payload ceiling: exactly a `u128`, so [`PublicId::to_u128`] is total and exact.

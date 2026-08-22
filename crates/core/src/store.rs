@@ -1,8 +1,7 @@
 //! The `Store` seam.
 //!
-//! The most important seam in the codebase: everything above it is target-agnostic, and the
-//! promise that one build serves both a Worker and a self-hosted binary rests entirely on it
-//! staying that way.
+//! Everything above this trait is target-agnostic. One build serves both a Worker and a
+//! self-hosted binary only for as long as that stays true.
 //!
 //! Constraints binding on every implementation:
 //!
@@ -82,14 +81,11 @@ pub struct PostLocation {
 
 /// Everything the application needs from storage.
 ///
-/// This trait is the whole of it: if a handler reaches past this into a concrete adapter, the
-/// dual-target promise is already broken, because the other target has no such method. An
-/// earlier revision had one method here that nothing called, while the Worker used two inherent
-/// methods on `D1Store` — a trait that compiled and carried no weight. Keep every storage call
-/// on this side of the line.
+/// This trait is the whole of it: a handler reaching past it into a concrete adapter breaks the
+/// dual-target promise, because the other target has no such method. Keep every storage call on
+/// this side of the line.
 ///
-/// Query budgets are part of the contract, not advice. D1 allows 50 statements per Worker
-/// invocation on the free plan, and the read path's whole design is not going per-post.
+/// The per-method query budgets below are part of the contract, not advice.
 #[async_trait(?Send)]
 pub trait Store {
     /// One page of a thread, with the space it belongs to.
@@ -97,8 +93,7 @@ pub trait Store {
     /// Threads are addressed by public id; the internal integer never leaves the database.
     ///
     /// **Budget: 2 statements**, ideally in one round trip — thread header, and an indexed
-    /// range scan over `(thread_id, path)`. Measured in production at 2.52 ms p50 for both
-    /// together; one statement per post would be 0.5 s.
+    /// range scan over `(thread_id, path)`.
     async fn thread_page(&self, thread: &PublicId, page: &Page) -> StoreResult<ThreadPage>;
 
     /// Resolve a post's public id to the thread it is in now.

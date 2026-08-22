@@ -1,22 +1,13 @@
 //! Session tokens and expiry policy.
 //!
-//! # The token is never stored
+//! **The token is never stored.** The cookie carries 256 random bits; the database holds only
+//! their SHA-256, so a leaked backup yields no usable session. Enforced by the types rather
+//! than by discipline: [`Store`](crate::store::Store) accepts a [`TokenHash`], and the only way
+//! to obtain one is [`SessionToken::hash`].
 //!
-//! A session cookie carries 256 random bits. What the database holds is the SHA-256 of those
-//! bits and nothing else, so a leaked copy of the data — a backup, or one of the seven days of
-//! Time Travel snapshots D1 keeps on the free plan — yields no usable session.
-//!
-//! That rule is enforced by the types rather than by discipline: [`Store`](crate::store::Store)
-//! takes a [`TokenHash`], and the only way to obtain one is [`SessionToken::hash`]. There is no
-//! path that passes a raw token to storage, because no storage method accepts one.
-//!
-//! # Sliding expiry, refreshed at most once a day
-//!
-//! Sliding expiry is what users expect and what makes a session store expensive: naively it is
-//! one write per request. [`SessionPolicy`] pushes the expiry out only when the last refresh is
-//! older than [`SessionPolicy::refresh_after_ms`], turning that into roughly one write per user
-//! per day. Against D1's 100,000 rows written/day that is the difference between a few thousand
-//! pageviews and a few tens of thousands of daily users.
+//! **Expiry slides, but is refreshed at most once a day.** [`SessionPolicy`] pushes the expiry
+//! out only when the last refresh is older than [`SessionPolicy::refresh_after_ms`], which
+//! keeps a sliding session at roughly one write per user per day rather than one per request.
 
 use core::fmt;
 

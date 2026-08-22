@@ -14,10 +14,8 @@ pub const ANON: &str = "__Host-ns_anon";
 
 /// Read one cookie's value from a raw `Cookie:` header.
 ///
-/// Takes the header rather than a request type so this is target-agnostic: the native server
-/// will need exactly the same parsing, and — more immediately — `crates/worker` is not in
-/// `default-members`, so tests living there never run under `cargo test`. Security logic with
-/// dead tests is worse than none, because it looks covered.
+/// Takes the header rather than a request type so both targets share it — and so the tests run
+/// under `cargo test`, which they do not in `crates/worker`.
 pub fn get(header: Option<&str>, name: &str) -> Option<String> {
     header?
         .split(';')

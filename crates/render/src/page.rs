@@ -53,10 +53,9 @@ pub fn thread_page(page: &ThreadPage) -> Markup {
                     ol class="posts" {
                         @for post in &page.posts {
                             @let indent = post.path.render_depth(space.depth_cap).min(MAX_INDENT);
-                            // Anchors and permalinks use the PUBLIC id. An earlier version
-                            // emitted post.id here, which put the internal sequential integer
-                            // into every baked page -- leaking the post count and making the
-                            // table enumerable, which is the whole thing §4.2 exists to avoid.
+                            // Anchors and permalinks use the PUBLIC id. Emitting post.id here
+                            // would bake the internal sequential integer into every page,
+                            // leaking the post count and making the table enumerable.
                             li class="post" id={ "p" (post.public_id) }
                                style={ "--indent:" (indent) }
                                data-depth=(indent) {
@@ -216,10 +215,8 @@ mod tests {
         assert!(html.contains(&format!(r#"id="p{pid}""#)));
     }
 
-    /// Internal row ids are not for publication. A baked page carrying sequential integers
-    /// would leak the post count and make the table enumerable, which is exactly what the
-    /// two-tier id scheme exists to prevent. This caught a real leak: the
-    /// permalink anchor used to be `id="p{post.id}"`.
+    /// Internal row ids are not for publication: a baked page carrying sequential integers
+    /// leaks the post count and makes the table enumerable.
     #[test]
     fn baked_page_never_exposes_internal_row_ids() {
         let mut posts = Vec::new();

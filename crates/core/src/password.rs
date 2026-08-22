@@ -1,48 +1,11 @@
-//! Password hashing — and the reason it does not fit a free Worker.
+//! Argon2id password hashing.
 //!
-//! # Measured, not assumed
+//! Hashes are PHC strings — `$argon2id$v=19$m=19456,t=2,p=1$salt$hash` — so algorithm and cost
+//! travel with the hash and [`needs_rehash`] can upgrade an account on its next login, the one
+//! moment the plaintext is in hand.
 //!
-//! Password hashing is deliberately slow; the Workers free plan allows **10 ms of CPU per
-//! request**. Those two facts do not reconcile. Measured in wasm under V8
-//! (`scripts/kdf-bench.mjs`):
-//!
-//! | candidate | p50 | vs 10 ms budget |
-//! |---|---|---|
-//! | Argon2id, OWASP minimum (19 MiB, t=2) | 25.2 ms | **2.5x over** |
-//! | Argon2id, RFC 9106 (64 MiB, t=3) | 134.9 ms | 13.5x over |
-//! | PBKDF2-SHA256, OWASP minimum (600k) | 456.1 ms | 45.6x over |
-//! | PBKDF2-SHA256 at workerd's 100k cap | 75.8 ms | 7.6x over |
-//! | …the same via native WebCrypto | 12.7 ms | 1.3x over |
-//!
-//! Note the last two. `crypto.subtle` runs natively rather than in wasm and is six times
-//! faster, but workerd caps PBKDF2 at 100,000 iterations to limit DoS
-//! ([workerd#1346](https://github.com/cloudflare/workerd/issues/1346), open since 2023) — and
-//! OWASP asks for 600,000. The fastest legal configuration is both **below** the recommended
-//! strength and **over** the CPU budget.
-//!
-//! **There is no way to do OWASP-grade password login on a free-plan Worker.** That is a
-//! property of the platform, not of this code.
-//!
-//! # What follows from that
-//!
-//! - **OIDC is the answer for a Workers deployment.** Verifying a signed assertion is a
-//!   signature check, sub-millisecond, and the CPU problem disappears entirely.
-//! - **The self-hosted target has no such limit** and uses [`Scheme::OWASP`] unchanged.
-//! - [`Scheme::CONSTRAINED`] exists for a free Worker that insists on passwords. It is the
-//!   strongest setting measured to fit (4 MiB, t=1, 4.33 ms at p95) and it is **below OWASP**.
-//!   It is never the default, and [`Scheme::is_below_recommended`] exists so a deployment can
-//!   say so out loud.
-//! - [`Scheme::CLIENT_ARGON`] is the third option: the constraint is the *Worker's* CPU, and
-//!   the browser's is not scarce. Running OWASP-grade Argon2id there and peppering the result
-//!   here restores the work factor that [`Scheme::CONSTRAINED`] gives up, at the cost of
-//!   requiring a client that performs the derivation.
-//!
-//! # Hashes carry their own parameters
-//!
-//! Hashes are stored in PHC string format — `$argon2id$v=19$m=19456,t=2,p=1$salt$hash`. The
-//! algorithm and cost travel with the hash, so raising them later is a matter of rehashing on
-//! next login rather than a migration that cannot work (the plaintext is gone).
-//! [`needs_rehash`] is what makes that upgrade path real.
+//! [`Scheme`] selects where the memory-hard work happens; [`PepperSet`] holds the server-side
+//! secrets mixed into every hash.
 
 use core::fmt;
 use std::collections::BTreeMap;
@@ -50,26 +13,12 @@ use std::collections::BTreeMap;
 use argon2::{Algorithm, Argon2, Version};
 use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt, SaltString};
 
-/// A server-side secret mixed into every hash — Argon2's own `K` parameter, not a bolted-on
-/// construction.
+/// A server-side secret mixed into every hash — Argon2's own `K` parameter.
 ///
-/// # What this buys, exactly
+/// Held outside the database, so a leaked database does not contain it. Protects nothing against
+/// a full server compromise, where both leak together, and is not a substitute for KDF cost.
 ///
-/// A pepper is stored **outside the database** — a Worker secret, or an environment variable —
-/// so a leaked database does not contain it. Against the threat that actually matters here
-/// (SQL injection, an exposed backup, one of D1's seven days of Time Travel snapshots), the
-/// hashes are then uncrackable *whatever the KDF cost is*. That is what makes
-/// [`Params::CONSTRAINED`] tolerable: the weak parameters only matter to an attacker who
-/// already has both the data and the secret.
-///
-/// # What it does not buy
-///
-/// Nothing against a full server compromise, where both leak together. Nothing against online
-/// guessing — that is rate limiting's job. And it is not a substitute for KDF cost: an attacker
-/// with the pepper is back to attacking 8 MiB Argon2id.
-///
-/// Distinct from the salt, which is per-user, stored *with* the hash, and defeats precomputation
-/// and batch cracking rather than adding strength to any single password.
+/// Distinct from the salt, which is per-user and stored *with* the hash.
 #[derive(Clone)]
 pub struct Pepper(Vec<u8>);
 
@@ -92,23 +41,11 @@ impl fmt::Debug for Pepper {
 
 /// Every pepper a deployment has ever used, keyed by id.
 ///
-/// # Why the id, and not just a list
+/// Each stored hash records the id that made it, so verification looks up exactly one pepper and
+/// costs the same however many are held.
 ///
-/// Verifying a *wrong* password against a list means trying each pepper in turn, and each try is
-/// a full Argon2 run. Measured at [`Params::CONSTRAINED`], that is 3.34 ms per attempt: two
-/// peppers fit the 10 ms budget, three do not (10.03 ms). A list therefore caps rotation at one
-/// generation, on the failed-login path specifically — the path an attacker controls.
-///
-/// So the stored hash records which pepper made it, and verification looks up exactly that one.
-/// Cost is constant no matter how many are held, which is what makes keeping all of them
-/// practical: a pepper never has to be retired on a deadline, and no account is ever stranded by
-/// a rotation that finished before it came back.
-///
-/// # Storage format
-///
-/// `<id>$<phc>`, e.g. `3$argon2id$v=19$m=4096,t=1,p=1$…`. An empty prefix (`$argon2id$…`, which
-/// is what PHC produces on its own) means unpeppered. Unambiguous because a PHC string always
-/// begins with `$`.
+/// Storage format: `<id>$<phc>`, e.g. `3$argon2id$v=19$m=4096,t=1,p=1$…`. An empty prefix means
+/// unpeppered — unambiguous, because a PHC string always begins with `$`.
 #[derive(Debug, Clone, Default)]
 pub struct PepperSet {
     peppers: BTreeMap<u32, Pepper>,
@@ -136,16 +73,10 @@ impl PepperSet {
 
     /// Parse the deployment's whole pepper history from one string.
     ///
-    /// Format: `1=<secret>;2=<secret>;…`. Whitespace around entries is ignored, a trailing
-    /// `;` is allowed, and **the highest id is the current one** — so rotating means appending
-    /// an entry, and nothing else moves.
+    /// Format: `1=<secret>;2=<secret>;…`. Whitespace around entries is ignored, a trailing `;`
+    /// is allowed, and **the highest id is the current one**, so rotating means appending.
     ///
-    /// One variable rather than one per pepper because the set is a single fact about the
-    /// deployment: a scan over numbered bindings cannot tell "id 3 was never used" from "id 3
-    /// failed to load", and silently holding fewer peppers than intended strands accounts.
-    ///
-    /// Every failure here is fatal by design. A pepper set that is *partly* right is the worst
-    /// outcome available — it authenticates some accounts and permanently rejects others.
+    /// Every failure is fatal: a partly-loaded set must never be returned.
     pub fn parse(spec: &str) -> Result<PepperSet, PasswordError> {
         let mut set = PepperSet::none();
         let mut highest: Option<u32> = None;
@@ -160,8 +91,7 @@ impl PepperSet {
             })?;
             let secret = secret.trim();
             if set.peppers.contains_key(&id) {
-                // Two secrets under one id means half the accounts cannot be verified, and
-                // which half depends on parse order. Never guess.
+                // Two secrets under one id would make verifiability depend on parse order.
                 return Err(PasswordError::BadPepperSpec(format!(
                     "pepper id {id} appears twice"
                 )));
@@ -225,12 +155,7 @@ impl PepperSet {
     }
 }
 
-/// Split a stored value into its pepper id and the PHC string.
-///
-/// `None` id means the hash is unpeppered.
 /// Catch a secret that is the right length but obviously not generated.
-///
-/// Cheap, and it catches the copy-paste a length check waves through.
 fn looks_unrandom(s: &str) -> bool {
     let b = s.as_bytes();
     b.iter().all(|c| *c == b[0])
@@ -288,8 +213,6 @@ pub enum Verified {
     /// Correct, and the stored hash is current.
     Yes,
     /// Correct, but the hash needs rewriting — weaker parameters, or the previous pepper.
-    ///
-    /// Login is the only moment the plaintext exists, so it is the only chance to migrate.
     YesRehash,
 }
 
@@ -299,11 +222,8 @@ impl Verified {
     }
 }
 
-/// Shortest password accepted.
-///
-/// Length is the cheapest strength there is, and the only compensation that costs no CPU at
-/// all. With [`Params::CONSTRAINED`] it matters more than usual: a weak KDF turns a weak
-/// password into a solved one.
+/// Shortest password accepted. Not applied under [`Scheme::Client`], where the server never
+/// sees the password.
 pub const MIN_PASSWORD_CHARS: usize = 12;
 
 /// Argon2id cost. Memory dominates: it is what makes a GPU attack expensive.
@@ -318,28 +238,17 @@ pub struct Params {
 }
 
 impl Params {
-    /// OWASP's minimum for Argon2id, and the default everywhere the CPU budget allows it.
-    /// Measured at 25.2 ms — fine natively, 2.5x over a free Worker's limit.
+    /// OWASP's minimum for Argon2id. The default everywhere the CPU budget allows it.
     pub const OWASP: Params = Params {
         m_kib: 19456,
         t: 2,
         p: 1,
     };
 
-    /// The strongest setting that fits the 10 ms free-plan budget **at p95**: 4.33 ms, 43%.
+    /// The strongest setting that fits the 10 ms free-plan budget at p95.
     ///
-    /// Chosen on p95 rather than median, because a request that overruns is a failed login, not
-    /// a slow one. An earlier revision used 8 MiB after a three-sample run reported 5.98 ms;
-    /// fifteen samples put its p95 at 11.99 ms — over budget. The neighbours are no better:
-    /// 4 MiB t=2 is 9.12 ms (91%) and 6 MiB t=1 is 9.83 ms (98%), and the same request still has
-    /// to render a page and talk to D1.
-    ///
-    /// **Below OWASP by ~4.7x in memory.** Present so a constrained deployment is an explicit,
-    /// visible choice rather than a silent downgrade — see [`Params::is_below_recommended`] and
-    /// pair it with a [`Pepper`], which restores the property that matters most.
-    ///
-    /// Measured on the development machine, not on Cloudflare's hardware. Worth re-checking
-    /// against a deployed instance before relying on the headroom.
+    /// **Below OWASP by ~4.7x in memory.** Requires a [`Pepper`]; see
+    /// [`Scheme::is_below_recommended`], which a deployment should surface at startup.
     pub const CONSTRAINED: Params = Params {
         m_kib: 4096,
         t: 1,
@@ -349,21 +258,9 @@ impl Params {
     /// Server-side cost applied to an *already* memory-hard client key, under
     /// [`Scheme::CLIENT_ARGON`].
     ///
-    /// Deliberately tiny, and that is not a weakness: the input is 32 bytes of CSPRNG-grade
-    /// output from an OWASP-parameter Argon2id run. Guessing it directly is not a search anyone
-    /// can mount, so grinding it slowly buys nothing. This step exists for one reason only --
-    /// to apply the [`Pepper`], so a stolen database does not hand over keys that can be
-    /// replayed straight back at the login form.
-    ///
-    /// Measured in wasm over 15 samples: **1.25 ms at p95, 12% of the 10 ms budget** — against
-    /// 4.18 ms (42%) for [`Params::CONSTRAINED`]. So moving the work to the client buys back
-    /// 3.3x of the request's CPU as well as the work factor.
-    ///
-    /// Sampled the same way [`Params::CONSTRAINED`] was, and on the same development machine
-    /// rather than Cloudflare's. Treat the ratio as the durable result and the absolute figures
-    /// as needing a re-check on a deployed instance: OWASP's 19 MiB re-measured at 48.5 ms p50
-    /// on this run against the 25.2 ms recorded in the table at the top of this module, which is
-    /// machine noise, not a change in the code.
+    /// Tiny on purpose: the input is already 32 bytes of output from an OWASP-parameter
+    /// Argon2id run, so grinding it slowly buys nothing. This step exists only to apply the
+    /// [`Pepper`], so a stolen database does not yield replayable keys.
     pub const HANDOFF: Params = Params {
         m_kib: 1024,
         t: 1,
@@ -372,10 +269,7 @@ impl Params {
 
     /// Whether these parameters are weaker than OWASP's minimum.
     ///
-    /// Not advisory: a deployment using [`Params::CONSTRAINED`] should surface this at startup.
-    /// A weakened KDF that nobody mentions is how it stays weakened.
-    ///
-    /// Read this on the *client* half of [`Scheme::CLIENT_ARGON`], never the server half --
+    /// Read this on the *client* half of [`Scheme::CLIENT_ARGON`], never the server half:
     /// [`Params::HANDOFF`] is below OWASP by design and says nothing about the work actually
     /// done. [`Scheme::is_below_recommended`] applies it to the right half.
     pub const fn is_below_recommended(&self) -> bool {
@@ -385,28 +279,10 @@ impl Params {
 
 /// Where the memory-hard work happens.
 ///
-/// A free Worker cannot afford OWASP-grade Argon2id ([`Params::CONSTRAINED`] is the strongest
-/// setting that fits, at ~4.7x below OWASP in memory). The browser can: it has no 10 ms budget.
-/// [`Scheme::CLIENT_ARGON`] moves the expensive half there and leaves the server applying only
-/// [`Params::HANDOFF`] to the result.
-///
-/// # Why this is a scheme and not another `Params` constant
-///
-/// The two produce stored records that look alike -- both end in a cheap Argon2id PHC string --
-/// but mean opposite things. Under [`Scheme::CLIENT_ARGON`] a cheap hash is sound, because its
-/// input already cost 19 MiB to compute. Applied to a plaintext password the same record is
-/// close to worthless. If one `verify` accepted both, then a config flipped back to
-/// [`Scheme::CONSTRAINED`], or one non-JS client posting a raw password, would silently write
-/// the worthless kind alongside the sound kind and nothing would ever say so.
-///
-/// So the two are kept non-interchangeable by construction, twice over:
-///
-/// - Stored client records carry a `c` marker, and [`verify`] refuses a record whose marker
-///   disagrees with the configured scheme rather than guessing.
-/// - The hashed input is domain-separated ([`CLIENT_KEY_DOMAIN`]), so even if a marker were
-///   forged the digests could not collide.
-///
-/// Both failures are closed: a mismatch rejects the login. Neither can quietly downgrade one.
+/// Server-side and client-side records are **not interchangeable**, and are kept apart twice
+/// over: stored client records carry a `c` marker that [`verify`] refuses to read across, and
+/// the hashed input is domain-separated ([`CLIENT_KEY_DOMAIN`]) so digests cannot collide even
+/// with a forged marker. Both failures are closed — a mismatch rejects the login.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scheme {
     /// The server receives the password and does the whole KDF.
@@ -425,19 +301,9 @@ impl Scheme {
 
     /// OWASP-grade Argon2id in the browser; the server only peppers the result.
     ///
-    /// The honest trade, stated plainly:
-    ///
-    /// - **Gained.** A stolen database costs an attacker a full 19 MiB Argon2id run per guess,
-    ///   which no free-Worker server-side scheme can charge them.
-    /// - **Lost.** Login now requires a client that performs the derivation; a plaintext
-    ///   password posted to this scheme is rejected, not accepted weakly. It also needs the
-    ///   salt before submit, so the salt lookup must answer for unknown accounts too or it
-    ///   becomes the account-enumeration oracle that [`crate::login`] exists to avoid.
-    /// - **Unchanged.** Anyone who can read the client key in flight has a password-equivalent
-    ///   for that account -- exactly the position they would be in with the password itself.
-    ///
-    /// No browser client ships with notespace yet, so today this serves callers that implement
-    /// [`CLIENT_KEY_BYTES`]-byte derivation themselves. Deployments are warned at startup.
+    /// Requires a client that performs the derivation and posts
+    /// [`CLIENT_KEY_BYTES`] bytes as hex. A plaintext password is rejected, not accepted
+    /// weakly. No browser client ships yet.
     pub const CLIENT_ARGON: Scheme = Scheme::Client {
         client: Params::OWASP,
         server: Params::HANDOFF,
@@ -489,18 +355,15 @@ impl Default for Scheme {
 /// Bytes of client-derived key [`Scheme::CLIENT_ARGON`] expects, hex-encoded on the wire.
 pub const CLIENT_KEY_BYTES: usize = 32;
 
-/// Domain prefix mixed into a client key before the server hashes it.
-///
-/// Keeps a client-scheme digest from ever equalling a server-scheme one over the same bytes,
-/// independently of the stored marker.
+/// Domain prefix mixed into a client key before the server hashes it, so a client-scheme digest
+/// can never equal a server-scheme one over the same bytes.
 pub const CLIENT_KEY_DOMAIN: &[u8] = b"notespace/client-argon/v1\0";
 
 /// The bytes fed to Argon2id for `secret` under `scheme`, after checking the shape is right.
 ///
 /// Under [`Scheme::Server`] that is the password, length-checked. Under [`Scheme::Client`] it is
-/// the domain prefix plus the decoded key -- and `MIN_PASSWORD_CHARS` deliberately does *not*
-/// apply, because the server never sees the password and cannot judge it. Enforcing password
-/// length is the client's job there, and saying so is the point of this branch.
+/// the domain prefix plus the decoded key; `MIN_PASSWORD_CHARS` does *not* apply there, because
+/// the server never sees the password. Enforcing it becomes the client's responsibility.
 fn kdf_input(secret: &str, scheme: Scheme) -> Result<Vec<u8>, PasswordError> {
     match scheme {
         Scheme::Server(_) => {
@@ -521,8 +384,6 @@ fn kdf_input(secret: &str, scheme: Scheme) -> Result<Vec<u8>, PasswordError> {
 /// Decode a hex client key, rejecting anything that is not exactly [`CLIENT_KEY_BYTES`].
 ///
 /// A plaintext password reaching a [`Scheme::Client`] deployment lands here and is rejected.
-/// That is the intended outcome: failing the login is recoverable, storing a cheap hash of a
-/// real password is not.
 fn decode_client_key(hex: &str) -> Result<Vec<u8>, PasswordError> {
     let b = hex.as_bytes();
     if b.len() != CLIENT_KEY_BYTES * 2 {
@@ -585,10 +446,10 @@ pub enum PasswordError {
     },
 }
 
-/// Hash a password with the ring's current pepper.
+/// Hash a secret with the set's current pepper.
 ///
 /// `salt_b64` must be at least 16 bytes of CSPRNG output, base64 unpadded. The salt is a
-/// parameter because `core` has no RNG on wasm — the same reason ids and timestamps are.
+/// parameter because `core` has no RNG on wasm.
 pub fn hash(
     secret: &str,
     salt_b64: &str,
@@ -607,7 +468,7 @@ pub fn hash(
         .hash_password(&input, salt)
         .map(|h| h.to_string())
         .map_err(|e| PasswordError::Hash(e.to_string()))?;
-    // Record the scheme and which pepper made this, so verification tries exactly one of each.
+    // Record the scheme and pepper id, so verification tries exactly one of each.
     Ok(match current {
         Some(id) => format!("{}{id}{phc}", scheme.marker()),
         None => format!("{}{phc}", scheme.marker()),
@@ -621,13 +482,10 @@ pub fn encode_salt(bytes: &[u8]) -> Result<String, PasswordError> {
         .map_err(|e| PasswordError::BadSalt(e.to_string()))
 }
 
-/// Verify a password, trying the current pepper and then the previous one.
+/// Verify a secret against a stored credential.
 ///
-/// Returns [`Verified::YesRehash`] when the password is right but the stored hash is stale —
-/// weaker parameters, or the previous pepper. Login is the only moment the plaintext exists,
-/// so it is the only chance to migrate the account.
-///
-/// `Err` means the *stored* hash is unusable, which is a bug rather than a failed login. A
+/// Returns [`Verified::YesRehash`] when the secret is right but the stored hash is stale.
+/// `Err` means the *stored* hash is unusable, which is a bug rather than a failed login; a
 /// wrong password is [`Verified::No`].
 ///
 /// The work factor is read from the hash, so an account written under old parameters still
@@ -639,9 +497,7 @@ pub fn verify(
     peppers: &PepperSet,
 ) -> Result<Verified, PasswordError> {
     let rec = split_stored(stored)?;
-    // Never guess across schemes. A client record verified as a server one would be checking a
-    // plaintext password against a 1 MiB hash; the reverse would reject every valid login with
-    // no explanation. Both are bugs worth naming rather than absorbing.
+    // Never read a record across schemes: name the mismatch rather than absorbing it.
     if rec.client != want.is_client() {
         return Err(PasswordError::SchemeMismatch {
             stored_client: rec.client,
@@ -652,7 +508,7 @@ pub fn verify(
     let parsed =
         PasswordHash::new(rec.phc).map_err(|e| PasswordError::MalformedHash(e.to_string()))?;
 
-    // Exactly one lookup, and therefore exactly one Argon2 run, however many peppers are held.
+    // Exactly one lookup, and therefore exactly one Argon2 run.
     let pepper = match rec.pepper_id {
         Some(id) => Some(peppers.get(id).ok_or(PasswordError::UnknownPepper(id))?),
         None => None,
@@ -675,15 +531,13 @@ pub fn verify(
 
 /// Whether a stored hash was made with weaker parameters than `want`.
 ///
-/// Does not consider the pepper — [`verify`] knows which one the hash names and folds that in.
+/// Does not consider the pepper; [`verify`] folds that in.
 pub fn needs_rehash(stored: &str, want: Scheme) -> bool {
     let Ok(rec) = split_stored(stored) else {
         return true;
     };
     if rec.client != want.is_client() {
-        // Not a rehash: the plaintext under one scheme cannot produce the other's record.
-        // `verify` rejects this before we are reached; returning true here would invite a
-        // caller to "fix" it by writing a record it has no valid input for.
+        // Not a rehash: no input available here can produce the other scheme's record.
         return false;
     }
     let want = want.server_params();

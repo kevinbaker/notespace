@@ -9,6 +9,14 @@ Status: draft v0.2 · M0 spike complete, measurements folded in · Target: green
 Audience: implementers (human and agentic). This file is intended to be read by Claude Code as
 project context. Keep it updated; it is the source of truth for architecture decisions.
 
+**The three documents, and which one to open.** This file says what the system should be.
+[`IMPLEMENTATION.md`](IMPLEMENTATION.md) maps each section below to the code that implements it,
+and records what is not built yet. [`DECISIONS.md`](DECISIONS.md) holds the reasoning behind the
+code — measurements, alternatives tried and rejected, bugs that shaped a design.
+
+References run in one direction only: these documents point into the code, and the code points
+at neither. A source file that needs a second document open to be read will drift from it.
+
 **Changes in v0.2** (all driven by the M0 spike — see `docs/M0-findings.md` for the numbers):
 §3.2 budget table annotated with measured values · §4 path encoding changed from decimal-6 to
 base32-4 · §4 new subsection on the id scheme · §8 M0 marked complete · §10 open questions 1, 2

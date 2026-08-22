@@ -1,61 +1,25 @@
 //! Resolving the password pepper, and refusing to run without one.
 //!
-//! # Why this cannot be auto-generated on a Worker
+//! The pepper is never auto-generated on this target: there is nowhere safe to put it, a Worker
+//! cannot write its own secrets, and concurrent isolates would each generate a different value.
+//! Password login therefore does not start without `PASSWORD_PEPPER`.
 //!
-//! Auto-creating a secret on first run is the right answer for a self-hosted binary and the
-//! wrong one here, for three independent reasons:
-//!
-//! 1. **There is nowhere safe to put it.** A Worker has no persistent local storage. The only
-//!    writable place is D1 — and a pepper stored in the database is not a pepper. The entire
-//!    property it provides is that a leaked database does not contain it. Auto-generating into
-//!    D1 would produce the appearance of protection with none of the substance, which is worse
-//!    than none: an operator would see "pepper configured" and stop worrying.
-//! 2. **A Worker cannot write its own secrets.** Doing so needs an API token with account
-//!    access, and shipping one to make the deployment self-configuring would be a far larger
-//!    hole than the one it closes.
-//! 3. **Isolates are plural.** Many run concurrently and are recycled constantly. Each would
-//!    generate a different value, so a password hashed by one would fail against every other.
-//!    Not merely insecure — broken.
-//!
-//! So on this target the rule is the other half of the choice: **refuse**. Password login does
-//! not start without `PASSWORD_PEPPER`.
-//!
-//! # What "refuse" means here
-//!
-//! Not "fail every request". A Worker does not start, it serves; and taking a public forum
-//! offline because a login secret is missing turns a security control into an outage, which is
-//! how security controls come to be switched off. The refusal is scoped to what it protects:
-//! **anything that touches a password returns 503**, reading continues, and the reason is logged
-//! at `console_error` on every isolate that starts.
-//!
-//! The self-hosted target has none of these constraints and should generate a pepper on first
-//! run, writing it to a mode-0600 file beside the database. That belongs in `crates/server`
-//! (M5), which does not exist yet.
+//! "Refuse" is scoped: **anything touching a password returns 503**, reading continues, and the
+//! reason is logged at `console_error` on every isolate that starts.
 
 use notespace_core::password::{PepperSet, Scheme};
 use worker::{console_error, Env};
 
 /// Optional var selecting where the memory-hard work happens.
 ///
-/// `constrained` (default) hashes server-side at the strongest setting that fits the CPU budget.
-/// `client-argon` expects the client to have run OWASP-grade Argon2id already and to post the
-/// derived key; the Worker only peppers it.
-///
-/// A var rather than a secret: which scheme is in use is not a secret, and every stored
-/// credential names it anyway.
+/// `constrained` (default) hashes server-side. `client-argon` expects the client to have run
+/// OWASP-grade Argon2id already and to post the derived key.
 pub const SCHEME_BINDING: &str = "PASSWORD_SCHEME";
 
 /// Secret holding every pepper the deployment has ever used.
 ///
-/// Format: `1=<secret>;2=<secret>;…`, highest id current. One variable rather than one per
-/// pepper, because the set is a single fact: a scan over numbered bindings cannot distinguish
-/// "id 3 was never used" from "id 3 failed to load", and silently holding fewer peppers than
-/// intended strands accounts.
-///
-/// A secret, not a var: the value of a pepper is that it does not live where the database does.
-///
-/// Rotating means appending an entry. Nothing already stored changes meaning, because every
-/// hash names the id that made it.
+/// Format: `1=<secret>;2=<secret>;…`, highest id current. Rotating means appending an entry;
+/// nothing already stored changes meaning, because every hash names the id that made it.
 pub const PEPPER_BINDING: &str = "PASSWORD_PEPPER";
 
 /// Whether local password login is available, and why not when it is not.
@@ -82,8 +46,7 @@ impl AuthConfig {
                  crates/worker/src/auth_config.rs.",
             );
         };
-        // Any error is fatal: a partly-loaded pepper set authenticates some accounts and
-        // permanently rejects others, which is worse than refusing outright.
+        // Any error is fatal: a partly-loaded set would strand an arbitrary subset of accounts.
         let peppers = match PepperSet::parse(&spec) {
             Ok(p) => p,
             Err(_) => {
@@ -100,13 +63,11 @@ impl AuthConfig {
             .map(|v| v.to_string())
             .as_deref()
         {
-            // The Worker cannot afford OWASP parameters. The pepper above is what makes
-            // that tolerable, which is why it is mandatory rather than advised.
+            // Below OWASP; the mandatory pepper is what makes it tolerable.
             None | Some("constrained") => Scheme::CONSTRAINED,
             Some("client-argon") => Scheme::CLIENT_ARGON,
             Some(other) => {
-                // Not a fallback to the default. An operator who asked for a stronger scheme and
-                // silently got the weaker one is the exact failure this whole module is about.
+                // Never fall back to the default: a misspelling must not silently weaken.
                 console_error!(
                     "{SCHEME_BINDING}={other:?} is not a known scheme. Expected \
                      \"constrained\" or \"client-argon\". Password login is disabled."

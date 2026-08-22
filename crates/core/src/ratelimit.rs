@@ -1,32 +1,16 @@
 //! Rate limiting for authentication attempts.
 //!
-//! # Why this matters more than the KDF here
+//! The check must run **before** the hash. An attacker pays nothing for a wrong guess; the
+//! server pays a full KDF run, so an unthrottled login form is also a CPU-exhaustion vector.
 //!
-//! A weak KDF is an *offline* problem: it decides how fast someone who already stole the
-//! database can crack it, and the pepper (§4.10) is the answer to that. Online guessing is a
-//! different attack with a different defence — refusing attempts — and no amount of Argon2 cost
-//! helps, because the attacker pays nothing for a wrong guess. **We** do: at
-//! `Params::CONSTRAINED` every attempt burns 3.34 ms of a 10 ms budget, so unthrottled login is
-//! also a cheap way to exhaust the account's CPU.
+//! Two buckets, and an attempt must pass both:
 //!
-//! So the check runs **before** the hash, not after. A refused attempt must cost a lookup, not a
-//! KDF.
+//! - **Per identity**: one account under a password list. Strict.
+//! - **Per client**: one password sprayed across many accounts, which never trips a per-account
+//!   limit. Looser, because a shared NAT is one client here.
 //!
-//! # Two buckets, because one attack is not the other
-//!
-//! - **Per identity**: someone hammering one account with a password list. Strict.
-//! - **Per client**: someone spraying one common password across many accounts — credential
-//!   stuffing, which never trips a per-account limit because no account sees two attempts.
-//!   Looser, because a shared NAT or a university proxy is one client to us.
-//!
-//! An attempt has to pass both.
-//!
-//! # Fixed windows, deliberately
-//!
-//! A sliding window is more accurate and needs per-attempt timestamps; a fixed window needs one
-//! counter and one instant. The cost of the approximation is that an attacker can straddle a
-//! boundary and get `2 * limit` attempts in quick succession — which for a limit of 5 means 10,
-//! and does not change anything. Precision is not worth a row per attempt on a 500 MB database.
+//! Windows are fixed, not sliding: one counter and one instant per bucket. An attacker can
+//! straddle a boundary for `2 * limit` attempts in quick succession, which is accepted.
 
 use crate::model::Timestamp;
 

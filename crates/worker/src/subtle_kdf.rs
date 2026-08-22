@@ -4,10 +4,9 @@
 //! *platform* API: using it links no cryptography into the bundle at all — only the
 //! wasm-bindgen glue to call it. Argon2, being a Rust crate, is compiled in.
 //!
-//! It runs natively rather than in wasm, which makes it about six times faster than the same
-//! iteration count compiled to wasm. That still is not enough: workerd caps PBKDF2 at 100,000
-//! iterations, OWASP asks for 600,000, and even the capped version measured 12.7 ms against a
-//! 10 ms budget. Kept for the measurement and for a paid-plan deployment, not used by default.
+//! Runs natively rather than in wasm, but workerd caps PBKDF2 at 100,000 iterations where
+//! OWASP asks for 600,000, and even the capped version exceeds the 10 ms budget. Kept for a
+//! paid-plan deployment; not used by default.
 
 use worker::js_sys::{global, Array, Object, Promise, Reflect, Uint8Array};
 use worker::wasm_bindgen::{JsCast, JsValue};
