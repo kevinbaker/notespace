@@ -93,10 +93,23 @@ uncrackable at the reduced Argon2 parameters this target can afford. Password lo
 start without one, and says so on every request that touches a password.
 
 ```bash
-openssl rand -hex 32 | wrangler secret put PASSWORD_PEPPER
+printf '1=%s' "$(openssl rand -hex 32)" | wrangler secret put PASSWORD_PEPPER
+openssl rand -hex 32 | wrangler secret put CSRF_KEY
 ```
 
+`PASSWORD_PEPPER` is a **list**: `1=<secret>;2=<secret>;…`, highest id current. One variable
+rather than one per pepper, because a scan over numbered bindings cannot tell "id 3 was never
+used" from "id 3 failed to load" — and silently holding fewer peppers than intended strands
+accounts. Any parse error refuses login outright rather than loading part of the set.
+
 Then build with the feature: `worker-build --release -- --features password`.
+
+Create an account:
+
+```bash
+cargo run -p notespace-seed -- user alice "<password>" "<the same pepper spec>" \
+  | wrangler d1 execute notespace-dev --remote --file=/dev/stdin
+```
 
 The pepper is deliberately **not** auto-generated. On a Worker there is nowhere safe to put one:
 the only writable store is D1, and a pepper inside the database is not a pepper. A Worker also
@@ -110,10 +123,10 @@ For local `wrangler dev`, put it in `.dev.vars` (gitignored):
 PASSWORD_PEPPER = "<64 hex characters>"
 ```
 
-**Rotating**: set `PASSWORD_PEPPER_PREVIOUS` to the old value and `PASSWORD_PEPPER` to the new
-one. Logins verify against either and rewrite the hash under the new pepper as accounts come
-back. Drop the previous binding once the tail is small enough to force a reset — a pepper cannot
-be rotated in place, because the hashes depend on it and the plaintexts are gone.
+**Rotating**: append an entry. `1=<old>;2=<new>` makes 2 current, and every hash keeps naming
+the id that made it, so nothing already stored changes meaning. Logins under an older pepper are
+rewritten under the current one as accounts come back. Nothing has to be retired on a deadline:
+holding every pepper is free, because verification looks up exactly one.
 
 ## Gotchas
 

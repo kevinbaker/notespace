@@ -787,6 +787,7 @@ version = "0.0.1"
 dependencies = [
  "axum",
  "console_error_panic_hook",
+ "form_urlencoded",
  "getrandom 0.2.17",
  "notespace-core",
  "notespace-render",

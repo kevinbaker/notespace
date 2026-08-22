@@ -160,6 +160,23 @@ pub trait Store {
     /// **Budget: 1 statement.**
     async fn delete_session(&self, token: &TokenHash) -> StoreResult<()>;
 
+    /// An account and its credential, by name. **Budget: 1 statement.**
+    ///
+    /// `None` for an unknown name. The caller must not branch on that before hashing — see
+    /// [`Credential`].
+    async fn user_by_name(&self, name: &str) -> StoreResult<Option<Credential>>;
+
+    /// Create an account. **Budget: 1 statement.** `password_hash` is `None` for external auth.
+    async fn create_user(
+        &self,
+        name: &str,
+        created_at: Timestamp,
+        password_hash: Option<&str>,
+    ) -> StoreResult<UserId>;
+
+    /// Rewrite a stored credential. **Budget: 1 statement.**
+    async fn set_password_hash(&self, user: UserId, hash: &str) -> StoreResult<()>;
+
     /// Current attempt counters for both buckets.
     ///
     /// **Budget: 1 statement.** Runs before the password hash on every login attempt, so a
@@ -190,6 +207,18 @@ pub trait Store {
     ///
     /// **Budget: 1 statement.** Returns how many sessions ended.
     async fn delete_user_sessions(&self, user: UserId) -> StoreResult<u32>;
+}
+
+/// An account as the login path needs it.
+///
+/// `password_hash` is `None` when the account has no local credential — an OIDC user, or one
+/// whose password was cleared. That is a login failure, but the handler must reach it *after*
+/// hashing something, not by returning early: an early return is measurably faster and turns
+/// the login form into a username oracle.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Credential {
+    pub user: User,
+    pub password_hash: Option<String>,
 }
 
 /// A live session and whose it is.

@@ -105,7 +105,49 @@ fn post_public_id(i: usize) -> String {
         .encode()
 }
 
+/// SQL for a test account with a real Argon2 credential.
+///
+/// `notespace-seed user <name> <password> <pepper-spec>`. The pepper spec is the same string as
+/// PASSWORD_PEPPER, so the hash written here verifies against the running deployment — a fixture
+/// hashed under a different pepper would fail login for reasons that look like a code bug.
+fn user_sql(name: &str, password: &str, pepper_spec: &str) -> String {
+    use notespace_core::password::{self, Params, PepperSet};
+    let peppers = PepperSet::parse(pepper_spec).expect("valid pepper spec");
+    // Deterministic salt: this is a seeding tool, and a reproducible fixture is worth more than
+    // unpredictability no attacker is present for.
+    let salt = password::encode_salt(b"notespace-seed01").expect("salt encodes");
+    let hash = password::hash(password, &salt, Params::CONSTRAINED, &peppers).expect("hash");
+    format!(
+        // Upsert: the base seed already creates accounts without credentials, so a plain
+        // INSERT collides with the unique name and silently leaves them unable to log in.
+        "INSERT INTO user (name, created_at, password_hash, state) VALUES ('{}', {}, '{}', 'active') \
+         ON CONFLICT(name) DO UPDATE SET password_hash = excluded.password_hash, state = 'active';",
+        sql_quote(&name.to_lowercase()),
+        1_735_689_600_000i64,
+        sql_quote(&hash),
+    )
+}
+
+/// Escape a single-quoted SQL literal.
+fn sql_quote(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
 fn main() {
+    // `user <name> <password> <pepper-spec>` emits one INSERT and exits.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("user") {
+        match (argv.get(2), argv.get(3), argv.get(4)) {
+            (Some(name), Some(pw), Some(spec)) => {
+                println!("{}", user_sql(name, pw, spec));
+                return;
+            }
+            _ => {
+                eprintln!("usage: notespace-seed user <name> <password> <pepper-spec>");
+                std::process::exit(2);
+            }
+        }
+    }
     let post_count: usize = std::env::args()
         .nth(1)
         .and_then(|s| s.parse().ok())

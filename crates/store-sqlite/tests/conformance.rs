@@ -12,13 +12,14 @@ use notespace_store_sqlite::SqliteStore;
 /// `include_str!` needs literal paths, so this list is maintained by hand — and a migration
 /// added without touching it fails as "no such table" somewhere unrelated.
 /// `migration_list_is_complete` below turns that into a clear failure instead.
-const MIGRATIONS: [&str; 6] = [
+const MIGRATIONS: [&str; 7] = [
     include_str!("../../../migrations/0001_init.sql"),
     include_str!("../../../migrations/0002_thread_public_id.sql"),
     include_str!("../../../migrations/0003_space_paths_and_names.sql"),
     include_str!("../../../migrations/0004_post_public_id.sql"),
     include_str!("../../../migrations/0005_session.sql"),
     include_str!("../../../migrations/0006_login_attempt.sql"),
+    include_str!("../../../migrations/0007_user_password.sql"),
 ];
 
 const MIGRATIONS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations");
@@ -162,4 +163,248 @@ fn migrations_apply_to_plain_sqlite() {
     for expected in ["post", "space", "thread", "user"] {
         assert!(tables.contains(&expected.to_string()), "missing {expected}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// The login flow
+// ---------------------------------------------------------------------------
+
+use notespace_core::login::{attempt, Attempt, LoginConfig, Outcome};
+use notespace_core::password::{self, Params, Pepper, PepperSet};
+use notespace_core::ratelimit::Limit;
+use notespace_core::session::{SessionPolicy, SessionToken, TOKEN_BYTES};
+use notespace_core::store::Store;
+
+const NOW: i64 = 1_800_000_000_000;
+const PW: &str = "correct horse battery staple";
+/// Cheap on purpose: these tests exercise the flow, not the work factor.
+const FAST: Params = Params {
+    m_kib: 64,
+    t: 1,
+    p: 1,
+};
+
+fn config() -> LoginConfig {
+    let peppers = PepperSet::single(0, Pepper::new(&[9u8; 32]).unwrap());
+    LoginConfig {
+        params: FAST,
+        dummy_hash: LoginConfig::dummy_hash_for(FAST, &peppers),
+        peppers,
+        sessions: SessionPolicy::default(),
+        per_identity: Limit {
+            max: 3,
+            window_ms: 60_000,
+        },
+        per_client: Limit {
+            max: 10,
+            window_ms: 60_000,
+        },
+    }
+}
+
+async fn with_account(store: &SqliteStore, cfg: &LoginConfig, name: &str, pw: Option<&str>) {
+    let hash =
+        pw.map(|p| password::hash(p, "c29tZXNhbHR2YWx1ZTE", cfg.params, &cfg.peppers).unwrap());
+    store
+        .create_user(name, NOW, hash.as_deref())
+        .await
+        .expect("create user");
+}
+
+fn try_login<'a>(name: &'a str, pw: &'a str, client: &'a str, seed: u8) -> Attempt<'a> {
+    Attempt {
+        username: name,
+        password: pw,
+        client,
+        token: SessionToken::from_bytes([seed; TOKEN_BYTES]),
+        now: NOW,
+    }
+}
+
+#[tokio::test]
+async fn a_correct_password_creates_a_session() {
+    let store = seeded();
+    let cfg = config();
+    with_account(&store, &cfg, "alice2", Some(PW)).await;
+
+    let out = attempt(&store, &cfg, try_login("alice2", PW, "203.0.113.1", 1))
+        .await
+        .unwrap();
+    let Outcome::Success { session, user } = out else {
+        panic!("correct password did not log in");
+    };
+    assert_eq!(user.name, "alice2");
+    assert_eq!(session.expires_at, cfg.sessions.expiry_from(NOW));
+
+    // The session is real: it resolves.
+    let found = store
+        .lookup_session(&session.token_hash, NOW + 1000)
+        .await
+        .unwrap()
+        .expect("session resolves");
+    assert_eq!(found.user.id, user.id);
+}
+
+#[tokio::test]
+async fn the_username_is_matched_case_insensitively() {
+    let store = seeded();
+    let cfg = config();
+    with_account(&store, &cfg, "casey", Some(PW)).await;
+    let out = attempt(&store, &cfg, try_login("CaSeY", PW, "203.0.113.2", 2))
+        .await
+        .unwrap();
+    assert!(matches!(out, Outcome::Success { .. }), "case folding lost");
+}
+
+#[tokio::test]
+async fn a_wrong_password_is_rejected_and_counted() {
+    let store = seeded();
+    let cfg = config();
+    with_account(&store, &cfg, "bob", Some(PW)).await;
+
+    let out = attempt(
+        &store,
+        &cfg,
+        try_login("bob", "wrong password!", "203.0.113.3", 3),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(out, Outcome::Rejected));
+
+    let keys = notespace_core::ratelimit::AttemptKeys::new("bob", "203.0.113.3");
+    let (identity, client) = store.login_attempts(&keys).await.unwrap();
+    assert_eq!(identity.map(|a| a.count), Some(1), "identity not counted");
+    assert_eq!(client.map(|a| a.count), Some(1), "client not counted");
+}
+
+/// The property the whole shape of `attempt` exists for.
+#[tokio::test]
+async fn an_unknown_account_is_indistinguishable_from_a_wrong_password() {
+    let store = seeded();
+    let cfg = config();
+    with_account(&store, &cfg, "real", Some(PW)).await;
+    // An account with no local password -- an OIDC user -- is the third case that must match.
+    with_account(&store, &cfg, "external", None).await;
+
+    for (name, label) in [
+        ("real", "wrong password"),
+        ("ghost", "no such account"),
+        ("external", "account with no password"),
+    ] {
+        let out = attempt(
+            &store,
+            &cfg,
+            try_login(name, "some wrong guess", "203.0.113.4", 4),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(out, Outcome::Rejected),
+            "{label} produced something other than a plain rejection"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_banned_account_cannot_log_in_with_the_right_password() {
+    let store = seeded();
+    let cfg = config();
+    with_account(&store, &cfg, "banned", Some(PW)).await;
+    store
+        .conn()
+        .execute("UPDATE user SET state='banned' WHERE name='banned'", [])
+        .unwrap();
+
+    let out = attempt(&store, &cfg, try_login("banned", PW, "203.0.113.5", 5))
+        .await
+        .unwrap();
+    assert!(
+        matches!(out, Outcome::Rejected),
+        "a banned account logged in"
+    );
+}
+
+#[tokio::test]
+async fn the_limiter_bites_before_the_password_is_checked() {
+    let store = seeded();
+    let cfg = config();
+    with_account(&store, &cfg, "target", Some(PW)).await;
+
+    for i in 1..=cfg.per_identity.max {
+        let out = attempt(&store, &cfg, try_login("target", "guess", "203.0.113.6", 6))
+            .await
+            .unwrap();
+        assert!(
+            matches!(out, Outcome::Rejected),
+            "attempt {i} not merely rejected"
+        );
+    }
+    // Now even the CORRECT password is refused -- which is the point.
+    let out = attempt(&store, &cfg, try_login("target", PW, "203.0.113.6", 7))
+        .await
+        .unwrap();
+    let Outcome::RateLimited { retry_after_secs } = out else {
+        panic!("the limiter did not bite");
+    };
+    assert!(retry_after_secs > 0 && retry_after_secs <= 60);
+}
+
+#[tokio::test]
+async fn a_successful_login_clears_the_counters() {
+    let store = seeded();
+    let cfg = config();
+    with_account(&store, &cfg, "carol", Some(PW)).await;
+
+    attempt(&store, &cfg, try_login("carol", "wrong!", "203.0.113.7", 8))
+        .await
+        .unwrap();
+    let out = attempt(&store, &cfg, try_login("carol", PW, "203.0.113.7", 9))
+        .await
+        .unwrap();
+    assert!(matches!(out, Outcome::Success { .. }));
+
+    let keys = notespace_core::ratelimit::AttemptKeys::new("carol", "203.0.113.7");
+    let (identity, client) = store.login_attempts(&keys).await.unwrap();
+    assert_eq!(identity, None, "identity counter survived a success");
+    assert_eq!(client, None, "client counter survived a success");
+}
+
+/// Logging in under weaker stored parameters must upgrade the hash in place.
+#[tokio::test]
+async fn login_rehashes_a_stale_credential() {
+    let store = seeded();
+    let mut cfg = config();
+    // Stored under an older pepper than the one now current.
+    let old = PepperSet::single(0, Pepper::new(&[1u8; 32]).unwrap());
+    let stale = password::hash(PW, "c29tZXNhbHR2YWx1ZTE", FAST, &old).unwrap();
+    store.create_user("dave", NOW, Some(&stale)).await.unwrap();
+
+    // Current config holds both peppers, with a different one current.
+    let mut set = PepperSet::none();
+    set.insert(0, Pepper::new(&[1u8; 32]).unwrap(), false);
+    set.insert(1, Pepper::new(&[2u8; 32]).unwrap(), true);
+    cfg.dummy_hash = LoginConfig::dummy_hash_for(FAST, &set);
+    cfg.peppers = set;
+
+    let out = attempt(&store, &cfg, try_login("dave", PW, "203.0.113.8", 10))
+        .await
+        .unwrap();
+    assert!(
+        matches!(out, Outcome::Success { .. }),
+        "stale hash did not log in"
+    );
+
+    let after: String = store
+        .conn()
+        .query_row(
+            "SELECT password_hash FROM user WHERE name='dave'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_ne!(after, stale, "the stale hash was not rewritten");
+    assert!(
+        after.starts_with("1$"),
+        "not rewritten under the current pepper: {after}"
+    );
 }

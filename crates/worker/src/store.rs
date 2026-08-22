@@ -18,7 +18,8 @@ use notespace_core::ratelimit::{AttemptKeys, Attempts};
 use notespace_core::session::{Session, TokenHash};
 use notespace_core::sql;
 use notespace_core::store::{
-    async_trait, Authenticated, NextPath, Page, PostLocation, Store, StoreError, StoreResult,
+    async_trait, Authenticated, Credential, NextPath, Page, PostLocation, Store, StoreError,
+    StoreResult,
 };
 
 use serde::Deserialize;
@@ -82,6 +83,14 @@ struct ThreadRow {
     space_name: String,
     space_ranking: String,
     space_depth_cap: i64,
+}
+
+#[derive(Deserialize)]
+struct CredentialRow {
+    id: i64,
+    name: String,
+    state: String,
+    password_hash: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -555,6 +564,62 @@ impl Store for D1Store {
 
     async fn insert_post(&self, new: &NewPost) -> StoreResult<Post> {
         self.append_post(new).await
+    }
+
+    async fn user_by_name(&self, name: &str) -> StoreResult<Option<Credential>> {
+        let res = self
+            .db
+            .prepare(sql::USER_BY_NAME)
+            .bind(&[name.into()])
+            .map_err(backend)?
+            .all()
+            .await
+            .map_err(backend)?;
+        self.last_stats.set(collect_stats(&[&res]));
+        let rows: Vec<CredentialRow> = res.results().map_err(backend)?;
+        Ok(rows.into_iter().next().map(|r| Credential {
+            user: User {
+                id: r.id,
+                name: r.name,
+                state: r.state.parse().unwrap_or_default(),
+            },
+            password_hash: r.password_hash,
+        }))
+    }
+
+    async fn create_user(
+        &self,
+        name: &str,
+        created_at: Timestamp,
+        password_hash: Option<&str>,
+    ) -> StoreResult<UserId> {
+        let res = self
+            .db
+            .prepare(sql::INSERT_USER)
+            .bind(&[
+                name.into(),
+                num(created_at),
+                match password_hash {
+                    Some(h) => h.into(),
+                    None => worker::wasm_bindgen::JsValue::NULL,
+                },
+            ])
+            .map_err(backend)?
+            .run()
+            .await
+            .map_err(backend)?;
+        self.last_stats.set(collect_stats(&[&res]));
+        res.meta()
+            .ok()
+            .flatten()
+            .and_then(|m| m.last_row_id)
+            .ok_or_else(|| StoreError::Backend("insert reported no row id".into()))
+    }
+
+    async fn set_password_hash(&self, user: UserId, hash: &str) -> StoreResult<()> {
+        self.run(sql::SET_PASSWORD_HASH, vec![num(user), hash.into()])
+            .await
+            .map(|_| ())
     }
 
     async fn login_attempts(

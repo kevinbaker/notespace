@@ -45,18 +45,33 @@ impl CsrfKey {
         Ok(CsrfKey(secret.to_vec()))
     }
 
-    fn sign(&self, session: &TokenHash, expires_at: Timestamp) -> String {
+    fn sign(&self, binding: &str, expires_at: Timestamp) -> String {
         let mut mac = SimpleHmac::<Sha256>::new_from_slice(&self.0).expect("hmac accepts any key");
-        mac.update(session.as_str().as_bytes());
+        mac.update(binding.as_bytes());
         mac.update(b".");
         mac.update(expires_at.to_string().as_bytes());
         hex(&mac.finalize().into_bytes())
     }
 
-    /// Mint a token for this session, valid until `now + lifetime_ms`.
-    pub fn mint(&self, session: &TokenHash, now: Timestamp, lifetime_ms: i64) -> CsrfToken {
+    /// Mint a token bound to `binding`, valid until `now + lifetime_ms`.
+    ///
+    /// `binding` is whatever identifies this visitor: a session's [`TokenHash`] once logged in,
+    /// or — on the login form itself, where there is no session yet — the value of a short-lived
+    /// anonymous cookie. Binding to *something* is what stops a token minted for one visitor
+    /// being replayed by another, and the login form is exactly where that matters.
+    pub fn mint(&self, binding: &str, now: Timestamp, lifetime_ms: i64) -> CsrfToken {
         let expires_at = now + lifetime_ms;
-        CsrfToken(format!("{expires_at}.{}", self.sign(session, expires_at)))
+        CsrfToken(format!("{expires_at}.{}", self.sign(binding, expires_at)))
+    }
+
+    /// Mint for a logged-in visitor.
+    pub fn mint_for_session(
+        &self,
+        session: &TokenHash,
+        now: Timestamp,
+        lifetime_ms: i64,
+    ) -> CsrfToken {
+        self.mint(session.as_str(), now, lifetime_ms)
     }
 
     /// Check a token submitted with a form.
@@ -64,18 +79,13 @@ impl CsrfKey {
     /// Every failure is the same to the caller: there is nothing useful to tell someone whose
     /// token did not verify, and distinguishing "expired" from "forged" leaks whether a guess
     /// had the right shape.
-    pub fn verify(
-        &self,
-        token: &str,
-        session: &TokenHash,
-        now: Timestamp,
-    ) -> Result<(), CsrfError> {
+    pub fn verify(&self, token: &str, binding: &str, now: Timestamp) -> Result<(), CsrfError> {
         let (expiry, mac) = token.split_once('.').ok_or(CsrfError::Invalid)?;
         let expires_at: Timestamp = expiry.parse().map_err(|_| CsrfError::Invalid)?;
         if expires_at <= now {
             return Err(CsrfError::Invalid);
         }
-        let expected = self.sign(session, expires_at);
+        let expected = self.sign(binding, expires_at);
         // Constant time: a byte-by-byte comparison leaks how much of a forged MAC was right,
         // which is enough to forge one a byte at a time.
         if expected.as_bytes().ct_eq(mac.as_bytes()).into() {
@@ -137,8 +147,11 @@ mod tests {
     fn key() -> CsrfKey {
         CsrfKey::new(&[7u8; 32]).unwrap()
     }
-    fn sess(seed: u8) -> TokenHash {
-        SessionToken::from_bytes([seed; TOKEN_BYTES]).hash()
+    fn sess(seed: u8) -> String {
+        SessionToken::from_bytes([seed; TOKEN_BYTES])
+            .hash()
+            .as_str()
+            .to_string()
     }
 
     #[test]
@@ -147,6 +160,19 @@ mod tests {
         let t = k.mint(&s, NOW, DEFAULT_LIFETIME_MS);
         assert_eq!(k.verify(t.as_str(), &s, NOW), Ok(()));
         assert_eq!(k.verify(t.as_str(), &s, NOW + 1000), Ok(()));
+    }
+
+    /// The login form has no session, so a token has to bind to something else.
+    #[test]
+    fn a_token_can_bind_to_an_anonymous_cookie() {
+        let k = key();
+        let t = k.mint("anon-cookie-value-abc", NOW, DEFAULT_LIFETIME_MS);
+        assert_eq!(k.verify(t.as_str(), "anon-cookie-value-abc", NOW), Ok(()));
+        // Still bound: another visitor's cookie does not open it.
+        assert_eq!(
+            k.verify(t.as_str(), "anon-cookie-value-xyz", NOW),
+            Err(CsrfError::Invalid)
+        );
     }
 
     /// The property a bare signed constant would not have.

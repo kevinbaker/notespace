@@ -14,12 +14,16 @@ mod subtle_kdf;
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use notespace_core::conformance::{run_all, Fixture};
+use notespace_core::cookie;
 use notespace_core::id::PublicId;
 use notespace_core::path::Path as TreePath;
+use notespace_core::session::SessionToken;
 use notespace_core::store::{Page, Store, StoreError, StoreResult};
+#[cfg(feature = "password")]
+use notespace_core::{csrf, login};
 use serde::Deserialize;
 use store::D1Store;
 use tower_service::Service;
@@ -76,8 +80,8 @@ fn router(env: Env) -> Router {
         .route("/t/{id}", get(thread_page))
         .route("/t/{id}/{slug}", get(thread_page_slug))
         .route("/p/{id}", get(post_permalink))
-        .route("/login", get(auth_status).post(auth_status))
-        .route("/register", get(auth_status).post(auth_status))
+        .route("/login", get(login_form).post(login_submit))
+        .route("/logout", post(logout))
         // GET runs the read-only checks; POST adds the write checks, which mutate the thread.
         // A GET that appends posts would be wrong regardless of how convenient it is.
         .route(
@@ -109,20 +113,247 @@ async fn thread_page(
     render_thread(state, id, None, query).await
 }
 
-/// The auth endpoints.
+/// The login form.
 ///
-/// The login flow itself is not built yet, but the *refusal* is — and it is the part that has to
-/// be right, because a deployment missing its pepper must not quietly accept passwords. This
-/// answers 503 when password login refused to start, so the failure is visible from outside the
-/// logs rather than only inside them.
+/// A visitor here has no session, so the CSRF token binds to a short-lived anonymous cookie set
+/// on this response. Without a binding the token is a signed constant and any visitor's token
+/// works for any other.
+#[cfg(feature = "password")]
 #[worker::send]
-async fn auth_status(State(env): State<Env>) -> Response {
-    auth_status_inner(&env)
+async fn login_form(
+    State(env): State<Env>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<LoginQuery>,
+) -> Response {
+    let cfg = auth_config::AuthConfig::resolve(&env);
+    if let auth_config::AuthConfig::Refused(why) = &cfg {
+        return (StatusCode::SERVICE_UNAVAILABLE, format!("{why}\n")).into_response();
+    }
+    let Some(key) = csrf_key(&env) else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CSRF_KEY is not configured",
+        );
+    };
+
+    // Reuse the visitor's anonymous cookie if they have one, so a reload does not invalidate a
+    // form they already have open in another tab.
+    let (anon, set_anon) = match cookie::get(cookie_header(&headers), cookie::ANON) {
+        Some(existing) => (existing, None),
+        None => match ids::random_hex() {
+            Ok(v) => {
+                let c = cookie::set(cookie::ANON, &v, 60 * 60);
+                (v, Some(c))
+            }
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
+        },
+    };
+
+    let token = key.mint(
+        &anon,
+        worker::Date::now().as_millis() as i64,
+        csrf::DEFAULT_LIFETIME_MS,
+    );
+    let next = q.next.as_deref().and_then(cookie::safe_next);
+    let body =
+        notespace_render::auth::login_page(token.as_str(), next, q.error.and_then(parse_error));
+
+    let mut resp = (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
+            // Never cached: it carries a token bound to one visitor.
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        Html(body.into_string()),
+    )
+        .into_response();
+    if let Some(c) = set_anon {
+        if let Ok(v) = c.parse() {
+            resp.headers_mut().append(header::SET_COOKIE, v);
+        }
+    }
+    resp
 }
 
-/// Password login compiled out: these endpoints do not exist.
+/// Turn `?error=` back into something to show. Only values this handler itself emits.
+#[cfg(feature = "password")]
+fn parse_error(code: String) -> Option<notespace_render::auth::LoginError> {
+    use notespace_render::auth::LoginError;
+    match code.as_str() {
+        "rejected" => Some(LoginError::Rejected),
+        "expired" => Some(LoginError::Expired),
+        other => other
+            .strip_prefix("wait-")
+            .and_then(|s| s.parse().ok())
+            .map(|retry_after_secs| LoginError::RateLimited { retry_after_secs }),
+    }
+}
+
+/// Handle a submitted login.
+///
+/// Redirects on every outcome rather than rendering in place: a POST that renders leaves the
+/// browser able to resubmit it, and resubmitting a login is a wasted attempt against the
+/// visitor's own rate limit.
+#[cfg(feature = "password")]
+#[worker::send]
+async fn login_submit(
+    State(env): State<Env>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Response {
+    let cfg = match auth_config::AuthConfig::resolve(&env) {
+        auth_config::AuthConfig::Refused(why) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, format!("{why}\n")).into_response()
+        }
+        auth_config::AuthConfig::External => {
+            return error(StatusCode::NOT_FOUND, "password login is disabled")
+        }
+        auth_config::AuthConfig::Passwords { peppers, params } => (peppers, params),
+    };
+    let (peppers, params) = cfg;
+
+    let form = form_urlencoded::parse(body.as_bytes());
+    let (mut username, mut password, mut token, mut next) =
+        (String::new(), String::new(), String::new(), None);
+    for (k, v) in form {
+        match k.as_ref() {
+            "username" => username = v.into_owned(),
+            "password" => password = v.into_owned(),
+            "csrf" => token = v.into_owned(),
+            "next" => next = Some(v.into_owned()),
+            _ => {}
+        }
+    }
+
+    let now = worker::Date::now().as_millis() as i64;
+    let Some(key) = csrf_key(&env) else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CSRF_KEY is not configured",
+        );
+    };
+    // The token is bound to the anonymous cookie; without it there is nothing to check against,
+    // which is itself a failure rather than a reason to skip the check.
+    let anon = cookie::get(cookie_header(&headers), cookie::ANON).unwrap_or_default();
+    if key.verify(&token, &anon, now).is_err() {
+        return redirect_to_login("expired", next.as_deref());
+    }
+
+    let db = match env.d1(DB_BINDING) {
+        Ok(db) => db,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &format!("no D1: {e}")),
+    };
+    let store = D1Store::new(db);
+
+    let session_token = match ids::random_session_token() {
+        Ok(t) => t,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    };
+    let login_cfg = login::LoginConfig {
+        dummy_hash: login::LoginConfig::dummy_hash_for(params, &peppers),
+        params,
+        peppers,
+        sessions: notespace_core::session::SessionPolicy::default(),
+        per_identity: notespace_core::ratelimit::Limit::PER_IDENTITY,
+        per_client: notespace_core::ratelimit::Limit::PER_CLIENT,
+    };
+    let attempt = login::Attempt {
+        username: &username,
+        password: &password,
+        client: &client_address(&headers),
+        token: session_token.clone(),
+        now,
+    };
+
+    match login::attempt(&store, &login_cfg, attempt).await {
+        Ok(login::Outcome::Success { session, .. }) => {
+            let max_age = (session.expires_at - now) / 1000;
+            let target = next.as_deref().and_then(cookie::safe_next).unwrap_or("/");
+            (
+                StatusCode::SEE_OTHER,
+                [
+                    (header::LOCATION, target.to_string()),
+                    (
+                        header::SET_COOKIE,
+                        cookie::set(cookie::SESSION, &session_token.to_cookie_value(), max_age),
+                    ),
+                ],
+            )
+                .into_response()
+        }
+        Ok(login::Outcome::Rejected) => redirect_to_login("rejected", next.as_deref()),
+        Ok(login::Outcome::RateLimited { retry_after_secs }) => {
+            redirect_to_login(&format!("wait-{retry_after_secs}"), next.as_deref())
+        }
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+#[cfg(feature = "password")]
+fn redirect_to_login(code: &str, next: Option<&str>) -> Response {
+    let target = match next.and_then(cookie::safe_next) {
+        Some(n) => format!("/login?error={code}&next={}", urlencode(n)),
+        None => format!("/login?error={code}"),
+    };
+    (StatusCode::SEE_OTHER, [(header::LOCATION, target)]).into_response()
+}
+
+/// Percent-encode the few characters that matter in a query value.
+#[cfg(feature = "password")]
+fn urlencode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                (b as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
+
+/// The raw `Cookie:` header, if present.
+fn cookie_header(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers.get(header::COOKIE).and_then(|v| v.to_str().ok())
+}
+
+/// The address rate limiting counts against.
+///
+/// `CF-Connecting-IP` is set by Cloudflare's edge and cannot be spoofed by the client — unlike
+/// `X-Forwarded-For`, which is why that one is not consulted.
+#[cfg(feature = "password")]
+fn client_address(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("cf-connecting-ip")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+#[cfg(feature = "password")]
+fn csrf_key(env: &Env) -> Option<csrf::CsrfKey> {
+    csrf::CsrfKey::new(env.secret("CSRF_KEY").ok()?.to_string().as_bytes()).ok()
+}
+
+/// Query parameters the login form accepts.
+#[cfg(feature = "password")]
+#[derive(Deserialize, Default)]
+struct LoginQuery {
+    next: Option<String>,
+    error: Option<String>,
+}
+
+/// Password login compiled out: the endpoints do not exist.
 #[cfg(not(feature = "password"))]
-fn auth_status_inner(_env: &Env) -> Response {
+async fn login_form() -> Response {
+    external_auth()
+}
+#[cfg(not(feature = "password"))]
+async fn login_submit() -> Response {
+    external_auth()
+}
+#[cfg(not(feature = "password"))]
+fn external_auth() -> Response {
     (
         StatusCode::NOT_FOUND,
         "local password login is disabled on this instance; authentication is external\n",
@@ -130,38 +361,29 @@ fn auth_status_inner(_env: &Env) -> Response {
         .into_response()
 }
 
-#[cfg(feature = "password")]
-fn auth_status_inner(env: &Env) -> Response {
-    match auth_config::AuthConfig::resolve(env) {
-        auth_config::AuthConfig::External => (
-            StatusCode::NOT_FOUND,
-            "local password login is disabled on this instance; authentication is external\n",
-        )
-            .into_response(),
-        // 503 rather than 500: the configuration is fixable and the service is otherwise
-        // healthy. No Retry-After -- this needs an operator, not time.
-        auth_config::AuthConfig::Refused(why) => {
-            (StatusCode::SERVICE_UNAVAILABLE, format!("{why}\n")).into_response()
+/// Sign out. `POST` only: a `GET /logout` is a one-pixel image away from being a denial of
+/// service on every reader whose browser prefetches it.
+#[worker::send]
+async fn logout(State(env): State<Env>, headers: axum::http::HeaderMap) -> Response {
+    if let (Ok(db), Some(raw)) = (
+        env.d1(DB_BINDING),
+        cookie::get(cookie_header(&headers), cookie::SESSION),
+    ) {
+        if let Some(token) = SessionToken::parse(&raw) {
+            // A failure here still clears the cookie: the visitor asked to be signed out, and
+            // leaving them holding a live cookie because a write failed is the wrong direction
+            // to err in.
+            let _ = D1Store::new(db).delete_session(&token.hash()).await;
         }
-        auth_config::AuthConfig::Passwords { peppers, params } => (
-            StatusCode::NOT_IMPLEMENTED,
-            format!(
-                "password login is configured but not yet implemented\n\
-                 argon2id m={} KiB t={} p={} (below OWASP: {})\n\
-                 peppers held: {} (current id {})\n",
-                params.m_kib,
-                params.t,
-                params.p,
-                params.is_below_recommended(),
-                peppers.len(),
-                peppers
-                    .current_id()
-                    .map(|i| i.to_string())
-                    .unwrap_or_else(|| "none".into())
-            ),
-        )
-            .into_response(),
     }
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, "/".to_string()),
+            (header::SET_COOKIE, cookie::clear(cookie::SESSION)),
+        ],
+    )
+        .into_response()
 }
 
 /// Runs the shared conformance suite against D1 and reports it as plain text.

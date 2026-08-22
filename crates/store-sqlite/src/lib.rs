@@ -24,7 +24,8 @@ use notespace_core::ratelimit::{AttemptKeys, Attempts};
 use notespace_core::session::{Session, TokenHash};
 use notespace_core::sql;
 use notespace_core::store::{
-    async_trait, Authenticated, NextPath, Page, PostLocation, Store, StoreError, StoreResult,
+    async_trait, Authenticated, Credential, NextPath, Page, PostLocation, Store, StoreError,
+    StoreResult,
 };
 use rusqlite::{Connection, OptionalExtension, Row};
 
@@ -338,6 +339,44 @@ impl Store for SqliteStore {
             .execute(sql::DELETE_USER_SESSIONS, [user])
             .map_err(backend)?;
         Ok(n as u32)
+    }
+
+    async fn user_by_name(&self, name: &str) -> StoreResult<Option<Credential>> {
+        self.conn
+            .query_row(sql::USER_BY_NAME, [name], |r| {
+                Ok(Credential {
+                    user: User {
+                        id: r.get("id")?,
+                        name: r.get("name")?,
+                        state: parse_enum(&r.get::<_, String>("state")?),
+                    },
+                    password_hash: r.get("password_hash")?,
+                })
+            })
+            .optional()
+            .map_err(backend)
+    }
+
+    async fn create_user(
+        &self,
+        name: &str,
+        created_at: Timestamp,
+        password_hash: Option<&str>,
+    ) -> StoreResult<UserId> {
+        self.conn
+            .execute(
+                sql::INSERT_USER,
+                rusqlite::params![name, created_at, password_hash],
+            )
+            .map_err(backend)?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    async fn set_password_hash(&self, user: UserId, hash: &str) -> StoreResult<()> {
+        self.conn
+            .execute(sql::SET_PASSWORD_HASH, rusqlite::params![user, hash])
+            .map_err(backend)?;
+        Ok(())
     }
 
     async fn login_attempts(

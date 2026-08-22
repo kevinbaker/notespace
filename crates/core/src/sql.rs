@@ -190,3 +190,29 @@ pub const CLEAR_LOGIN_ATTEMPTS: &str = "DELETE FROM login_attempt WHERE key = ?1
 ///
 /// Binds: `?1` cutoff timestamp.
 pub const SWEEP_LOGIN_ATTEMPTS: &str = "DELETE FROM login_attempt WHERE window_start < ?1";
+
+// ---------------------------------------------------------------------------
+// Accounts
+// ---------------------------------------------------------------------------
+
+/// Look up an account for login. Returns the credential alongside the identity so the handler
+/// does not need a second round trip.
+///
+/// Matched on the stored (lowercase) name — see DESIGN.md §4.4, normalization is case and only
+/// case, so the caller lowercases before binding.
+///
+/// Binds: `?1` username.
+pub const USER_BY_NAME: &str = "\
+SELECT id, name, state, password_hash FROM user WHERE name = ?1";
+
+/// Create an account.
+///
+/// Binds: `?1` name, `?2` created_at, `?3` password_hash (may be NULL for external auth).
+pub const INSERT_USER: &str = "\
+INSERT INTO user (name, created_at, password_hash, state) VALUES (?1, ?2, ?3, 'active')";
+
+/// Rewrite a stored credential — after a password change, or a rehash under stronger parameters
+/// or a newer pepper.
+///
+/// Binds: `?1` user id, `?2` password_hash.
+pub const SET_PASSWORD_HASH: &str = "UPDATE user SET password_hash = ?2 WHERE id = ?1";

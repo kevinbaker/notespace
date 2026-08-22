@@ -7,6 +7,7 @@
 //!
 //! The 10ms CPU budget applies to both, but only the read path runs on every request.
 
+pub mod auth;
 pub mod markdown;
 pub mod page;
 

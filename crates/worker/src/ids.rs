@@ -17,6 +17,22 @@ pub fn generate() -> Result<PublicId, IdError> {
     PublicId::new(Date::now().as_millis(), random_u32())
 }
 
+/// 32 random bytes as hex, for anonymous CSRF cookies.
+#[cfg(feature = "password")]
+pub fn random_hex() -> Result<String, String> {
+    let mut buf = [0u8; 32];
+    getrandom::getrandom(&mut buf).map_err(|e| format!("csprng: {e}"))?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// A fresh session token.
+#[cfg(feature = "password")]
+pub fn random_session_token() -> Result<notespace_core::session::SessionToken, String> {
+    let mut buf = [0u8; notespace_core::session::TOKEN_BYTES];
+    getrandom::getrandom(&mut buf).map_err(|e| format!("csprng: {e}"))?;
+    Ok(notespace_core::session::SessionToken::from_bytes(buf))
+}
+
 fn random_u32() -> u32 {
     let mut buf = [0u8; 4];
     // A failure here means the platform has no CSPRNG, which on Workers cannot happen. Falling

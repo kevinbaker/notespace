@@ -22,6 +22,7 @@ console_error_panic_hook = "0.1"
 # "no system RNG on wasm" constraint tractable. v0.2's feature works without RUSTFLAGS,
 # unlike v0.3's backend cfg.
 getrandom = { version = "0.2", features = ["js"] }
+form_urlencoded = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 

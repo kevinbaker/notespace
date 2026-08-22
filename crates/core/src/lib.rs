@@ -5,8 +5,11 @@
 //! here is unit-testable without a database or a network.
 
 pub mod conformance;
+pub mod cookie;
 pub mod csrf;
 pub mod id;
+#[cfg(feature = "password")]
+pub mod login;
 pub mod model;
 pub(crate) mod naming;
 #[cfg(feature = "password")]

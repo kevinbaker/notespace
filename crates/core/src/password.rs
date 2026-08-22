@@ -130,6 +130,59 @@ impl PepperSet {
         self
     }
 
+    /// Parse the deployment's whole pepper history from one string.
+    ///
+    /// Format: `1=<secret>;2=<secret>;…`. Whitespace around entries is ignored, a trailing
+    /// `;` is allowed, and **the highest id is the current one** — so rotating means appending
+    /// an entry, and nothing else moves.
+    ///
+    /// One variable rather than one per pepper because the set is a single fact about the
+    /// deployment: a scan over numbered bindings cannot tell "id 3 was never used" from "id 3
+    /// failed to load", and silently holding fewer peppers than intended strands accounts.
+    ///
+    /// Every failure here is fatal by design. A pepper set that is *partly* right is the worst
+    /// outcome available — it authenticates some accounts and permanently rejects others.
+    pub fn parse(spec: &str) -> Result<PepperSet, PasswordError> {
+        let mut set = PepperSet::none();
+        let mut highest: Option<u32> = None;
+        for entry in spec.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+            let (id, secret) = entry.split_once('=').ok_or_else(|| {
+                PasswordError::BadPepperSpec(
+                    "each entry must be `<id>=<secret>`, e.g. `1=<64 hex chars>`".into(),
+                )
+            })?;
+            let id: u32 = id.trim().parse().map_err(|_| {
+                PasswordError::BadPepperSpec(format!("{:?} is not a pepper id", id.trim()))
+            })?;
+            let secret = secret.trim();
+            if set.peppers.contains_key(&id) {
+                // Two secrets under one id means half the accounts cannot be verified, and
+                // which half depends on parse order. Never guess.
+                return Err(PasswordError::BadPepperSpec(format!(
+                    "pepper id {id} appears twice"
+                )));
+            }
+            let pepper = Pepper::new(secret.as_bytes()).map_err(|_| {
+                PasswordError::BadPepperSpec(format!(
+                    "pepper {id} is {} bytes; at least 32 are required",
+                    secret.len()
+                ))
+            })?;
+            if looks_unrandom(secret) {
+                return Err(PasswordError::BadPepperSpec(format!(
+                    "pepper {id} looks like a placeholder rather than a generated secret"
+                )));
+            }
+            set.peppers.insert(id, pepper);
+            highest = Some(highest.map_or(id, |h| h.max(id)));
+        }
+        if set.peppers.is_empty() {
+            return Err(PasswordError::BadPepperSpec("no peppers configured".into()));
+        }
+        set.current = highest;
+        Ok(set)
+    }
+
     /// A single pepper, used for new hashes.
     pub fn single(id: u32, pepper: Pepper) -> Self {
         let mut s = PepperSet::none();
@@ -171,6 +224,17 @@ impl PepperSet {
 /// Split a stored value into its pepper id and the PHC string.
 ///
 /// `None` id means the hash is unpeppered.
+/// Catch a secret that is the right length but obviously not generated.
+///
+/// Cheap, and it catches the copy-paste a length check waves through.
+fn looks_unrandom(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.iter().all(|c| *c == b[0])
+        || s.to_ascii_lowercase().contains("changeme")
+        || s.to_ascii_lowercase().contains("example")
+        || s.to_ascii_lowercase().contains("your-secret")
+}
+
 fn split_stored(stored: &str) -> Result<(Option<u32>, &str), PasswordError> {
     if stored.starts_with('$') {
         return Ok((None, stored));
@@ -285,6 +349,8 @@ pub enum PasswordError {
     /// cannot be verified at all and needs a reset.
     #[error("hash was made with pepper {0}, which is not configured")]
     UnknownPepper(u32),
+    #[error("PASSWORD_PEPPER is malformed: {0}")]
+    BadPepperSpec(String),
 }
 
 /// Hash a password with the ring's current pepper.
@@ -583,6 +649,73 @@ mod tests {
             "the default must be the strong one"
         );
         const { assert!(Params::CONSTRAINED.m_kib < Params::OWASP.m_kib) };
+    }
+
+    const S1: &str = "1111111111111111111111111111111111111111111111111111111111111112";
+    const S2: &str = "2222222222222222222222222222222222222222222222222222222222222223";
+    const S3: &str = "3333333333333333333333333333333333333333333333333333333333333334";
+
+    #[test]
+    fn a_pepper_list_parses_and_the_highest_id_is_current() {
+        let set = PepperSet::parse(&format!("1={S1};2={S2};5={S3}")).unwrap();
+        assert_eq!(set.len(), 3);
+        assert_eq!(set.current_id(), Some(5), "highest id must be current");
+        // Every id in the list is usable, not just the current one.
+        for id in [1u32, 2, 5] {
+            assert!(set.get(id).is_some(), "pepper {id} missing");
+        }
+    }
+
+    #[test]
+    fn parsing_tolerates_whitespace_and_a_trailing_separator() {
+        let a = PepperSet::parse(&format!("1={S1};2={S2}")).unwrap();
+        let b = PepperSet::parse(&format!("  1 = {S1} ; 2 = {S2} ; ")).unwrap();
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a.current_id(), b.current_id());
+        // And the secrets actually survived the trimming.
+        let h = hash(PW, SALT, FAST, &a).unwrap();
+        assert_eq!(verify(PW, &h, FAST, &b), Ok(Verified::Yes));
+    }
+
+    /// Every one of these is fatal on purpose: a partly-correct pepper set authenticates some
+    /// accounts and permanently rejects others.
+    #[test]
+    fn a_malformed_pepper_list_is_refused_rather_than_partly_loaded() {
+        for (spec, why) in [
+            (String::new(), "empty"),
+            ("   ;  ".into(), "only separators"),
+            (S1.to_string(), "no id="),
+            (format!("x={S1}"), "non-numeric id"),
+            (format!("1={S1};1={S2}"), "duplicate id"),
+            ("1=tooshort".into(), "secret under 32 bytes"),
+            (format!("1={}", "a".repeat(64)), "placeholder secret"),
+            (
+                format!("1={}", "changeme-changeme-changeme-changeme"),
+                "placeholder word",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    PepperSet::parse(&spec),
+                    Err(PasswordError::BadPepperSpec(_))
+                ),
+                "accepted a spec that is {why}: {spec:?}"
+            );
+        }
+    }
+
+    /// Rotation is appending an entry. Nothing already stored changes meaning.
+    #[test]
+    fn appending_an_entry_rotates_without_stranding_anything() {
+        let before = PepperSet::parse(&format!("1={S1}")).unwrap();
+        let stored = hash(PW, SALT, FAST, &before).unwrap();
+        assert!(stored.starts_with("1$"));
+
+        let after = PepperSet::parse(&format!("1={S1};2={S2}")).unwrap();
+        assert_eq!(after.current_id(), Some(2));
+        // The old hash still verifies, and asks to be rewritten under the new current pepper.
+        assert_eq!(verify(PW, &stored, FAST, &after), Ok(Verified::YesRehash));
+        assert!(hash(PW, SALT, FAST, &after).unwrap().starts_with("2$"));
     }
 
     #[test]
