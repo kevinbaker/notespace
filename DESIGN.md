@@ -630,6 +630,71 @@ CSRF. `SameSite=Lax` covers cross-site form posts from other origins, but not ev
 the reply form is a `POST`. Needs a token, decided when the form is built.
 
 
+### 4.10 Password hashing does not fit a free Worker
+
+Measured, because the collision is not obvious until you put numbers on it. Password hashing is
+deliberately slow; the free plan allows **10 ms of CPU per request**. Wasm under V8,
+`scripts/kdf-bench.mjs`:
+
+| candidate | p50 | vs 10 ms |
+|---|---|---|
+| Argon2id, OWASP minimum (19 MiB, t=2) | 25.2 ms | **2.5x over** |
+| Argon2id, RFC 9106 (64 MiB, t=3) | 134.9 ms | 13.5x over |
+| PBKDF2-SHA256, OWASP minimum (600k) | 456.1 ms | 45.6x over |
+| PBKDF2-SHA256 at workerd's 100k cap | 75.8 ms | 7.6x over |
+| …the same via **native** WebCrypto | 12.7 ms | 1.3x over |
+
+The last row is the one that closes the door. `crypto.subtle` runs natively rather than in wasm
+and is six times faster — but workerd caps PBKDF2 at 100,000 iterations to limit DoS
+([workerd#1346](https://github.com/cloudflare/workerd/issues/1346), open since 2023), and OWASP
+asks for 600,000. **The fastest legal configuration is simultaneously below the recommended
+strength and over the CPU budget.**
+
+Nor is Argon2 rescued by tuning. The strongest setting measured to fit is **8 MiB, t=1 at
+5.98 ms** — 2.4x less memory than OWASP's floor, and already 60% of the entire request budget.
+
+| Argon2id | p50 | |
+|---|---|---|
+| m=4 MiB, t=3 | 8.61 ms | 86% of budget |
+| **m=8 MiB, t=1** | **5.98 ms** | **60% — strongest that fits** |
+| m=12 MiB, t=1 | 8.86 ms | 89% |
+| m=19 MiB, t=2 | 25.2 ms | OWASP minimum, over |
+
+So: **there is no OWASP-grade password login on a free-plan Worker.** That is a platform
+property, not a code one, and the design should say so rather than quietly pick weak parameters.
+
+What follows:
+
+- **OIDC is the answer for the Workers deployment.** Verifying a signed assertion is a signature
+  check — sub-millisecond — and the problem disappears. Already the intended direction.
+- **The self-hosted target has no 10 ms limit** and uses `Params::OWASP` unchanged. The
+  dual-target design turns out to matter here for a reason nobody planned.
+- **`Params::CONSTRAINED`** exists for a free Worker that insists on passwords: 8 MiB, t=1, the
+  strongest that fits. It is never the default, and `is_below_recommended()` lets a deployment
+  say so at startup. A weakened KDF nobody mentions is how it stays weakened.
+- **A paid plan** raises the limit to 30 s, at which point all of this is moot.
+
+Hashes are PHC strings — `$argon2id$v=19$m=19456,t=2,p=1$salt$hash` — so cost travels with the
+hash and `needs_rehash` can upgrade an account on its next login, the one moment the plaintext
+is ever in hand.
+
+Cost of linking Argon2 into the Worker: **176.5 KB gzipped, against the 3 MB limit.**
+
+### 4.11 CSRF tokens are signed, not stored
+
+`<expiry>.<HMAC-SHA256(key, session_hash + expiry)>`, verified in constant time. Measured at
+**1.78 µs** — 0.018% of the request budget — which is why nothing is stored. A CSRF token in the
+database would cost a query on every form render and every submit, for a value that has to be
+derivable anyway.
+
+Bound to the **session**, not merely signed, so a token minted for one visitor cannot be
+replayed by another. It carries its own expiry, so one scraped from a cached page stops working.
+
+This is defence in depth rather than a replacement for `SameSite=Lax`: that attribute already
+blocks cross-site form posts, but it does not cover a subdomain takeover and it is one browser
+default away from being the only protection there is.
+
+
 ## 5. Moderation pipeline
 
 Runs asynchronously off the request path. You do not have 10ms to spare for an LLM call.

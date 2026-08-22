@@ -5,9 +5,11 @@
 //! here is unit-testable without a database or a network.
 
 pub mod conformance;
+pub mod csrf;
 pub mod id;
 pub mod model;
 pub(crate) mod naming;
+pub mod password;
 pub mod path;
 pub mod session;
 pub mod space_key;

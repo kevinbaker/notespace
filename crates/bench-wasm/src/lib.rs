@@ -429,3 +429,56 @@ pub fn id_sizes() -> Vec<usize> {
         core::mem::size_of::<PackedId>(),
     ]
 }
+
+// ---------------------------------------------------------------------------
+// Password hashing against the 10 ms CPU budget
+// ---------------------------------------------------------------------------
+//
+// Password hashing is deliberately slow and the free-plan CPU limit is 10 ms per request. That
+// is the whole problem, and it is worth numbers rather than assumptions.
+
+use argon2::{Algorithm, Argon2, Params, Version};
+
+/// PBKDF2-HMAC-SHA256 at `iters`, in wasm. Returns a byte of the output so nothing is elided.
+#[wasm_bindgen]
+pub fn kdf_pbkdf2(iters: u32) -> u8 {
+    let mut out = [0u8; 32];
+    pbkdf2::pbkdf2_hmac::<sha2::Sha256>(
+        b"correct horse battery staple",
+        b"a-salt-16-bytes!",
+        iters,
+        &mut out,
+    );
+    out[0]
+}
+
+/// Argon2id at the given cost. `m_kib` memory, `t` passes, 1 lane.
+#[wasm_bindgen]
+pub fn kdf_argon2(m_kib: u32, t: u32) -> u8 {
+    let params = Params::new(m_kib, t, 1, Some(32)).expect("valid params");
+    let a = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut out = [0u8; 32];
+    a.hash_password_into(
+        b"correct horse battery staple",
+        b"a-salt-16-bytes!",
+        &mut out,
+    )
+    .expect("hash");
+    out[0]
+}
+
+/// HMAC-SHA256 over a short message: the CSRF token path.
+#[wasm_bindgen]
+pub fn csrf_hmac(n: u32) -> u8 {
+    use hmac::{Mac, SimpleHmac};
+    let mut last = 0u8;
+    for i in 0..n {
+        let mut mac =
+            SimpleHmac::<sha2::Sha256>::new_from_slice(b"a-32-byte-server-secret-value!!!")
+                .expect("key");
+        mac.update(b"session-token-hash:1800000000000");
+        mac.update(&i.to_le_bytes());
+        last = mac.finalize().into_bytes()[0];
+    }
+    last
+}

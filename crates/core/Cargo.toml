@@ -13,6 +13,10 @@ thiserror = { workspace = true }
 async-trait = "0.1"
 # Pure Rust, no_std-capable, compiles to wasm32-unknown-unknown without a backend feature.
 sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+subtle = { version = "2", default-features = false }
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
+password-hash = { version = "0.5", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 proptest = "1"
