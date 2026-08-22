@@ -650,15 +650,24 @@ and is six times faster — but workerd caps PBKDF2 at 100,000 iterations to lim
 asks for 600,000. **The fastest legal configuration is simultaneously below the recommended
 strength and over the CPU budget.**
 
-Nor is Argon2 rescued by tuning. The strongest setting measured to fit is **8 MiB, t=1 at
-5.98 ms** — 2.4x less memory than OWASP's floor, and already 60% of the entire request budget.
+Nor is Argon2 rescued by tuning. Measured at p95 over fifteen samples — a request that overruns
+is a failed login, not a slow one, so the tail is what matters:
 
-| Argon2id | p50 | |
-|---|---|---|
-| m=4 MiB, t=3 | 8.61 ms | 86% of budget |
-| **m=8 MiB, t=1** | **5.98 ms** | **60% — strongest that fits** |
-| m=12 MiB, t=1 | 8.86 ms | 89% |
-| m=19 MiB, t=2 | 25.2 ms | OWASP minimum, over |
+| Argon2id | p50 | **p95** | p95 vs budget |
+|---|---|---|---|
+| m=2 MiB, t=1 | 2.07 ms | 2.30 ms | 23% |
+| **m=4 MiB, t=1** | **4.21 ms** | **4.33 ms** | **43% — chosen** |
+| m=4 MiB, t=2 | 8.57 ms | 9.12 ms | 91%, tight |
+| m=6 MiB, t=1 | 6.77 ms | 9.83 ms | 98%, tight |
+| m=8 MiB, t=1 | 9.78 ms | 11.99 ms | **over** |
+| m=19 MiB, t=2 | 53.45 ms | 56.77 ms | OWASP minimum, 5.7x over |
+
+An earlier revision of this table claimed 8 MiB t=1 fitted at 5.98 ms. That came from a
+three-sample run; fifteen samples put its p95 at 11.99 ms. `Params::CONSTRAINED` is 4 MiB, t=1,
+which leaves the rest of the request — render, D1, session lookup — somewhere to live.
+
+These are development-machine numbers. Cloudflare's hardware differs, and the headroom is worth
+re-checking against a deployed instance.
 
 So: **there is no OWASP-grade password login on a free-plan Worker.** That is a platform
 property, not a code one, and the design should say so rather than quietly pick weak parameters.
@@ -669,14 +678,48 @@ What follows:
   check — sub-millisecond — and the problem disappears. Already the intended direction.
 - **The self-hosted target has no 10 ms limit** and uses `Params::OWASP` unchanged. The
   dual-target design turns out to matter here for a reason nobody planned.
-- **`Params::CONSTRAINED`** exists for a free Worker that insists on passwords: 8 MiB, t=1, the
-  strongest that fits. It is never the default, and `is_below_recommended()` lets a deployment
-  say so at startup. A weakened KDF nobody mentions is how it stays weakened.
+- **`Params::CONSTRAINED`** exists for a free Worker that insists on passwords: 4 MiB, t=1. It
+  is never the default, and the Worker logs a `console_error` at startup when it is in use. A
+  weakened KDF nobody mentions is how it stays weakened.
 - **A paid plan** raises the limit to 30 s, at which point all of this is moot.
 
 Hashes are PHC strings — `$argon2id$v=19$m=19456,t=2,p=1$salt$hash` — so cost travels with the
-hash and `needs_rehash` can upgrade an account on its next login, the one moment the plaintext
-is ever in hand.
+hash and `verify` can report `YesRehash` to upgrade an account on its next login, the one moment
+the plaintext is ever in hand.
+
+#### Getting strength back: what works and what does not
+
+| measure | against a leaked database | against online guessing | cost |
+|---|---|---|---|
+| **Pepper** | **decisive** — hashes are uncrackable without it | nothing | **0.3%** |
+| Per-user salt | stops precomputation and batch cracking, not single-target | nothing | 0 (mandatory) |
+| Minimum length | raises the floor a weak KDF would otherwise give away | helps | 0 |
+| Rate limiting | nothing | **decisive** | not built |
+| Client-side pre-hash | adds cost the server does not pay | nothing | needs JS |
+
+The **pepper** is the one that changes the picture. It is Argon2's own `K` parameter, held
+outside the database as a Worker secret, so a leaked database — SQL injection, an exposed
+backup, one of D1's seven days of Time Travel snapshots — yields hashes that cannot be attacked
+at *any* KDF cost. That is the threat reduced parameters actually expose, and peppering closes
+it. Measured cost: **0.3%**, interleaved A/B (a naive sequential comparison first suggested 27%,
+which was drift).
+
+What it does not do: nothing against a full server compromise, where both leak together, and
+nothing against online guessing. It is not a substitute for KDF cost either — an attacker
+holding the pepper is back to attacking 4 MiB Argon2id.
+
+A **salt** is not a strength measure and is worth separating from the pepper. It is per-user,
+stored *with* the hash, and defeats rainbow tables and cracking many accounts at once. It adds
+nothing against a single targeted password. Already mandatory via PHC.
+
+Rotation is why peppers live in a `PepperRing` rather than a variable: a pepper cannot be
+changed in place, since the hashes depend on it and the plaintexts are gone. The ring keeps the
+previous one for verification, `verify` returns `YesRehash` when it matches, and logins migrate
+accounts one at a time.
+
+**Still missing, and more important than any of the above for online attacks: rate limiting.**
+A weak KDF is an offline-cracking problem; online guessing is stopped by refusing attempts.
+Nothing implements that yet.
 
 #### What each costs in the bundle
 

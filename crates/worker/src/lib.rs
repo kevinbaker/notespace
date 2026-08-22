@@ -4,9 +4,10 @@
 //! the free-tier CPU, size and query budgets. Auth, writes and baking are M2/M6.
 
 mod ids;
+mod startup;
+mod store;
 #[cfg(feature = "kdf-subtle")]
 mod subtle_kdf;
-mod store;
 
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{header, StatusCode};
@@ -26,6 +27,10 @@ use worker::{event, Context, Env, HttpRequest, Result as WorkerResult};
 /// Must match the `binding` name in `wrangler.toml` (and any binding configured in the
 /// dashboard). A mismatch surfaces at runtime as "no D1 binding", never at build time.
 const DB_BINDING: &str = "DATABASE";
+
+/// Worker secret holding the password pepper. Deliberately a secret rather than a var: the
+/// whole value of a pepper is that it does not live where the database lives.
+const PEPPER_BINDING: &str = "PASSWORD_PEPPER";
 
 /// Posts per page. 200 is the number DESIGN.md §8 names as the spike target: if a page this
 /// size does not fit the budget, the free-tier premise fails.
@@ -47,7 +52,23 @@ struct ConformanceQuery {
 async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> WorkerResult<Response> {
     // Without this a wasm panic surfaces as an opaque 1101 with no stack.
     console_error_panic_hook::set_once();
+    startup::report_once(&posture(&env));
     Ok(router(env).call(req).await?)
+}
+
+/// What this deployment is actually running, read from bindings rather than assumed.
+fn posture(env: &Env) -> startup::Posture {
+    let peppered = env
+        .secret(PEPPER_BINDING)
+        .map(|s| s.to_string().len() >= 32)
+        .unwrap_or(false);
+    startup::Posture {
+        password_login: cfg!(feature = "password"),
+        // Only meaningful when password login is compiled in; CONSTRAINED is what a Worker
+        // build would use, and it is below OWASP by construction.
+        params_below_recommended: cfg!(feature = "password"),
+        peppered,
+    }
 }
 
 fn router(env: Env) -> Router {

@@ -467,6 +467,23 @@ pub fn kdf_argon2(m_kib: u32, t: u32) -> u8 {
     out[0]
 }
 
+/// Argon2id with a pepper (Argon2's own secret parameter), to confirm it costs nothing.
+#[wasm_bindgen]
+pub fn kdf_argon2_peppered(m_kib: u32, t: u32) -> u8 {
+    let params = Params::new(m_kib, t, 1, Some(32)).expect("valid params");
+    let secret = [0x5Au8; 32];
+    let a = Argon2::new_with_secret(&secret, Algorithm::Argon2id, Version::V0x13, params)
+        .expect("secret within length");
+    let mut out = [0u8; 32];
+    a.hash_password_into(
+        b"correct horse battery staple",
+        b"a-salt-16-bytes!",
+        &mut out,
+    )
+    .expect("hash");
+    out[0]
+}
+
 /// HMAC-SHA256 over a short message: the CSRF token path.
 #[wasm_bindgen]
 pub fn csrf_hmac(n: u32) -> u8 {
