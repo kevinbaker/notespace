@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-notespace-core = { workspace = true }
+notespace-core = { workspace = true, default-features = false }
 pulldown-cmark = { workspace = true }
 ammonia = { workspace = true }
 maud = { workspace = true }

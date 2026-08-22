@@ -24,7 +24,10 @@ repository = "https://github.com/kevinbaker/notespace"
 homepage = "https://notespace.org"
 
 [workspace.dependencies]
-notespace-core = { path = "crates/core" }
+# default-features = false at the root so members can opt out. A member cannot disable defaults
+# on an inherited workspace dependency unless the root does -- Cargo warns and ignores it.
+# Crates that want local password login list the `password` feature explicitly.
+notespace-core = { path = "crates/core", default-features = false }
 notespace-render = { path = "crates/render" }
 
 # Every dependency here must compile to wasm32-unknown-unknown. See DESIGN.md §9.

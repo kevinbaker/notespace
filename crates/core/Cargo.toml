@@ -15,9 +15,15 @@ async-trait = "0.1"
 sha2 = { version = "0.10", default-features = false }
 hmac = { version = "0.12", default-features = false }
 subtle = { version = "2", default-features = false }
-argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
-password-hash = { version = "0.5", default-features = false, features = ["alloc"] }
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"], optional = true }
+password-hash = { version = "0.5", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
 proptest = "1"
 serde_json = "1"
+
+[features]
+default = ["password"]
+# Local password login. A Workers deployment using OIDC has no use for it, and dropping it
+# takes Argon2 out of the wasm bundle -- see DESIGN.md §4.10.
+password = ["dep:argon2", "dep:password-hash"]

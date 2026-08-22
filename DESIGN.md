@@ -678,7 +678,31 @@ Hashes are PHC strings — `$argon2id$v=19$m=19456,t=2,p=1$salt$hash` — so cos
 hash and `needs_rehash` can upgrade an account on its next login, the one moment the plaintext
 is ever in hand.
 
-Cost of linking Argon2 into the Worker: **176.5 KB gzipped, against the 3 MB limit.**
+#### What each costs in the bundle
+
+Measured with each KDF actually reachable from a route, because unused code is dead-stripped —
+an earlier revision of this section reported Argon2 as costing 176.5 KB, which was simply the
+whole bundle, and the Argon2 in it was being stripped for never being called.
+
+| variant | raw | gzipped | delta (gzipped) |
+|---|---|---|---|
+| baseline, no KDF | 1,421,837 | 421,789 | — |
+| **+ `crypto.subtle` PBKDF2** | 1,427,085 | 423,802 | **+2.0 KB** |
+| **+ Argon2id (Rust)** | 1,455,353 | 432,610 | **+10.6 KB** |
+
+`crypto.subtle` costs almost nothing because it is a *platform* API: the cryptography is in the
+runtime and only the wasm-bindgen glue is compiled in. It also needs no new dependencies —
+`js-sys`, `wasm-bindgen` and `wasm-bindgen-futures` are already re-exported by `worker`. Argon2
+is a Rust crate, so all of it is linked.
+
+**Neither is a reason to choose.** Both are trivial against the 3 MB script limit; the decision
+is made entirely by CPU. Both are behind cargo features (`password`, `kdf-subtle`), off by
+default in the Worker, so an OIDC deployment carries neither.
+
+One Cargo detail worth knowing, since it made the first three measurements identical: a member
+crate **cannot** disable default features on an inherited workspace dependency. `default-features
+= false` has to be set on the root `[workspace.dependencies]` entry, and Cargo warns that it is
+"ignored" otherwise. The root now sets it and crates opt in with `features = ["password"]`.
 
 ### 4.11 CSRF tokens are signed, not stored
 

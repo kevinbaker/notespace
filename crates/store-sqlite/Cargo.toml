@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-notespace-core = { path = "../core" }
+notespace-core = { path = "../core", features = ["password"] }
 async-trait = "0.1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 

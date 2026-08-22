@@ -11,7 +11,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-notespace-core = { workspace = true }
+notespace-core = { workspace = true, default-features = false }
 notespace-render = { workspace = true }
 worker = { version = "0.8", features = ["d1", "http", "axum"] }
 worker-macros = { version = "0.8", features = ["http"] }
@@ -24,3 +24,13 @@ console_error_panic_hook = "0.1"
 getrandom = { version = "0.2", features = ["js"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[features]
+default = []
+# Local password login on the Worker. Off by default: it does not fit the free plan's 10 ms CPU
+# budget at OWASP strength (DESIGN.md §4.10), and OIDC is the intended path. Costs ~10.6 KB
+# gzipped when enabled.
+password = ["notespace-core/password"]
+# PBKDF2 through the runtime's crypto.subtle. ~2.0 KB gzipped, because the cryptography lives in
+# the runtime and only the binding glue is compiled in. Still over budget on the free plan.
+kdf-subtle = []

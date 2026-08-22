@@ -9,6 +9,7 @@ pub mod csrf;
 pub mod id;
 pub mod model;
 pub(crate) mod naming;
+#[cfg(feature = "password")]
 pub mod password;
 pub mod path;
 pub mod session;

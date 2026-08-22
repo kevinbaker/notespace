@@ -16,7 +16,7 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 hmac = { version = "0.12", default-features = false }
 sha2 = { version = "0.10", default-features = false }
-notespace-core = { workspace = true }
+notespace-core = { workspace = true, features = ["password"] }
 notespace-render = { workspace = true }
 wasm-bindgen = "0.2"
 serde = { workspace = true }

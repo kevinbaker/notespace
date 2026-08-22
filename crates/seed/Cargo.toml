@@ -8,5 +8,5 @@ license.workspace = true
 publish = false
 
 [dependencies]
-notespace-core = { workspace = true }
+notespace-core = { workspace = true, features = ["password"] }
 notespace-render = { workspace = true }

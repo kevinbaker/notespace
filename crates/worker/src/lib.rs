@@ -4,6 +4,8 @@
 //! the free-tier CPU, size and query budgets. Auth, writes and baking are M2/M6.
 
 mod ids;
+#[cfg(feature = "kdf-subtle")]
+mod subtle_kdf;
 mod store;
 
 use axum::extract::{Path as UrlPath, Query, State};
