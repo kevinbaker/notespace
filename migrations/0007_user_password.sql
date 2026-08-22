@@ -1,4 +1,4 @@
--- Local password credentials (DESIGN.md §4.10).
+-- Local password credentials.
 --
 -- Nullable, because an account is not required to have a password: an OIDC-backed user never
 -- has one, and that is the intended path on the Workers target. NULL means "cannot log in with

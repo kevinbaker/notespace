@@ -1,6 +1,6 @@
 //! Rendering, split by *when* it runs.
 //!
-//! DESIGN.md §3.3: "Render at write time, never at read time."
+//! The rule is: render at write time, never at read time.
 //!
 //! - [`markdown`] runs once per post, on write. It is allowed to be comparatively expensive.
 //! - [`page`] runs on a cold read, assembling already-rendered fragments. It must be cheap.

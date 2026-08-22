@@ -25,5 +25,5 @@ serde_json = "1"
 [features]
 default = ["password"]
 # Local password login. A Workers deployment using OIDC has no use for it, and dropping it
-# takes Argon2 out of the wasm bundle -- see DESIGN.md §4.10.
+# takes Argon2 out of the wasm bundle.
 password = ["dep:argon2", "dep:password-hash"]

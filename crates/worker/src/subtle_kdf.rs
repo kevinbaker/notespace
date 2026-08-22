@@ -1,7 +1,7 @@
 //! PBKDF2 through the runtime's own `crypto.subtle`.
 //!
-//! The point of this module is a size comparison, and the answer is in DESIGN.md §4.10: WebCrypto
-//! is a *platform* API, so using it links no cryptography into the bundle at all — only the
+//! The point of this module is a size comparison, and the answer is that WebCrypto is a
+//! *platform* API: using it links no cryptography into the bundle at all — only the
 //! wasm-bindgen glue to call it. Argon2, being a Rust crate, is compiled in.
 //!
 //! It runs natively rather than in wasm, which makes it about six times faster than the same

@@ -1,7 +1,7 @@
 -- notespace initial schema.
 --
 -- Dialect: SQLite, and *only* SQLite. This file runs unmodified against both Cloudflare D1
--- and a native SQLite file (DESIGN.md §3.1). No Postgres-isms, ever.
+-- and a native SQLite file. No Postgres-isms, ever.
 --
 -- M0 covers the read path for a thread page, so this is the space/thread/post/user subset
 -- plus the indexes the read path depends on. signal, action_log, capability, rule,

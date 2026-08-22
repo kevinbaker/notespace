@@ -1,4 +1,4 @@
-//! Domain types. See DESIGN.md §2 (primitives) and §4 (data model).
+//! Domain types.
 //!
 //! M0 covers only the read path for a thread page, so this is the Space/Thread/Post/User
 //! subset. Signal, Capability, ActionLog and Rule land in M1-M4.
@@ -12,12 +12,12 @@ pub type ThreadId = i64;
 pub type PostId = i64;
 pub type UserId = i64;
 
-/// Unix seconds. Deliberately not `std::time::SystemTime`: that panics on wasm (DESIGN.md §3.2).
+/// Unix seconds. Deliberately not `std::time::SystemTime`: that panics on wasm.
 pub type Timestamp = i64;
 
 /// HTML that has already been through the sanitizer.
 ///
-/// DESIGN.md §3.5: "The client is the attacker. Always sanitize server-side." Client-generated
+/// The client is the attacker, so sanitizing happens server-side, always. Client-generated
 /// HTML persisted and served to other readers is stored XSS, and the read path emits
 /// `body_html` verbatim — so the only thing standing between a crafted post and every future
 /// reader of that thread is that this string went through `notespace_render`.
@@ -47,7 +47,7 @@ impl SanitizedHtml {
 /// A post to be written.
 ///
 /// Ids and timestamps are supplied by the caller rather than generated here: `core` has no clock
-/// and no RNG, because neither exists on wasm (DESIGN.md §3.2, §9).
+/// and no RNG, because neither exists on wasm.
 #[derive(Debug, Clone)]
 pub struct NewPost {
     pub public_id: PublicId,
@@ -60,12 +60,13 @@ pub struct NewPost {
     pub author_id: UserId,
     /// Source of truth, stored verbatim.
     pub body_md: String,
-    /// Rendered at write time (DESIGN.md §3.3) so the read path never renders markdown.
+    /// Rendered at write time so the read path never renders markdown.
     pub body_html: SanitizedHtml,
     pub created_at: Timestamp,
 }
 
-/// DESIGN.md primitive #1. Owns permissions and the ranking function.
+/// A container of threads, and the unit configuration attaches to: it owns the permissions
+/// and the ranking function that decide how its threads behave.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Space {
     pub id: SpaceId,
@@ -77,7 +78,7 @@ pub struct Space {
     pub name: String,
     pub parent_id: Option<SpaceId>,
     pub ranking: Ranking,
-    /// 0 means a flat board; see the Classic BB preset in DESIGN.md §6.
+    /// 0 means a flat board, which is what the classic-bulletin-board preset selects.
     pub depth_cap: u32,
 }
 
@@ -91,7 +92,7 @@ pub enum Ranking {
     ScoreThreshold,
 }
 
-/// DESIGN.md primitive #2.
+/// A conversation within a space: the unit that gets listed, ranked and paginated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ThreadKind {
@@ -119,7 +120,7 @@ pub enum ThreadState {
 pub enum PostState {
     #[default]
     Visible,
-    /// Held by the moderation pipeline (DESIGN.md §5) pending classification.
+    /// Held by the moderation pipeline pending classification.
     Pending,
     Hidden,
     Deleted,
@@ -132,7 +133,7 @@ pub struct User {
     pub state: UserState,
 }
 
-/// Why a username stays taken forever: `Deleted` is a tombstone, not a removal (DESIGN.md §4.5).
+/// Why a username stays taken forever: `Deleted` is a tombstone, not a removal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum UserState {
@@ -156,7 +157,7 @@ impl UserState {
 pub struct Thread {
     /// Internal identity. Carries every foreign key; never appears in a URL.
     pub id: ThreadId,
-    /// Opaque, time-sortable id used in URLs (DESIGN.md §4.2).
+    /// Opaque, time-sortable id used in URLs.
     pub public_id: PublicId,
     pub space_id: SpaceId,
     pub kind: ThreadKind,
@@ -168,15 +169,15 @@ pub struct Thread {
     pub bumped_at: Timestamp,
     pub post_count: u32,
     pub state: ThreadState,
-    /// Bumped on edit/delete to invalidate baked pages without a cache purge (DESIGN.md §3.3).
+    /// Bumped on edit/delete to invalidate baked pages without a cache purge.
     pub cache_version: i64,
 }
 
-/// DESIGN.md primitive #3.
+/// A single message in a thread, positioned by its materialized `path`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Post {
     pub id: PostId,
-    /// Opaque, time-sortable public id (DESIGN.md §4.7).
+    /// Opaque, time-sortable public id.
     ///
     /// A post's other address, `(thread_id, path)`, encodes which thread it is in, so a split
     /// or merge invalidates it. This one survives the move, which is what makes a permalink
@@ -194,7 +195,7 @@ pub struct Post {
     /// a thread page needs only `body_html`, and shipping both doubles the bytes D1 sends
     /// back for no benefit. The edit path loads it; rendering never does.
     pub body_md: Option<String>,
-    /// Rendered and sanitized at *write* time (DESIGN.md §3.3). Safe to emit verbatim.
+    /// Rendered and sanitized at *write* time. Safe to emit verbatim.
     pub body_html: String,
     pub created_at: Timestamp,
     pub edited_at: Option<Timestamp>,

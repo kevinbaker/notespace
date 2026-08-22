@@ -10,7 +10,7 @@ compatibility_date = "2025-08-01"
 # It does NOT run in Cloudflare's own build environment (Workers Builds / the dashboard's Git
 # integration): that image ships Node, not rustup, cargo or worker-build, so a dashboard-driven
 # build of this project fails and the Worker keeps serving whatever it had. Deploy from a
-# developer machine or from CI that installs Rust. See docs/DEPLOY.md.
+# developer machine or from CI that installs Rust.
 [build]
 # Wrangler runs this through /bin/sh, which does NOT source your shell profile -- so
 # ~/.cargo/bin is usually absent from PATH even when worker-build is installed, and the build

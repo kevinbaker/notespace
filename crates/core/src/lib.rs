@@ -1,7 +1,7 @@
 //! notespace core domain model.
 //!
 //! This crate is deliberately free of I/O, of `wasm`/native awareness, and of any
-//! dependency that cannot compile to `wasm32-unknown-unknown` (DESIGN.md §9). Everything
+//! dependency that cannot compile to `wasm32-unknown-unknown`. Everything
 //! here is unit-testable without a database or a network.
 
 pub mod conformance;

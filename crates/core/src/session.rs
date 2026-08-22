@@ -1,4 +1,4 @@
-//! Session tokens and expiry policy (DESIGN.md §4.9).
+//! Session tokens and expiry policy.
 //!
 //! # The token is never stored
 //!

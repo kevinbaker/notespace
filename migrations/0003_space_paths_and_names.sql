@@ -1,4 +1,4 @@
--- Spaces and users are addressed by name, not by opaque id (DESIGN.md §4.4).
+-- Spaces and users are addressed by name, not by opaque id.
 --
 -- `/s/sports/hockey` and `/u/testuser`. Slugs are unique PER PARENT, so `sports/general` and
 -- `music/general` are different spaces, and the URL carries the whole path.

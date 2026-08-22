@@ -1,11 +1,11 @@
 //! Read-path templates.
 //!
-//! Two constraints from DESIGN.md shape everything here:
+//! Two constraints shape everything here:
 //!
-//! - §3.3: "Baked HTML is user-agnostic. No usernames, no vote state, no unread markers in
-//!   the baked blob, or you lose all cache sharing." Nothing in this module takes a viewer.
-//!   Personalisation is layered client-side from `GET /api/me/thread/{id}`.
-//! - §3.2: 10ms CPU per request. Posts arrive already rendered and in preorder, so this is
+//! - **Baked HTML is user-agnostic.** No usernames, no vote state, no unread markers in the
+//!   baked blob, or all cache sharing is lost. Nothing in this module takes a viewer;
+//!   personalisation is layered client-side from `GET /api/me/thread/{id}`.
+//! - **10 ms CPU per request.** Posts arrive already rendered and in preorder, so this is
 //!   a single linear pass with no tree construction and no per-post allocation beyond the
 //!   output buffer.
 
@@ -19,7 +19,7 @@ const MAX_INDENT: u32 = 8;
 /// Render a full thread page.
 ///
 /// `space` supplies `depth_cap`, which is what makes a flat board and a threaded board the
-/// same code path (DESIGN.md §6: presets are data, not code).
+/// same code path — presets are data, not code.
 pub fn thread_page(page: &ThreadPage) -> Markup {
     let space = &page.space;
     let t = &page.thread;
@@ -218,7 +218,7 @@ mod tests {
 
     /// Internal row ids are not for publication. A baked page carrying sequential integers
     /// would leak the post count and make the table enumerable, which is exactly what the
-    /// two-tier id scheme in DESIGN.md §4.2 exists to prevent. This caught a real leak: the
+    /// two-tier id scheme exists to prevent. This caught a real leak: the
     /// permalink anchor used to be `id="p{post.id}"`.
     #[test]
     fn baked_page_never_exposes_internal_row_ids() {
@@ -327,7 +327,7 @@ mod tests {
 
     #[test]
     fn baked_page_contains_no_viewer_identity() {
-        // The cache-sharing invariant from DESIGN.md §3.3. If this ever fails, every
+        // The cache-sharing invariant. If this ever fails, every
         // reader gets their own cache entry and the read path stops being free.
         let p = page(vec![post(1, "0001", PostState::Visible, "<p>hi</p>")]);
         let html = thread_page(&p).into_string();

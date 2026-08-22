@@ -1,4 +1,4 @@
--- Public ids for posts (DESIGN.md §4.7).
+-- Public ids for posts.
 --
 -- Every post gets one, at the same 16-character width threads use. An earlier revision argued
 -- against this on storage grounds; the argument was wrong, and the correction is worth keeping
@@ -19,7 +19,7 @@
 --
 -- It is affordable anyway because D1 stops being the corpus. Archived threads live in R2, and
 -- what stays behind is a stub -- so this overhead applies to the hot working set, not to
--- everything ever posted. See 0005 and DESIGN.md §4.8.
+-- everything ever posted. See 0005.
 --
 -- NOT NULLABLE-AND-PROMOTED
 --

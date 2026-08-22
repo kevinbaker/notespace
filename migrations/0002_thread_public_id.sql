@@ -1,4 +1,4 @@
--- Public ids for threads (DESIGN.md §4.2).
+-- Public ids for threads.
 --
 -- Two-tier: `thread.id` stays the INTEGER PRIMARY KEY that every foreign key points at, and
 -- `public_id` is the opaque, time-sortable, 16-character id that appears in URLs. Posts get

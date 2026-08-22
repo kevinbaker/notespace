@@ -30,7 +30,7 @@ homepage = "https://notespace.org"
 notespace-core = { path = "crates/core", default-features = false }
 notespace-render = { path = "crates/render" }
 
-# Every dependency here must compile to wasm32-unknown-unknown. See DESIGN.md §9.
+# Every dependency here must compile to wasm32-unknown-unknown.
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 ammonia = "4"
 maud = "0.27"

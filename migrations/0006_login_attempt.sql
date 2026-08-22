@@ -1,4 +1,4 @@
--- Login rate limiting (DESIGN.md §4.12).
+-- Login rate limiting.
 --
 -- The defence against online guessing, which the KDF does nothing about: an attacker pays
 -- nothing for a wrong guess, and we pay 3.34 ms of a 10 ms CPU budget. Unthrottled login is

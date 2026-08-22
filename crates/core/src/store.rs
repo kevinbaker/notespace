@@ -1,8 +1,8 @@
 //! The `Store` seam.
 //!
-//! DESIGN.md §3.1: "The `Store` trait is the most important design decision in this
-//! document. Everything above it is target-agnostic. Get it wrong and the dual-target
-//! promise dies."
+//! The most important seam in the codebase: everything above it is target-agnostic, and the
+//! promise that one build serves both a Worker and a self-hosted binary rests entirely on it
+//! staying that way.
 //!
 //! Constraints binding on every implementation:
 //!
@@ -18,7 +18,7 @@ use crate::path::Path;
 use crate::ratelimit::{AttemptKeys, Attempts};
 use crate::session::{Session, TokenHash};
 
-/// `?Send` is required: wasm futures are not `Send` (DESIGN.md §3.1).
+/// `?Send` is required: wasm futures are not `Send`.
 pub use async_trait::async_trait;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -94,8 +94,7 @@ pub struct PostLocation {
 pub trait Store {
     /// One page of a thread, with the space it belongs to.
     ///
-    /// Threads are addressed by public id; the internal integer never leaves the database
-    /// (DESIGN.md §4.2).
+    /// Threads are addressed by public id; the internal integer never leaves the database.
     ///
     /// **Budget: 2 statements**, ideally in one round trip — thread header, and an indexed
     /// range scan over `(thread_id, path)`. Measured in production at 2.52 ms p50 for both

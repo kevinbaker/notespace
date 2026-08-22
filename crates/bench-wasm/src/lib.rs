@@ -2,7 +2,7 @@
 //!
 //! # Why this exists rather than a native `criterion` benchmark
 //!
-//! The number DESIGN.md §8 asks for is CPU *on a Worker*, and a Worker runs wasm under V8.
+//! The number that matters is CPU *on a Worker*, and a Worker runs wasm under V8.
 //! Native x86 timings would be measuring the wrong machine code on the wrong engine. Node
 //! runs the same V8 that workerd embeds, so timing this module under Node measures the same
 //! compiled wasm, executed by the same JIT, that Cloudflare would run.

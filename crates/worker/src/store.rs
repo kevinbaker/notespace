@@ -1,8 +1,8 @@
 //! D1 implementation of [`Store`].
 //!
-//! The whole point of this file is the query count. DESIGN.md §3.2 allows 50 D1 queries per
-//! Worker invocation on the free plan, and §3.1 says a thread page must be 1-3 queries, not
-//! one-per-post. This implementation uses **two statements in a single batched round trip**:
+//! The whole point of this file is the query count. The D1 free plan allows 50 queries per
+//! Worker invocation, and a thread page has to cost 1-3 of them rather than one per post. This
+//! implementation uses **two statements in a single batched round trip**:
 //!
 //! 1. thread metadata + its author
 //! 2. one indexed range scan over `(thread_id, path)` for the posts, joined to authors
@@ -200,8 +200,8 @@ fn backend<E: std::fmt::Display>(e: E) -> StoreError {
 /// in-process SQLite rather than a service. `duration` is likewise the real round trip,
 /// which local mode cannot show at all because there is no network in the path.
 ///
-/// Reported per request via `Server-Timing`, so the first production deploy answers the
-/// open questions in docs/M0-findings.md instead of restating the local numbers.
+/// Reported per request via `Server-Timing`, so a production deploy answers with its own
+/// numbers instead of leaving the local ones to stand in for them.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct QueryStats {
     /// Statements in the batch. Must stay at 2 — the D1 free tier allows 50 per invocation,
@@ -232,8 +232,8 @@ pub struct D1Store {
     /// Stats from the most recent query, for the handler to read afterwards.
     ///
     /// Interior mutability rather than a return-value change on purpose: `Store` is the seam
-    /// the dual-target promise rests on (DESIGN.md §3.1), and D1's telemetry has no business
-    /// in its signatures. A native SQLite adapter reports different things, or nothing.
+    /// the dual-target promise rests on, and D1's telemetry has no business in its
+    /// signatures. A native SQLite adapter reports different things, or nothing.
     last_stats: Cell<QueryStats>,
 }
 

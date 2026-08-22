@@ -1,6 +1,6 @@
 //! The login form.
 //!
-//! Server-rendered and works without JavaScript, like every other page (DESIGN.md §7). A login
+//! Server-rendered and works without JavaScript, like every other page. A login
 //! form that needs JS is a login form that fails for the people most likely to be on a bad
 //! connection.
 

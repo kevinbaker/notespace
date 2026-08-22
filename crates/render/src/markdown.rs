@@ -2,8 +2,8 @@
 //!
 //! # Threat model
 //!
-//! DESIGN.md §3.5: "Client-generated HTML persisted and served to other users is stored XSS.
-//! The client is the attacker. Always sanitize server-side."
+//! Client-generated HTML persisted and served to other users is stored XSS. The client is the
+//! attacker, so sanitizing happens server-side, always.
 //!
 //! Two independent things are true here, and both matter:
 //!

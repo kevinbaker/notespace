@@ -50,7 +50,7 @@ pub fn report_once(p: &Posture) {
                 "notespace: NOTE -- Argon2 parameters are below the OWASP minimum. The free plan \
                  allows 10 ms of CPU per request and OWASP's minimum needs ~57 ms. The pepper is \
                  what keeps a leaked database uncrackable at these parameters. Prefer OIDC, or a \
-                 paid plan. See DESIGN.md 4.10."
+                 paid plan."
             );
         }
         #[cfg(feature = "password")]
@@ -65,8 +65,7 @@ pub fn report_once(p: &Posture) {
                 "notespace: NOTE -- client-argon expects the client to post a 32-byte \
                  Argon2id-derived key as hex, not a password. No browser client ships with \
                  notespace yet, so the stock login form will be REJECTED by this deployment. \
-                 Use PASSWORD_SCHEME=constrained unless your client performs the derivation. \
-                 See DESIGN.md 4.10."
+                 Use PASSWORD_SCHEME=constrained unless your client performs the derivation."
             );
         }
     }

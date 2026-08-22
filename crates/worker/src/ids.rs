@@ -1,7 +1,7 @@
 //! Generating public ids on a Worker.
 //!
-//! DESIGN.md §3.2 and §9: no `std::time::SystemTime` and no system RNG on wasm. Both inputs
-//! therefore come from the platform rather than from `core`, which is why
+//! There is no `std::time::SystemTime` and no system RNG on wasm. Both inputs therefore come
+//! from the platform rather than from `core`, which is why
 //! [`PublicId::new`](notespace_core::id::PublicId::new) takes them as parameters.
 //!
 //! - **Time** is `Date.now()` through `worker::Date`, which is the JS clock.

@@ -1,8 +1,8 @@
 //! Materialized tree paths.
 //!
-//! DESIGN.md §4: "The materialized `path` column is load-bearing. One indexed range scan
-//! returns an entire correctly-ordered thread page. Recursive CTEs would blow the 50-query
-//! and 10ms budgets. Pad segments to fixed width so lexicographic order equals tree order."
+//! The `path` column is load-bearing: one indexed range scan returns an entire
+//! correctly-ordered thread page. A recursive CTE would blow both the 50-query and the 10 ms
+//! budgets. Segments are padded to a fixed width so lexicographic order equals tree order.
 //!
 //! A path is a `.`-separated list of zero-padded base32 ordinals, one per level:
 //!
@@ -14,7 +14,7 @@
 //!
 //! # Why base32 rather than decimal
 //!
-//! Measured in the M0 spike (see `docs/M0-findings.md`): four base32 digits address 1,048,576
+//! Measured: four base32 digits address 1,048,576
 //! siblings per level, slightly *more* than the 1,000,000 that six decimal digits buy, while
 //! storing 30% fewer bytes. Since the `(thread_id, path)` index is the read path's whole
 //! mechanism and D1's free tier caps the database at 500 MB, a 30% smaller key is worth
@@ -220,7 +220,7 @@ impl Path {
     /// Exclusive upper bound for a range scan over this path's whole subtree.
     ///
     /// Yields SQL of the shape `WHERE path >= :path AND path < :bound`, which is one
-    /// indexed range scan per DESIGN.md §4 rather than a recursive CTE.
+    /// indexed range scan rather than a recursive CTE.
     pub fn subtree_end(&self) -> String {
         // '.' is 0x2E; '/' is 0x2F, the next byte up, and still below every alphabet byte.
         // Every descendant path begins `<self>.`, so `<self>/` is the tight exclusive upper
@@ -288,7 +288,7 @@ fn encode_segment(ordinal: u32) -> Result<String, PathError> {
         n /= 32;
     }
     // Built by pushing `char`s rather than validating UTF-8, so there is no fallible step
-    // and no `expect` in shipping code (DESIGN.md §9: the wasm target panics badly).
+    // and no `expect` in shipping code, because the wasm target panics badly.
     // Every ALPHABET byte is ASCII, so `as char` is exact.
     let mut out = String::with_capacity(SEGMENT_WIDTH);
     for b in buf {

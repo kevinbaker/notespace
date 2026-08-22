@@ -1,4 +1,4 @@
--- Sessions (DESIGN.md §4.9).
+-- Sessions.
 --
 -- In D1 rather than Workers KV, which is what Cloudflare recommends for session data. Their
 -- recommendation assumes data that is read at thousands of RPS, rarely written, and tolerant of

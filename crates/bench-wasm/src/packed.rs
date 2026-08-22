@@ -1,6 +1,6 @@
 //! Candidate representation for `PublicId`: a packed integer instead of a canonical `String`.
 //!
-//! Exists only to be benchmarked against the shipping type. See `docs/M0-findings.md`.
+//! Exists only to be benchmarked against the shipping type.
 //!
 //! # The 128-bit cap
 //!

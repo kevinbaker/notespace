@@ -100,8 +100,8 @@ impl AuthConfig {
             .map(|v| v.to_string())
             .as_deref()
         {
-            // The Worker cannot afford OWASP parameters (DESIGN.md §4.10). The pepper above is
-            // what makes that tolerable, which is why it is mandatory rather than advised.
+            // The Worker cannot afford OWASP parameters. The pepper above is what makes
+            // that tolerable, which is why it is mandatory rather than advised.
             None | Some("constrained") => Scheme::CONSTRAINED,
             Some("client-argon") => Scheme::CLIENT_ARGON,
             Some(other) => {

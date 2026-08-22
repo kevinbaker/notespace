@@ -1,7 +1,7 @@
 //! Cloudflare Workers entrypoint for notespace.
 //!
-//! M0 scope (DESIGN.md §8): serve a 200-post thread page from D1 and prove it fits inside
-//! the free-tier CPU, size and query budgets. Auth, writes and baking are M2/M6.
+//! M0 scope: serve a 200-post thread page from D1 and prove it fits inside the free-tier CPU,
+//! size and query budgets. Auth, writes and baking are M2/M6.
 
 #[cfg(feature = "password")]
 mod auth_config;
@@ -34,8 +34,8 @@ use worker::{event, Context, Env, HttpRequest, Result as WorkerResult};
 /// dashboard). A mismatch surfaces at runtime as "no D1 binding", never at build time.
 const DB_BINDING: &str = "DATABASE";
 
-/// Posts per page. 200 is the number DESIGN.md §8 names as the spike target: if a page this
-/// size does not fit the budget, the free-tier premise fails.
+/// Posts per page. 200 is the spike target: if a page this size does not fit the budget, the
+/// free-tier premise fails.
 const PAGE_SIZE: u32 = 200;
 
 #[derive(Deserialize, Default)]
@@ -645,7 +645,7 @@ async fn render_thread(
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-                    // The document is user-agnostic (DESIGN.md §3.3), so it is safe to
+                    // The document is user-agnostic, so it is safe to
                     // share one cached copy across every reader. M6 replaces this with a
                     // baked R2 object keyed by the thread's cache_version.
                     (header::CACHE_CONTROL, "public, max-age=0, s-maxage=60"),

@@ -3,8 +3,8 @@
 //! The second implementation of the seam, and the reason the first one can be trusted. A trait
 //! with one implementation is an interface, not a seam: nothing stops it drifting toward the
 //! quirks of the only thing behind it. This adapter and
-//! [`notespace_core::conformance`] together are what make the dual-target promise in
-//! DESIGN.md §3.1 checkable rather than merely stated.
+//! [`notespace_core::conformance`] together are what make the dual-target promise checkable
+//! rather than merely stated.
 //!
 //! It also makes the read path testable in an ordinary `cargo test`. Exercising the D1 adapter
 //! means building wasm and booting wrangler; this runs in milliseconds against an in-memory

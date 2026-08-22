@@ -1,6 +1,6 @@
 //! The read-path SQL, shared verbatim by every [`Store`](crate::store::Store) implementation.
 //!
-//! DESIGN.md §3.1 requires an identical SQLite dialect on both targets. Keeping the statements
+//! Both targets must speak an identical SQLite dialect. Keeping the statements
 //! in one place makes that structural rather than aspirational: the adapters cannot drift,
 //! because there is only one copy of the SQL to drift from. What differs between them is
 //! binding and row decoding, not the query.
@@ -32,7 +32,7 @@ WHERE t.public_id = ?1";
 /// The URL carries a public id, but posts are keyed by the integer `thread_id`. Resolving that
 /// in the caller would cost a round trip and undo the batching the whole read path depends on,
 /// so it folds into a scalar subquery — a single probe of `idx_thread_public_id`, which is the
-/// "+1 row read per pageview" DESIGN.md §4.2 budgets for.
+/// one extra row read per pageview that addressing threads by public id costs.
 ///
 /// Binds: `?1` = thread public id, `?2` = path cursor (exclusive), `?3` = limit.
 pub const POSTS: &str = "\
@@ -71,9 +71,8 @@ pub const PATH_START: &str = "";
 /// descendant of the parent in preorder; truncating that to the parent's depth + 1 yields the
 /// last *direct child*, whose successor is the ordinal to insert at.
 ///
-/// Counting children instead would be wrong, not merely slower: tombstones stay in the table
-/// (DESIGN.md §8, edit/delete with tombstones), so a count reuses an ordinal that is still
-/// occupied.
+/// Counting children instead would be wrong, not merely slower: edit and delete leave
+/// tombstones in the table, so a count reuses an ordinal that is still occupied.
 ///
 /// Binds: `?1` = thread row id, `?2` = lower bound (exclusive), `?3` = upper bound (exclusive).
 pub const LAST_PATH_IN_RANGE: &str = "\
@@ -113,7 +112,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, 'visible')";
 /// Keep the denormalized counters honest. Runs in the same batch as the insert.
 ///
 /// `post_count` exists so a thread list does not need `COUNT(*)` per row, and `bumped_at` is
-/// what bump-ordered spaces sort on (DESIGN.md §6).
+/// what bump-ordered spaces sort on.
 ///
 /// Binds: `?1` = thread row id, `?2` = new bumped_at.
 pub const BUMP_THREAD: &str = "\
@@ -121,7 +120,7 @@ UPDATE thread SET post_count = post_count + 1, bumped_at = ?2, cache_version = c
 WHERE id = ?1";
 
 // ---------------------------------------------------------------------------
-// Sessions (DESIGN.md §4.9)
+// Sessions
 // ---------------------------------------------------------------------------
 
 /// Create a session. `token_hash` is the SHA-256 of the cookie value, never the value itself.
@@ -162,7 +161,7 @@ pub const DELETE_SESSION: &str = "DELETE FROM session WHERE token_hash = ?1";
 pub const DELETE_USER_SESSIONS: &str = "DELETE FROM session WHERE user_id = ?1";
 
 // ---------------------------------------------------------------------------
-// Login rate limiting (DESIGN.md §4.12)
+// Login rate limiting
 // ---------------------------------------------------------------------------
 
 /// Current counters for the two buckets an attempt is checked against.
@@ -198,8 +197,8 @@ pub const SWEEP_LOGIN_ATTEMPTS: &str = "DELETE FROM login_attempt WHERE window_s
 /// Look up an account for login. Returns the credential alongside the identity so the handler
 /// does not need a second round trip.
 ///
-/// Matched on the stored (lowercase) name — see DESIGN.md §4.4, normalization is case and only
-/// case, so the caller lowercases before binding.
+/// Matched on the stored (lowercase) name. Normalization is case and only case, so the caller
+/// lowercases before binding.
 ///
 /// Binds: `?1` username.
 pub const USER_BY_NAME: &str = "\

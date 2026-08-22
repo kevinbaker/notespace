@@ -1,7 +1,7 @@
 //! One test suite, run against every [`Store`] implementation.
 //!
-//! DESIGN.md §9: "Two test suites: one shared conformance suite run against both `Store`
-//! implementations, and pure unit tests for ranking/trust/path logic." This is the first.
+//! One shared suite runs against both `Store` implementations; pure unit tests cover
+//! ranking, trust and path logic separately. This is the shared one.
 //!
 //! It lives in `core` rather than in a test directory because it has to be callable from two
 //! very different places: a native `cargo test`, and a Worker running against real D1 where

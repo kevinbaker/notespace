@@ -1,7 +1,7 @@
 //! Public ids — opaque, time-sortable, and safe to read aloud or type.
 //!
-//! DESIGN.md §4.2: ids are two-tier. `INTEGER PRIMARY KEY` stays the internal identity and
-//! carries every foreign key; this type is what appears in URLs.
+//! Ids are two-tier. `INTEGER PRIMARY KEY` stays the internal identity and carries every
+//! foreign key; this type is what appears in URLs.
 //!
 //! # Layout
 //!
@@ -224,14 +224,14 @@ impl PublicId {
     /// Build an id at the default width.
     ///
     /// Both inputs are parameters rather than fetched here, because `core` takes no I/O and
-    /// neither `std::time::SystemTime` nor a system RNG exists on wasm (DESIGN.md §3.2, §9).
+    /// neither `std::time::SystemTime` nor a system RNG exists on wasm.
     /// The Worker supplies `Date.now()` and `crypto.getRandomValues`; tests supply fixed values.
     pub fn new(timestamp_ms: u64, random: u32) -> Result<Self, IdError> {
         Self::with_width(timestamp_ms, random as u128, ID_CHARS)
     }
 
     /// Build an id at an explicit width, for a future instance configured to generate wider
-    /// ids (DESIGN.md §4.3). Extra bits are appended below the existing ones, so an id built
+    /// ids. Extra bits are appended below the existing ones, so an id built
     /// here is prefix-compatible with one built by [`PublicId::new`].
     pub fn with_width(timestamp_ms: u64, random: u128, chars: usize) -> Result<Self, IdError> {
         if timestamp_ms > MAX_TIMESTAMP_MS {
@@ -555,7 +555,7 @@ mod tests {
         assert_eq!(PublicId::parse(&s.to_uppercase()), Ok(id));
     }
 
-    // --- widening (DESIGN.md §4.3) ---
+    // --- widening ---
 
     #[test]
     fn wider_ids_keep_the_narrow_one_as_a_literal_prefix() {
