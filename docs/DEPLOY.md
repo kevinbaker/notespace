@@ -11,6 +11,18 @@ cargo install worker-build
 wrangler login
 ```
 
+Check it the way wrangler will, not the way your shell will:
+
+```bash
+/bin/sh -c 'worker-build --version'      # fails? see below -- wrangler.toml handles it
+```
+
+Wrangler runs the build through `/bin/sh`, which does not source your shell profile, so
+`~/.cargo/bin` is typically missing from its PATH even though your interactive shell has it.
+That produces `worker-build: not found` and exit 127 from a correctly installed tool.
+`wrangler.toml` prepends `$HOME/.cargo/bin` to PATH in the build command to cover this. If
+`cargo install worker-build` put the binary somewhere else, point that line at it.
+
 The database id is already in `wrangler.toml` (`wrangler d1 info notespace-dev` prints it if it
 ever needs re-checking). It is an identifier, not a secret, and belongs in version control.
 **The bindings in

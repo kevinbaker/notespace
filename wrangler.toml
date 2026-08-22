@@ -12,7 +12,11 @@ compatibility_date = "2025-08-01"
 # build of this project fails and the Worker keeps serving whatever it had. Deploy from a
 # developer machine or from CI that installs Rust. See docs/DEPLOY.md.
 [build]
-command = "worker-build --release"
+# Wrangler runs this through /bin/sh, which does NOT source your shell profile -- so
+# ~/.cargo/bin is usually absent from PATH even when worker-build is installed, and the build
+# dies with "worker-build: not found" (exit 127). Prepending it here fixes that case; if the
+# tool genuinely is not installed, `cargo install worker-build` still does.
+command = 'PATH="$HOME/.cargo/bin:$PATH" worker-build --release'
 cwd = "crates/worker"
 
 [[d1_databases]]
