@@ -5,13 +5,13 @@ name = "notespace-dev"
 main = "crates/worker/build/worker/shim.mjs"
 compatibility_date = "2025-08-01"
 
-# Also expose <name>.<subdomain>.workers.dev alongside the custom domain. Useful for comparing
-# numbers, and it works even if the custom domain is misconfigured.
+# Off: dev.notespace.org is the only entry point. The Cache API is a no-op on *.workers.dev --
+# it only caches for a zone you own -- so a workers.dev copy would measure a different system
+# from the one being served.
 #
 # Must stay above the first [table] header: TOML assigns a bare key to whichever table precedes
-# it, so this sitting below [[d1_databases]] made it a D1 field that wrangler warned about and
-# dropped.
-workers_dev = true
+# it, so this sitting below [[d1_databases]] made it a D1 field that wrangler silently dropped.
+workers_dev = false
 
 # dev.notespace.org is attached to this Worker via the dashboard, and is left that way
 # deliberately: wrangler only manages routes it is told about, so an undeclared route survives a

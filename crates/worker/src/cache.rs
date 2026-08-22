@@ -4,6 +4,10 @@
 //! so `s-maxage` on its own does nothing here. Storing the response through the Cache API is
 //! what makes the header real, and what lets one render serve every reader for its TTL.
 //!
+//! Entries are keyed by the thread's `cache_version` ([`thread_key`]), so a write invalidates
+//! them in the same statement that stores the post. The public URL stays `/t/{id}`; the version
+//! only appears in the internal cache key.
+//!
 //! Only safe because the baked page is user-agnostic — no viewer identity, no `Set-Cookie`.
 //! `baked_page_contains_no_viewer_identity` in `notespace_render` is the test that keeps it so.
 //! Anything that starts varying by viewer must stop being cached here first.
@@ -20,8 +24,11 @@ pub use notespace_core::cache_key::thread_key;
 /// two cannot drift into disagreeing about how long the page may be held.
 pub const PAGE_HEADERS: [(&str, &str); 5] = [
     ("content-type", "text/html; charset=utf-8"),
-    // `s-maxage` is the edge TTL the Cache API reads; `max-age=0` keeps browsers revalidating.
-    ("cache-control", "public, max-age=0, s-maxage=60"),
+    // The entry is keyed by the thread's bake version, so a write makes the old key unreachable
+    // rather than waiting for this to lapse. That turns the TTL from a correctness knob into a
+    // retention one: long enough to keep a busy thread resident, and stale entries are simply
+    // never looked up again. `max-age=0` still has browsers revalidate the stable public URL.
+    ("cache-control", "public, max-age=0, s-maxage=3600"),
     // Server-rendered HTML with no inline script; blocks stored-XSS payloads that would
     // survive a future sanitizer regression.
     (
@@ -35,12 +42,15 @@ pub const PAGE_HEADERS: [(&str, &str); 5] = [
 
 /// Look for a stored copy.
 ///
-/// The stored response carries the `Server-Timing` of the render that produced it. Serving that
-/// verbatim would report D1 work this request did not do, so it is replaced on the way out.
-pub async fn get(key: &str) -> Option<Response> {
+/// `spent` is what this request has already cost -- the version lookup that produced the key.
+/// The stored response carries the `Server-Timing` of the render that made it, which would
+/// report work this request did not do; but replacing it with a bare `hit` would hide the row
+/// the lookup did read. Both are wrong in opposite directions, so the header is rebuilt from
+/// what actually happened.
+pub async fn get(key: &str, spent: &str) -> Option<Response> {
     let hit = Cache::default().get(key, false).await.ok()??;
     let mut resp: Response = hit.into();
-    if let Ok(v) = "cache;desc=\"hit\"".parse() {
+    if let Ok(v) = format!("{spent}, cache;desc=\"hit\"").parse() {
         resp.headers_mut()
             .insert(header::HeaderName::from_static("server-timing"), v);
     }

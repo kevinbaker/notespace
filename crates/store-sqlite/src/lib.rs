@@ -99,6 +99,13 @@ fn parse_enum<T: Default + core::str::FromStr>(s: &str) -> T {
 
 #[async_trait(?Send)]
 impl Store for SqliteStore {
+    async fn thread_version(&self, thread: &PublicId) -> StoreResult<Option<i64>> {
+        self.conn
+            .query_row(sql::THREAD_VERSION, [thread.as_str()], |r| r.get(0))
+            .optional()
+            .map_err(backend)
+    }
+
     async fn thread_page(&self, thread: &PublicId, page: &Page) -> StoreResult<ThreadPage> {
         let (space, thread_row) = self
             .conn

@@ -621,19 +621,6 @@ async fn render_thread(
         None => None,
     };
 
-    // Keyed after canonicalisation and parsed cursor, so one page has exactly one entry
-    // whatever else is in the query string. Checked before the D1 binding is even opened: a
-    // hit must cost no database work at all, or caching has bought nothing.
-    let key = headers
-        .get(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|host| cache::thread_key(host, &canonical, after.as_ref().map(|p| p.as_str())));
-    if let Some(k) = &key {
-        if let Some(hit) = cache::get(k).await {
-            return hit;
-        }
-    }
-
     let db = match env.d1(DB_BINDING) {
         Ok(db) => db,
         Err(e) => {
@@ -645,6 +632,32 @@ async fn render_thread(
     };
 
     let store = D1Store::new(db);
+
+    // One row, to learn the thread's bake version. Every write bumps it, so a key built from it
+    // is invalidated by the write itself: a reply shows up on the very next request instead of
+    // whenever a TTL happens to lapse. That one row is what buys the freshness -- the
+    // alternative pays the page's full 404-row scan every time a TTL turns over.
+    //
+    // A failed or absent version read falls through uncached rather than failing the page; the
+    // query below is what decides whether the thread exists.
+    let version = store.thread_version(&thread_id).await.ok().flatten();
+    // Counted even on a hit: this row is the standing cost of version-keyed caching, and a
+    // Server-Timing that omitted it would understate D1 usage by one row per pageview.
+    let lookup = store.last_stats().server_timing();
+    let key = version.and_then(|v| {
+        headers
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|host| {
+                cache::thread_key(host, &canonical, v, after.as_ref().map(|p| p.as_str()))
+            })
+    });
+    if let Some(k) = &key {
+        if let Some(hit) = cache::get(k, &lookup).await {
+            return hit;
+        }
+    }
+
     let page = Page {
         after,
         limit: PAGE_SIZE,

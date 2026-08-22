@@ -323,10 +323,20 @@ That made D1 rows the binding constraint rather than requests:
 exhaust a day's budget, from one client. Only the canonical thread id and the parsed cursor
 reach the key.
 
-**Bounded staleness is the accepted cost.** A write is now invisible for up to 60 s. Purging
-properly is not available here: `Cache::delete` only affects the colo that served the request,
-and cache tags are Enterprise. M6's baked R2 objects keyed by `cache_version` are the real fix;
-until then the TTL is the invalidation strategy.
+**The key carries the thread's bake version, so a write invalidates by itself.** The public URL
+has to stay `/t/{id}` — permalinks — but the Cache API key is internal and arbitrary, so the
+version can live there instead. `cache_version` was already in the schema and already bumped by
+`BUMP_THREAD` on every insert; nothing read it until now.
+
+That costs one D1 row per pageview to learn the version, and buys zero staleness. One row against
+404 is not a trade worth agonising over: 100k requests/day × 1 row is 2% of the daily budget, and
+the TTL stops being a correctness knob — a stale entry is simply never looked up again, so
+`s-maxage` is now only about how long a busy thread stays resident.
+
+The version read and the page read are not atomic, and do not need to be. A write landing between
+them stores fresh content under the *old* version's key, which no reader will ever build again —
+an orphan, not a stale hit. Versions only increase, so there is no interleaving that serves stale
+content.
 
 Only sound because the baked page is user-agnostic. `baked_page_contains_no_viewer_identity`
 is the test holding that invariant, and caching is applied to the thread page alone — `/login`

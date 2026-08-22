@@ -86,6 +86,11 @@ struct ThreadRow {
 }
 
 #[derive(Deserialize)]
+struct VersionRow {
+    cache_version: i64,
+}
+
+#[derive(Deserialize)]
 struct CredentialRow {
     id: i64,
     name: String,
@@ -556,6 +561,20 @@ impl Store for D1Store {
 
     async fn locate_post(&self, post: &PublicId) -> StoreResult<PostLocation> {
         self.fetch_post_location(post).await
+    }
+
+    async fn thread_version(&self, thread: &PublicId) -> StoreResult<Option<i64>> {
+        let res = self
+            .db
+            .prepare(sql::THREAD_VERSION)
+            .bind(&[thread.as_str().into()])
+            .map_err(backend)?
+            .all()
+            .await
+            .map_err(backend)?;
+        self.last_stats.set(collect_stats(&[&res]));
+        let rows: Vec<VersionRow> = res.results().map_err(backend)?;
+        Ok(rows.into_iter().next().map(|r| r.cache_version))
     }
 
     async fn insert_post(&self, new: &NewPost) -> StoreResult<Post> {

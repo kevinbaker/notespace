@@ -101,6 +101,14 @@ pub trait Store {
     /// **Budget: 1 statement.**
     async fn locate_post(&self, post: &PublicId) -> StoreResult<PostLocation>;
 
+    /// The thread's bake version, for building a cache key.
+    ///
+    /// `None` when no such thread exists. Bumped by every write to the thread, so a key built
+    /// from it is invalidated by the write itself rather than by a TTL.
+    ///
+    /// **Budget: 1 statement, 1 row.**
+    async fn thread_version(&self, thread: &PublicId) -> StoreResult<Option<i64>>;
+
     /// Append a post to a thread, allocating its materialized path.
     ///
     /// **Budget: 4 statements.** Resolve the thread, resolve the parent (skipped for a

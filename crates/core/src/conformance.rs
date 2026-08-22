@@ -92,6 +92,7 @@ pub async fn run_all<S: Store>(store: &S, fx: &Fixture) -> Vec<Check> {
         paging_visits_every_post_exactly_once(store, fx).await,
         cursor_is_none_on_the_last_page(store, fx).await,
         absent_thread_is_not_found(store, fx).await,
+        thread_version_is_readable_and_absent_for_unknown(store, fx).await,
         locate_post_finds_its_thread(store, fx).await,
         absent_post_is_not_found(store, fx).await,
         posts_never_expose_body_md(store, fx).await,
@@ -723,6 +724,27 @@ async fn absent_thread_is_not_found<S: Store>(store: &S, fx: &Fixture) -> Check 
         Err(StoreError::NotFound) => Check::pass(NAME),
         Err(e) => Check::fail(NAME, format!("wrong error: {e}")),
         Ok(_) => Check::fail(NAME, "returned a page for a thread that does not exist"),
+    }
+}
+
+/// The cache key depends on this, so both adapters must agree on it -- including that an
+/// unknown thread is `None` rather than an error or a zero, which would key every missing
+/// thread to the same cached page.
+async fn thread_version_is_readable_and_absent_for_unknown<S: Store>(
+    store: &S,
+    fx: &Fixture,
+) -> Check {
+    const NAME: &str = "thread_version reads, and is None for an unknown thread";
+    let known = match store.thread_version(&fx.thread).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return Check::fail(NAME, "no version for the fixture thread"),
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    require!(NAME, known >= 0, "negative version {known}");
+    match store.thread_version(&fx.absent).await {
+        Ok(None) => Check::pass(NAME),
+        Ok(Some(v)) => Check::fail(NAME, format!("unknown thread reported version {v}")),
+        Err(e) => Check::fail(NAME, format!("unknown thread errored: {e}")),
     }
 }
 

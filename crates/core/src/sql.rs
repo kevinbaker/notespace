@@ -24,6 +24,15 @@ JOIN user u ON u.id = t.author_id \
 JOIN space s ON s.id = t.space_id \
 WHERE t.public_id = ?1";
 
+/// The thread's bake version, and nothing else.
+///
+/// One row, one column, off `idx_thread_public_id`. Read on every pageview to build the cache
+/// key, so it has to stay this cheap: the whole point is paying one row instead of the page's
+/// full scan when the render is already cached.
+///
+/// Binds: `?1` = thread public id.
+pub const THREAD_VERSION: &str = "SELECT cache_version FROM thread WHERE public_id = ?1";
+
 /// One page of posts. `path > ?2` is an indexed range scan on `idx_post_thread_path`, not a
 /// sort: SQLite walks the index in order and stops at LIMIT.
 ///
