@@ -129,6 +129,27 @@ pub enum PostState {
 pub struct User {
     pub id: UserId,
     pub name: String,
+    pub state: UserState,
+}
+
+/// Why a username stays taken forever: `Deleted` is a tombstone, not a removal (DESIGN.md §4.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UserState {
+    #[default]
+    Active,
+    /// Account gone. The row and the name remain so neither can be reissued.
+    Deleted,
+    /// Suspended. Sessions are revoked on ban, but this is checked on every authenticated
+    /// request too: a ban that depends on a cleanup query having run is not a ban.
+    Banned,
+}
+
+impl UserState {
+    /// Whether this account may act — post, vote, or hold a session.
+    pub fn can_act(&self) -> bool {
+        matches!(self, UserState::Active)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -293,6 +314,12 @@ string_enum!(ThreadState {
     Deleted => "deleted",
 });
 
+string_enum!(UserState {
+    Active => "active",
+    Deleted => "deleted",
+    Banned => "banned",
+});
+
 string_enum!(PostState {
     Visible => "visible",
     Pending => "pending",
@@ -334,6 +361,10 @@ mod string_form_tests {
         check!(ThreadKind, [Discussion, Link, Question, Poll, Announcement]);
         use ThreadState::*;
         check!(ThreadState, [Visible, Locked, Pinned, Hidden, Deleted]);
+        check!(
+            UserState,
+            [UserState::Active, UserState::Deleted, UserState::Banned]
+        );
         check!(
             PostState,
             [

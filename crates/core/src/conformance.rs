@@ -22,6 +22,7 @@
 use crate::id::PublicId;
 use crate::model::{NewPost, SanitizedHtml};
 use crate::path::Path;
+use crate::session::{Session, SessionPolicy, SessionToken, TOKEN_BYTES};
 use crate::store::{Page, Store, StoreError};
 
 /// What the suite expects the store to already contain.
@@ -112,7 +113,174 @@ async fn write_checks<S: Store>(store: &S, fx: &Fixture) -> Vec<Check> {
         siblings_get_consecutive_ordinals(store, fx).await,
         writing_the_same_id_twice_conflicts(store, fx).await,
         reply_to_absent_parent_is_not_found(store, fx).await,
+        sessions_round_trip_and_carry_the_user(store, fx).await,
+        expired_sessions_do_not_resolve(store, fx).await,
+        refresh_extends_a_session(store, fx).await,
+        logout_is_immediate_and_idempotent(store, fx).await,
+        logout_everywhere_ends_every_session(store, fx).await,
     ]
+}
+
+const NOW: i64 = 1_800_000_000_000;
+
+fn session_for(fx: &Fixture, seed: u8, now: i64) -> (SessionToken, Session) {
+    let policy = SessionPolicy::default();
+    let token = SessionToken::from_bytes([seed; TOKEN_BYTES]);
+    let session = Session {
+        token_hash: token.hash(),
+        user_id: fx.author_id,
+        created_at: now,
+        refreshed_at: now,
+        expires_at: policy.expiry_from(now),
+    };
+    (token, session)
+}
+
+async fn sessions_round_trip_and_carry_the_user<S: Store>(store: &S, fx: &Fixture) -> Check {
+    const NAME: &str = "a session resolves to its user";
+    let (token, session) = session_for(fx, 0x11, NOW);
+    if let Err(e) = store.create_session(&session).await {
+        return Check::fail(NAME, format!("create: {e}"));
+    }
+    let found = match store.lookup_session(&token.hash(), NOW + 1000).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return Check::fail(NAME, "a session just created did not resolve"),
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    require!(NAME, found.user.id == fx.author_id, "wrong user");
+    require!(NAME, !found.user.name.is_empty(), "user came back nameless");
+    require!(
+        NAME,
+        found.session.expires_at == session.expires_at,
+        "expiry not preserved"
+    );
+    // An unknown token must resolve to nothing, not to somebody.
+    let stranger = SessionToken::from_bytes([0xEE; TOKEN_BYTES]);
+    match store.lookup_session(&stranger.hash(), NOW).await {
+        Ok(None) => {}
+        Ok(Some(_)) => return Check::fail(NAME, "an unknown token resolved to a session"),
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    }
+    Check::pass(NAME)
+}
+
+/// Expiry is enforced by the query, not by a sweep that may not have run.
+async fn expired_sessions_do_not_resolve<S: Store>(store: &S, fx: &Fixture) -> Check {
+    const NAME: &str = "an expired session does not resolve, even if the row is still there";
+    let (token, mut session) = session_for(fx, 0x22, NOW);
+    session.expires_at = NOW + 1000;
+    if let Err(e) = store.create_session(&session).await {
+        return Check::fail(NAME, format!("create: {e}"));
+    }
+    match store.lookup_session(&token.hash(), NOW + 500).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Check::fail(NAME, "did not resolve while still live"),
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    }
+    // Exactly at expiry it is already gone, not still valid for one more millisecond.
+    match store
+        .lookup_session(&token.hash(), session.expires_at)
+        .await
+    {
+        Ok(None) => Check::pass(NAME),
+        Ok(Some(_)) => Check::fail(NAME, "resolved at its own expiry instant"),
+        Err(e) => Check::fail(NAME, format!("{e}")),
+    }
+}
+
+async fn refresh_extends_a_session<S: Store>(store: &S, fx: &Fixture) -> Check {
+    const NAME: &str = "refresh extends expiry without changing identity";
+    let policy = SessionPolicy::default();
+    let (token, session) = session_for(fx, 0x33, NOW);
+    if let Err(e) = store.create_session(&session).await {
+        return Check::fail(NAME, format!("create: {e}"));
+    }
+    // Sliding expiry refreshes at most once a day; before that, nothing should be written.
+    require!(
+        NAME,
+        !policy.should_refresh(&session, NOW + 60_000),
+        "policy would refresh a minute in"
+    );
+    let later = NOW + policy.refresh_after_ms;
+    require!(
+        NAME,
+        policy.should_refresh(&session, later),
+        "policy would not refresh after a full interval"
+    );
+
+    let new_expiry = policy.expiry_from(later);
+    if let Err(e) = store
+        .refresh_session(&token.hash(), later, new_expiry)
+        .await
+    {
+        return Check::fail(NAME, format!("refresh: {e}"));
+    }
+    match store.lookup_session(&token.hash(), later).await {
+        Ok(Some(a)) => {
+            require!(
+                NAME,
+                a.session.expires_at == new_expiry,
+                "expiry {} not extended to {new_expiry}",
+                a.session.expires_at
+            );
+            require!(
+                NAME,
+                a.session.created_at == session.created_at,
+                "refresh rewrote created_at"
+            );
+            require!(NAME, a.user.id == fx.author_id, "refresh changed the user");
+            Check::pass(NAME)
+        }
+        Ok(None) => Check::fail(NAME, "session vanished after refresh"),
+        Err(e) => Check::fail(NAME, format!("{e}")),
+    }
+}
+
+async fn logout_is_immediate_and_idempotent<S: Store>(store: &S, fx: &Fixture) -> Check {
+    const NAME: &str = "logout takes effect immediately and repeats harmlessly";
+    let (token, session) = session_for(fx, 0x44, NOW);
+    if let Err(e) = store.create_session(&session).await {
+        return Check::fail(NAME, format!("create: {e}"));
+    }
+    if let Err(e) = store.delete_session(&token.hash()).await {
+        return Check::fail(NAME, format!("delete: {e}"));
+    }
+    match store.lookup_session(&token.hash(), NOW).await {
+        Ok(None) => {}
+        Ok(Some(_)) => return Check::fail(NAME, "session survived logout"),
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    }
+    // Deleting again is success: the caller wanted the token dead and it is.
+    match store.delete_session(&token.hash()).await {
+        Ok(()) => Check::pass(NAME),
+        Err(e) => Check::fail(NAME, format!("second delete errored: {e}")),
+    }
+}
+
+/// What a ban or a password change relies on.
+async fn logout_everywhere_ends_every_session<S: Store>(store: &S, fx: &Fixture) -> Check {
+    const NAME: &str = "logout everywhere ends every session for the user";
+    let mut tokens = Vec::new();
+    for seed in [0x55u8, 0x56, 0x57] {
+        let (t, s) = session_for(fx, seed, NOW);
+        if let Err(e) = store.create_session(&s).await {
+            return Check::fail(NAME, format!("create: {e}"));
+        }
+        tokens.push(t);
+    }
+    let ended = match store.delete_user_sessions(fx.author_id).await {
+        Ok(n) => n,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    require!(NAME, ended >= 3, "reported only {ended} sessions ended");
+    for t in &tokens {
+        match store.lookup_session(&t.hash(), NOW).await {
+            Ok(None) => {}
+            Ok(Some(_)) => return Check::fail(NAME, "a session survived logout-everywhere"),
+            Err(e) => return Check::fail(NAME, format!("{e}")),
+        }
+    }
+    Check::pass(NAME)
 }
 
 fn draft(fx: &Fixture, id: &PublicId, parent: Option<&PublicId>, body: &str) -> NewPost {

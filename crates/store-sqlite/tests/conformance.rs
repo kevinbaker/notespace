@@ -9,12 +9,18 @@ use notespace_core::id::PublicId;
 use notespace_core::path::Path;
 use notespace_store_sqlite::SqliteStore;
 
-const MIGRATIONS: [&str; 4] = [
+/// `include_str!` needs literal paths, so this list is maintained by hand — and a migration
+/// added without touching it fails as "no such table" somewhere unrelated.
+/// `migration_list_is_complete` below turns that into a clear failure instead.
+const MIGRATIONS: [&str; 5] = [
     include_str!("../../../migrations/0001_init.sql"),
     include_str!("../../../migrations/0002_thread_public_id.sql"),
     include_str!("../../../migrations/0003_space_paths_and_names.sql"),
     include_str!("../../../migrations/0004_post_public_id.sql"),
+    include_str!("../../../migrations/0005_session.sql"),
 ];
+
+const MIGRATIONS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations");
 
 /// Deterministic ids matching what `notespace-seed` produces, so the fixture below describes
 /// the same data the D1 side is seeded with.
@@ -116,6 +122,25 @@ async fn sqlite_adapter_passes_the_shared_suite() {
             .map(|c| format!("  - {}: {}", c.name, c.failure.as_deref().unwrap_or("")))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+}
+
+/// Every migration on disk must be in [`MIGRATIONS`]. Without this, adding one and forgetting
+/// to list it here makes the suite test an older schema than the Worker runs.
+#[test]
+fn migration_list_is_complete() {
+    let mut on_disk: Vec<String> = std::fs::read_dir(MIGRATIONS_DIR)
+        .expect("migrations directory")
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".sql"))
+        .collect();
+    on_disk.sort();
+    assert_eq!(
+        on_disk.len(),
+        MIGRATIONS.len(),
+        "{} migrations on disk ({on_disk:?}) but {} listed in MIGRATIONS",
+        on_disk.len(),
+        MIGRATIONS.len()
     );
 }
 

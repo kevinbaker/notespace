@@ -607,8 +607,13 @@ credential cache at thousands of RPS. This forum is none of those.
   D1's seven days of Time Travel snapshots — then yields no usable sessions.
 - `HttpOnly; Secure; SameSite=Lax; Path=/`. Lax rather than Strict so that following a link into
   the forum keeps you logged in.
-- **Fixed expiry, not sliding.** Sliding expiry costs a write per request, which is what makes
-  session stores expensive; a fixed window costs one write per login.
+- **Sliding expiry, refreshed at most once a day.** Naive sliding is a write per request, which
+  is what makes session stores expensive. Refreshing only when the last one is a day old gives
+  the same "never logged out" experience for roughly **one write per active user per day** —
+  against D1's 100,000 rows/day, the difference between a few thousand pageviews and tens of
+  thousands of daily users. Default lifetime 30 days.
+- An **expired session is never refreshed**, so a request arriving a month late is a logout
+  rather than a resurrection.
 - Revocation is a `DELETE`, effective immediately.
 
 #### Why a per-request lookup is affordable

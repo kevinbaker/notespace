@@ -20,9 +20,10 @@
 use notespace_core::id::PublicId;
 use notespace_core::model::*;
 use notespace_core::path::Path;
+use notespace_core::session::{Session, TokenHash};
 use notespace_core::sql;
 use notespace_core::store::{
-    async_trait, NextPath, Page, PostLocation, Store, StoreError, StoreResult,
+    async_trait, Authenticated, NextPath, Page, PostLocation, Store, StoreError, StoreResult,
 };
 use rusqlite::{Connection, OptionalExtension, Row};
 
@@ -260,6 +261,82 @@ impl Store for SqliteStore {
             score: 0.0,
             state: PostState::Visible,
         })
+    }
+
+    async fn create_session(&self, session: &Session) -> StoreResult<()> {
+        self.conn
+            .execute(
+                sql::INSERT_SESSION,
+                rusqlite::params![
+                    session.token_hash.as_str(),
+                    session.user_id,
+                    session.created_at,
+                    session.refreshed_at,
+                    session.expires_at,
+                ],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn lookup_session(
+        &self,
+        token: &TokenHash,
+        now: Timestamp,
+    ) -> StoreResult<Option<Authenticated>> {
+        self.conn
+            .query_row(
+                sql::LOOKUP_SESSION,
+                rusqlite::params![token.as_str(), now],
+                |r| {
+                    Ok(Authenticated {
+                        session: Session {
+                            token_hash: token.clone(),
+                            user_id: r.get("user_id")?,
+                            created_at: r.get("created_at")?,
+                            refreshed_at: r.get("refreshed_at")?,
+                            expires_at: r.get("expires_at")?,
+                        },
+                        user: User {
+                            id: r.get("user_id")?,
+                            name: r.get("user_name")?,
+                            state: parse_enum(&r.get::<_, String>("user_state")?),
+                        },
+                    })
+                },
+            )
+            .optional()
+            .map_err(backend)
+    }
+
+    async fn refresh_session(
+        &self,
+        token: &TokenHash,
+        refreshed_at: Timestamp,
+        expires_at: Timestamp,
+    ) -> StoreResult<()> {
+        self.conn
+            .execute(
+                sql::REFRESH_SESSION,
+                rusqlite::params![token.as_str(), refreshed_at, expires_at],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn delete_session(&self, token: &TokenHash) -> StoreResult<()> {
+        self.conn
+            .execute(sql::DELETE_SESSION, [token.as_str()])
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn delete_user_sessions(&self, user: UserId) -> StoreResult<u32> {
+        let n = self
+            .conn
+            .execute(sql::DELETE_USER_SESSIONS, [user])
+            .map_err(backend)?;
+        Ok(n as u32)
     }
 
     async fn locate_post(&self, post: &PublicId) -> StoreResult<PostLocation> {

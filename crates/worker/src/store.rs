@@ -14,9 +14,10 @@ use core::cell::Cell;
 use notespace_core::id::PublicId;
 use notespace_core::model::*;
 use notespace_core::path::Path;
+use notespace_core::session::{Session, TokenHash};
 use notespace_core::sql;
 use notespace_core::store::{
-    async_trait, NextPath, Page, PostLocation, Store, StoreError, StoreResult,
+    async_trait, Authenticated, NextPath, Page, PostLocation, Store, StoreError, StoreResult,
 };
 
 use serde::Deserialize;
@@ -80,6 +81,16 @@ struct ThreadRow {
     space_name: String,
     space_ranking: String,
     space_depth_cap: i64,
+}
+
+#[derive(Deserialize)]
+struct SessionRow {
+    user_id: i64,
+    created_at: i64,
+    refreshed_at: i64,
+    expires_at: i64,
+    user_name: String,
+    user_state: String,
 }
 
 #[derive(Deserialize)]
@@ -365,6 +376,29 @@ impl D1Store {
         })
     }
 
+    /// Run a statement that returns no rows, reporting how many it changed.
+    async fn run(
+        &self,
+        stmt: &str,
+        binds: Vec<worker::wasm_bindgen::JsValue>,
+    ) -> StoreResult<Option<u32>> {
+        let res = self
+            .db
+            .prepare(stmt)
+            .bind(&binds)
+            .map_err(backend)?
+            .run()
+            .await
+            .map_err(backend)?;
+        self.last_stats.set(collect_stats(&[&res]));
+        Ok(res
+            .meta()
+            .ok()
+            .flatten()
+            .and_then(|m| m.changes)
+            .map(|c| c as u32))
+    }
+
     /// Stats from the most recent query on this store.
     pub fn last_stats(&self) -> QueryStats {
         self.last_stats.get()
@@ -513,5 +547,76 @@ impl Store for D1Store {
 
     async fn insert_post(&self, new: &NewPost) -> StoreResult<Post> {
         self.append_post(new).await
+    }
+
+    async fn create_session(&self, session: &Session) -> StoreResult<()> {
+        self.run(
+            sql::INSERT_SESSION,
+            vec![
+                session.token_hash.as_str().into(),
+                num(session.user_id),
+                num(session.created_at),
+                num(session.refreshed_at),
+                num(session.expires_at),
+            ],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn lookup_session(
+        &self,
+        token: &TokenHash,
+        now: Timestamp,
+    ) -> StoreResult<Option<Authenticated>> {
+        let res = self
+            .db
+            .prepare(sql::LOOKUP_SESSION)
+            .bind(&[token.as_str().into(), num(now)])
+            .map_err(backend)?
+            .all()
+            .await
+            .map_err(backend)?;
+        self.last_stats.set(collect_stats(&[&res]));
+        let rows: Vec<SessionRow> = res.results().map_err(backend)?;
+        Ok(rows.into_iter().next().map(|r| Authenticated {
+            session: Session {
+                token_hash: token.clone(),
+                user_id: r.user_id,
+                created_at: r.created_at,
+                refreshed_at: r.refreshed_at,
+                expires_at: r.expires_at,
+            },
+            user: User {
+                id: r.user_id,
+                name: r.user_name,
+                state: r.user_state.parse().unwrap_or_default(),
+            },
+        }))
+    }
+
+    async fn refresh_session(
+        &self,
+        token: &TokenHash,
+        refreshed_at: Timestamp,
+        expires_at: Timestamp,
+    ) -> StoreResult<()> {
+        self.run(
+            sql::REFRESH_SESSION,
+            vec![token.as_str().into(), num(refreshed_at), num(expires_at)],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn delete_session(&self, token: &TokenHash) -> StoreResult<()> {
+        self.run(sql::DELETE_SESSION, vec![token.as_str().into()])
+            .await
+            .map(|_| ())
+    }
+
+    async fn delete_user_sessions(&self, user: UserId) -> StoreResult<u32> {
+        let meta = self.run(sql::DELETE_USER_SESSIONS, vec![num(user)]).await?;
+        Ok(meta.unwrap_or(0))
     }
 }

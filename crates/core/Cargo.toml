@@ -11,6 +11,8 @@ repository.workspace = true
 serde = { workspace = true }
 thiserror = { workspace = true }
 async-trait = "0.1"
+# Pure Rust, no_std-capable, compiles to wasm32-unknown-unknown without a backend feature.
+sha2 = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 proptest = "1"

@@ -119,3 +119,44 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, 'visible')";
 pub const BUMP_THREAD: &str = "\
 UPDATE thread SET post_count = post_count + 1, bumped_at = ?2, cache_version = cache_version + 1 \
 WHERE id = ?1";
+
+// ---------------------------------------------------------------------------
+// Sessions (DESIGN.md §4.9)
+// ---------------------------------------------------------------------------
+
+/// Create a session. `token_hash` is the SHA-256 of the cookie value, never the value itself.
+///
+/// Binds: `?1` token_hash, `?2` user_id, `?3` created_at, `?4` refreshed_at, `?5` expires_at.
+pub const INSERT_SESSION: &str = "\
+INSERT INTO session (token_hash, user_id, created_at, refreshed_at, expires_at) \
+VALUES (?1, ?2, ?3, ?4, ?5)";
+
+/// Look up a live session and the user it belongs to, in one statement.
+///
+/// Joins `user` rather than making the caller fetch it: an authenticated request needs both, and
+/// two round trips for one identity is not in the budget.
+///
+/// Expiry is filtered here rather than in the caller. Sweeping expired rows is a background
+/// chore that may not have run, so "the row exists" and "the session is live" are different
+/// questions and only the second one is ever asked.
+///
+/// Binds: `?1` token_hash, `?2` now (unix ms).
+pub const LOOKUP_SESSION: &str = "\
+SELECT s.token_hash, s.user_id, s.created_at, s.refreshed_at, s.expires_at, \
+u.name AS user_name, u.state AS user_state \
+FROM session s JOIN user u ON u.id = s.user_id \
+WHERE s.token_hash = ?1 AND s.expires_at > ?2";
+
+/// Push a session's expiry out. Rate-limited by `SessionPolicy`, not by this statement.
+///
+/// Binds: `?1` token_hash, `?2` refreshed_at, `?3` expires_at.
+pub const REFRESH_SESSION: &str = "\
+UPDATE session SET refreshed_at = ?2, expires_at = ?3 WHERE token_hash = ?1";
+
+/// Log out. Binds: `?1` token_hash.
+pub const DELETE_SESSION: &str = "DELETE FROM session WHERE token_hash = ?1";
+
+/// Log out everywhere — after a password change, or when an account is banned.
+///
+/// Binds: `?1` user_id.
+pub const DELETE_USER_SESSIONS: &str = "DELETE FROM session WHERE user_id = ?1";

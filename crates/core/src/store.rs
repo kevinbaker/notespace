@@ -13,8 +13,9 @@
 //!   exist there.
 
 use crate::id::PublicId;
-use crate::model::{NewPost, Post, ThreadPage};
+use crate::model::{NewPost, Post, ThreadPage, Timestamp, User, UserId};
 use crate::path::Path;
+use crate::session::{Session, TokenHash};
 
 /// `?Send` is required: wasm futures are not `Send` (DESIGN.md §3.1).
 pub use async_trait::async_trait;
@@ -121,6 +122,54 @@ pub trait Store {
     /// A conforming implementation therefore never silently drops a post and never writes two
     /// posts to the same path. `writes_never_collide` in the conformance suite pins both.
     async fn insert_post(&self, post: &NewPost) -> StoreResult<Post>;
+
+    /// Start a session. **Budget: 1 statement.**
+    async fn create_session(&self, session: &Session) -> StoreResult<()>;
+
+    /// Resolve a cookie to its session and user, or `None` if there is no live session.
+    ///
+    /// **Budget: 1 statement**, joining `user` — an authenticated request needs both, and two
+    /// round trips for one identity is not in the budget.
+    ///
+    /// Takes a [`TokenHash`], not a token: the raw secret has no path into storage because no
+    /// storage method accepts one.
+    ///
+    /// Expired rows are filtered by the query rather than by the caller, so a sweep that has
+    /// not run cannot hand back a dead session.
+    async fn lookup_session(
+        &self,
+        token: &TokenHash,
+        now: Timestamp,
+    ) -> StoreResult<Option<Authenticated>>;
+
+    /// Push a session's expiry out. **Budget: 1 statement.**
+    ///
+    /// Rate-limited by [`SessionPolicy`](crate::session::SessionPolicy), not here: called on
+    /// every request, sliding expiry would be a write per pageview.
+    async fn refresh_session(
+        &self,
+        token: &TokenHash,
+        refreshed_at: Timestamp,
+        expires_at: Timestamp,
+    ) -> StoreResult<()>;
+
+    /// Log out. Idempotent — deleting an absent session is success, not `NotFound`, because the
+    /// caller's goal is "this token no longer works" and it already does not.
+    ///
+    /// **Budget: 1 statement.**
+    async fn delete_session(&self, token: &TokenHash) -> StoreResult<()>;
+
+    /// Log out everywhere: after a password change, or when an account is banned.
+    ///
+    /// **Budget: 1 statement.** Returns how many sessions ended.
+    async fn delete_user_sessions(&self, user: UserId) -> StoreResult<u32>;
+}
+
+/// A live session and whose it is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Authenticated {
+    pub session: Session,
+    pub user: User,
 }
 
 /// Path allocation, shared by every adapter.
