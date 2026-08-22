@@ -12,10 +12,15 @@ thread_local! {
 }
 
 /// What this deployment is running, for the log line.
-pub struct Posture {
-    pub password_login: bool,
-    pub params_below_recommended: bool,
-    pub peppered: bool,
+pub enum Posture {
+    /// Password login compiled out; authentication is external.
+    External,
+    /// Password login is live, with a pepper. Parameters are still below OWASP on this target.
+    #[cfg(feature = "password")]
+    PasswordsWithPepper,
+    /// Password login is compiled in but refusing to run, with the reason.
+    #[cfg(feature = "password")]
+    Refused(&'static str),
 }
 
 /// Log the posture once per isolate. Warnings are `console_error` so they are not lost in
@@ -24,28 +29,26 @@ pub fn report_once(p: &Posture) {
     if REPORTED.with(|r| r.replace(true)) {
         return;
     }
-    if !p.password_login {
-        worker::console_log!(
+    match p {
+        Posture::External => worker::console_log!(
             "notespace: local password login is disabled; authentication is external (OIDC)"
-        );
-        return;
-    }
-    worker::console_log!("notespace: local password login is enabled");
-    if p.params_below_recommended {
-        worker::console_error!(
-            "notespace: WARNING -- Argon2 parameters are BELOW the OWASP minimum. The Workers \
-             free plan allows 10 ms of CPU per request and OWASP's minimum needs ~56 ms, so \
-             password login here is weaker than it should be. Prefer OIDC, or a paid plan. \
-             See DESIGN.md 4.10."
-        );
-    }
-    if !p.peppered {
-        worker::console_error!(
-            "notespace: WARNING -- no pepper configured. With reduced Argon2 parameters, a \
-             pepper is what keeps a leaked database uncrackable. Set the PASSWORD_PEPPER secret \
-             (>= 32 bytes) with `wrangler secret put PASSWORD_PEPPER`."
-        );
-    } else {
-        worker::console_log!("notespace: password pepper configured");
+        ),
+        #[cfg(feature = "password")]
+        Posture::Refused(why) => worker::console_error!(
+            "notespace: PASSWORD LOGIN REFUSED TO START -- {}. Reading is unaffected; anything \
+             touching a password returns 503 until this is fixed.",
+            why
+        ),
+        #[cfg(feature = "password")]
+        Posture::PasswordsWithPepper => {
+            worker::console_log!("notespace: local password login is enabled, pepper configured");
+            // True on this target by construction: CONSTRAINED is what fits 10 ms of CPU.
+            worker::console_error!(
+                "notespace: NOTE -- Argon2 parameters are below the OWASP minimum. The free plan \
+                 allows 10 ms of CPU per request and OWASP's minimum needs ~57 ms. The pepper is \
+                 what keeps a leaked database uncrackable at these parameters. Prefer OIDC, or a \
+                 paid plan. See DESIGN.md 4.10."
+            );
+        }
     }
 }

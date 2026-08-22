@@ -3,6 +3,8 @@
 //! M0 scope (DESIGN.md §8): serve a 200-post thread page from D1 and prove it fits inside
 //! the free-tier CPU, size and query budgets. Auth, writes and baking are M2/M6.
 
+#[cfg(feature = "password")]
+mod auth_config;
 mod ids;
 mod startup;
 mod store;
@@ -27,10 +29,6 @@ use worker::{event, Context, Env, HttpRequest, Result as WorkerResult};
 /// Must match the `binding` name in `wrangler.toml` (and any binding configured in the
 /// dashboard). A mismatch surfaces at runtime as "no D1 binding", never at build time.
 const DB_BINDING: &str = "DATABASE";
-
-/// Worker secret holding the password pepper. Deliberately a secret rather than a var: the
-/// whole value of a pepper is that it does not live where the database lives.
-const PEPPER_BINDING: &str = "PASSWORD_PEPPER";
 
 /// Posts per page. 200 is the number DESIGN.md §8 names as the spike target: if a page this
 /// size does not fit the budget, the free-tier premise fails.
@@ -57,17 +55,18 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> WorkerResult<Respon
 }
 
 /// What this deployment is actually running, read from bindings rather than assumed.
+/// Password login compiled out.
+#[cfg(not(feature = "password"))]
+fn posture(_env: &Env) -> startup::Posture {
+    startup::Posture::External
+}
+
+#[cfg(feature = "password")]
 fn posture(env: &Env) -> startup::Posture {
-    let peppered = env
-        .secret(PEPPER_BINDING)
-        .map(|s| s.to_string().len() >= 32)
-        .unwrap_or(false);
-    startup::Posture {
-        password_login: cfg!(feature = "password"),
-        // Only meaningful when password login is compiled in; CONSTRAINED is what a Worker
-        // build would use, and it is below OWASP by construction.
-        params_below_recommended: cfg!(feature = "password"),
-        peppered,
+    match auth_config::AuthConfig::resolve(env) {
+        auth_config::AuthConfig::External => startup::Posture::External,
+        auth_config::AuthConfig::Refused(why) => startup::Posture::Refused(why),
+        auth_config::AuthConfig::Passwords { .. } => startup::Posture::PasswordsWithPepper,
     }
 }
 
@@ -77,6 +76,8 @@ fn router(env: Env) -> Router {
         .route("/t/{id}", get(thread_page))
         .route("/t/{id}/{slug}", get(thread_page_slug))
         .route("/p/{id}", get(post_permalink))
+        .route("/login", get(auth_status).post(auth_status))
+        .route("/register", get(auth_status).post(auth_status))
         // GET runs the read-only checks; POST adds the write checks, which mutate the thread.
         // A GET that appends posts would be wrong regardless of how convenient it is.
         .route(
@@ -106,6 +107,61 @@ async fn thread_page(
     query: Query<PageQuery>,
 ) -> Response {
     render_thread(state, id, None, query).await
+}
+
+/// The auth endpoints.
+///
+/// The login flow itself is not built yet, but the *refusal* is — and it is the part that has to
+/// be right, because a deployment missing its pepper must not quietly accept passwords. This
+/// answers 503 when password login refused to start, so the failure is visible from outside the
+/// logs rather than only inside them.
+#[worker::send]
+async fn auth_status(State(env): State<Env>) -> Response {
+    auth_status_inner(&env)
+}
+
+/// Password login compiled out: these endpoints do not exist.
+#[cfg(not(feature = "password"))]
+fn auth_status_inner(_env: &Env) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        "local password login is disabled on this instance; authentication is external\n",
+    )
+        .into_response()
+}
+
+#[cfg(feature = "password")]
+fn auth_status_inner(env: &Env) -> Response {
+    match auth_config::AuthConfig::resolve(env) {
+        auth_config::AuthConfig::External => (
+            StatusCode::NOT_FOUND,
+            "local password login is disabled on this instance; authentication is external\n",
+        )
+            .into_response(),
+        // 503 rather than 500: the configuration is fixable and the service is otherwise
+        // healthy. No Retry-After -- this needs an operator, not time.
+        auth_config::AuthConfig::Refused(why) => {
+            (StatusCode::SERVICE_UNAVAILABLE, format!("{why}\n")).into_response()
+        }
+        auth_config::AuthConfig::Passwords { peppers, params } => (
+            StatusCode::NOT_IMPLEMENTED,
+            format!(
+                "password login is configured but not yet implemented\n\
+                 argon2id m={} KiB t={} p={} (below OWASP: {})\n\
+                 pepper: configured{}\n",
+                params.m_kib,
+                params.t,
+                params.p,
+                params.is_below_recommended(),
+                if peppers.previous.is_some() {
+                    ", rotation in progress"
+                } else {
+                    ""
+                }
+            ),
+        )
+            .into_response(),
+    }
 }
 
 /// Runs the shared conformance suite against D1 and reports it as plain text.

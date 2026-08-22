@@ -83,6 +83,38 @@ deployed code until a successful deploy replaces it.
 Building in CI is possible (install Rust, then `wrangler deploy`), and is the right answer once
 this is worth automating. It is not worth automating yet.
 
+## Enabling password login (optional)
+
+Off by default: authentication is expected to be external (OIDC), because OWASP-grade password
+hashing does not fit the free plan's 10 ms CPU budget (DESIGN.md §4.10).
+
+If you enable it anyway, a **pepper is mandatory** — it is what keeps a leaked database
+uncrackable at the reduced Argon2 parameters this target can afford. Password login refuses to
+start without one, and says so on every request that touches a password.
+
+```bash
+openssl rand -hex 32 | wrangler secret put PASSWORD_PEPPER
+```
+
+Then build with the feature: `worker-build --release -- --features password`.
+
+The pepper is deliberately **not** auto-generated. On a Worker there is nowhere safe to put one:
+the only writable store is D1, and a pepper inside the database is not a pepper. A Worker also
+cannot write its own secrets, and concurrent isolates would each generate a different value —
+so a password hashed by one would fail against every other. A self-hosted binary has none of
+those constraints and should generate one on first run; that is M5.
+
+For local `wrangler dev`, put it in `.dev.vars` (gitignored):
+
+```
+PASSWORD_PEPPER = "<64 hex characters>"
+```
+
+**Rotating**: set `PASSWORD_PEPPER_PREVIOUS` to the old value and `PASSWORD_PEPPER` to the new
+one. Logins verify against either and rewrite the hash under the new pepper as accounts come
+back. Drop the previous binding once the tail is small enough to force a reset — a pepper cannot
+be rotated in place, because the hashes depend on it and the plaintexts are gone.
+
 ## Gotchas
 
 - **`name` must match the Worker that owns the route.** `wrangler.toml` says `notespace-dev`
