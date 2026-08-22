@@ -3,6 +3,7 @@
 //! M0 scope (DESIGN.md §8): serve a 200-post thread page from D1 and prove it fits inside
 //! the free-tier CPU, size and query budgets. Auth, writes and baking are M2/M6.
 
+mod ids;
 mod store;
 
 use axum::extract::{Path as UrlPath, Query, State};
@@ -53,7 +54,12 @@ fn router(env: Env) -> Router {
         .route("/t/{id}", get(thread_page))
         .route("/t/{id}/{slug}", get(thread_page_slug))
         .route("/p/{id}", get(post_permalink))
-        .route("/__conformance", get(conformance))
+        // GET runs the read-only checks; POST adds the write checks, which mutate the thread.
+        // A GET that appends posts would be wrong regardless of how convenient it is.
+        .route(
+            "/__conformance",
+            get(conformance).post(conformance_with_writes),
+        )
         .with_state(env)
 }
 
@@ -93,7 +99,21 @@ async fn thread_page(
 ///
 /// Reads only that thread, and writes nothing.
 #[worker::send]
-async fn conformance(State(env): State<Env>, Query(q): Query<ConformanceQuery>) -> Response {
+async fn conformance(state: State<Env>, q: Query<ConformanceQuery>) -> Response {
+    run_conformance(state, q, false).await
+}
+
+/// The full suite, write checks included. `POST` because it appends posts to the thread.
+#[worker::send]
+async fn conformance_with_writes(state: State<Env>, q: Query<ConformanceQuery>) -> Response {
+    run_conformance(state, q, true).await
+}
+
+async fn run_conformance(
+    State(env): State<Env>,
+    Query(q): Query<ConformanceQuery>,
+    writes: bool,
+) -> Response {
     let db = match env.d1(DB_BINDING) {
         Ok(db) => db,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &format!("no D1: {e}")),
@@ -134,18 +154,41 @@ async fn conformance(State(env): State<Env>, Query(q): Query<ConformanceQuery>) 
         );
     };
 
+    // Real generated ids, so the write checks exercise the same id path a real post takes.
+    let writable = if writes {
+        match (0..4)
+            .map(|_| ids::generate())
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("id generation: {e}"),
+                )
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     let fixture = Fixture {
         thread: thread.clone(),
         post_count: probe.thread.post_count,
         known_post: known.public_id.clone(),
         known_post_path: known.path.clone(),
         absent,
+        writable,
+        // A user that certainly exists: whoever started the thread.
+        author_id: probe.thread.author_id,
     };
     let checks = run_all(&store, &fixture).await;
     let failed = checks.iter().filter(|c| !c.passed()).count();
     let mut body = format!(
-        "notespace conformance suite -- D1 adapter\nthread {} / {} posts\n\n",
-        fixture.thread, fixture.post_count
+        "notespace conformance suite -- D1 adapter\nthread {} / {} posts\nwrites: {}\n\n",
+        fixture.thread,
+        fixture.post_count,
+        if writes { "yes (POST)" } else { "no (GET)" }
     );
     for c in &checks {
         match &c.failure {

@@ -13,7 +13,7 @@
 //!   exist there.
 
 use crate::id::PublicId;
-use crate::model::ThreadPage;
+use crate::model::{NewPost, Post, ThreadPage};
 use crate::path::Path;
 
 /// `?Send` is required: wasm futures are not `Send` (DESIGN.md §3.1).
@@ -28,6 +28,15 @@ pub enum StoreError {
     Corrupt(String),
     #[error("backend error: {0}")]
     Backend(String),
+    /// A path was allocated concurrently by another writer. Recompute and retry.
+    ///
+    /// Distinct from [`StoreError::Backend`] because it is expected under load and is the
+    /// caller's cue to try again, not to surface an error.
+    #[error("write raced another writer")]
+    Conflict,
+    /// The reply would exceed the space's configured depth cap.
+    #[error("reply is too deep: cap is {cap}")]
+    TooDeep { cap: u32 },
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -95,4 +104,67 @@ pub trait Store {
     ///
     /// **Budget: 1 statement.**
     async fn locate_post(&self, post: &PublicId) -> StoreResult<PostLocation>;
+
+    /// Append a post to a thread, allocating its materialized path.
+    ///
+    /// **Budget: 4 statements.** Resolve the thread, resolve the parent (skipped for a
+    /// top-level post), find the last path under the parent, then insert and bump in one batch.
+    ///
+    /// # Concurrency
+    ///
+    /// Allocating a path is read-then-write, so two replies to the same parent at the same
+    /// moment can compute the same ordinal. The `UNIQUE(thread_id, path)` index catches the
+    /// loser, which surfaces as [`StoreError::Conflict`]. Implementations must *not* paper over
+    /// it by picking another ordinal internally — the caller retries, because a retry has to
+    /// re-read the parent anyway.
+    ///
+    /// A conforming implementation therefore never silently drops a post and never writes two
+    /// posts to the same path. `writes_never_collide` in the conformance suite pins both.
+    async fn insert_post(&self, post: &NewPost) -> StoreResult<Post>;
+}
+
+/// Path allocation, shared by every adapter.
+///
+/// The rule is small but easy to get subtly wrong in two places, so it lives in one: an adapter
+/// supplies the last path under the parent, and this decides what the new path is. Both the
+/// bounds of the lookup and the arithmetic on the result are here, because they have to agree.
+pub struct NextPath;
+
+impl NextPath {
+    /// Half-open bounds for "the deepest path under this parent".
+    ///
+    /// For a reply, that is the parent's own subtree. For a top-level post it is the whole
+    /// thread, since the last root is a prefix of the thread's last path in preorder.
+    ///
+    /// Both bounds are exclusive, which is why the lower one is the parent's own path rather
+    /// than its first child: a parent with no children yet must match nothing.
+    pub fn search_bounds(parent: Option<&Path>) -> (String, String) {
+        match parent {
+            Some(p) => (p.as_str().to_string(), p.subtree_end()),
+            // "" sorts below every path, and a character above the alphabet's last sorts above
+            // every path.
+            None => (String::new(), "\u{7f}".to_string()),
+        }
+    }
+
+    /// The path a new post should take.
+    ///
+    /// `last` is the deepest existing path under `parent`, as returned by a lookup bounded by
+    /// [`NextPath::search_bounds`] — *not* the last direct child. Truncating it here is what
+    /// keeps the lookup a single indexed probe instead of a scan across siblings.
+    pub fn allocate(parent: Option<&Path>, last: Option<&Path>) -> StoreResult<Path> {
+        // `Path::depth()` counts separators, so a root is depth 0 and a child of `parent` sits
+        // one below it.
+        let child_depth = parent.map_or(0, |p| p.depth() + 1);
+        let last_sibling = last.and_then(|l| l.ancestor_at_depth(child_depth));
+        let next = match (last_sibling, parent) {
+            // Somebody is already at this level: take the next ordinal.
+            (Some(sib), _) => sib.next_sibling(),
+            // First child of an existing post.
+            (None, Some(p)) => p.child(0),
+            // First post in the thread.
+            (None, None) => Path::root(0),
+        };
+        next.map_err(|e| StoreError::Backend(format!("path allocation: {e}")))
+    }
 }

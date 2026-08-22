@@ -15,13 +15,31 @@ use notespace_core::id::PublicId;
 use notespace_core::model::*;
 use notespace_core::path::Path;
 use notespace_core::sql;
-use notespace_core::store::{async_trait, Page, PostLocation, Store, StoreError, StoreResult};
+use notespace_core::store::{
+    async_trait, NextPath, Page, PostLocation, Store, StoreError, StoreResult,
+};
 
 use serde::Deserialize;
 use worker::{D1Database, D1Result, D1ResultMeta};
 
 // The SQL lives in `notespace_core::sql`, shared verbatim with the native adapter so the two
 // cannot drift. What is target-specific is binding and row decoding, below.
+
+/// Bind an integer for D1.
+///
+/// `i64::into::<JsValue>()` produces a JS `BigInt`, and D1 rejects it outright:
+/// `D1_TYPE_ERROR: Type 'bigint' not supported`. Every integer bind has to go through a `f64`,
+/// which is a JS `number`.
+///
+/// This is a real difference between the two targets rather than a quirk of one: rusqlite takes
+/// an `i64` without complaint, so the native adapter never sees it. The conformance suite's
+/// write checks are what surfaced it.
+///
+/// Exact for anything inside 2^53 — row ids, depths, and millisecond timestamps all are, and a
+/// forum reaching 9 quadrillion of anything has other problems.
+fn num(v: i64) -> worker::wasm_bindgen::JsValue {
+    worker::wasm_bindgen::JsValue::from_f64(v as f64)
+}
 
 /// Sum D1's per-statement meta into one figure per request.
 ///
@@ -62,6 +80,22 @@ struct ThreadRow {
     space_name: String,
     space_ranking: String,
     space_depth_cap: i64,
+}
+
+#[derive(Deserialize)]
+struct ThreadRowId {
+    id: i64,
+}
+
+#[derive(Deserialize)]
+struct PostRowId {
+    id: i64,
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct PathRow {
+    path: String,
 }
 
 #[derive(Deserialize)]
@@ -204,6 +238,130 @@ impl D1Store {
             })?,
             path: Path::parse(&row.post_path)
                 .map_err(|e| StoreError::Backend(format!("post has an unparseable path: {e}")))?,
+        })
+    }
+
+    /// Append a post, allocating its path.
+    ///
+    /// Four statements. D1 has no interactive transaction, so the allocation is a read followed
+    /// by a write rather than one atomic step — which is exactly why `UNIQUE(thread_id, path)`
+    /// exists. The insert and the counter bump go in one `batch()`, which D1 runs atomically,
+    /// so a post can never be written without its thread being bumped.
+    async fn append_post(&self, new: &NewPost) -> StoreResult<Post> {
+        let thread_row = self
+            .db
+            .prepare(sql::THREAD_ROW)
+            .bind(&[new.thread.as_str().into()])
+            .map_err(backend)?
+            .all()
+            .await
+            .map_err(backend)?;
+        let threads: Vec<ThreadRowId> = thread_row.results().map_err(backend)?;
+        let thread_id = threads.into_iter().next().ok_or(StoreError::NotFound)?.id;
+
+        let parent = match &new.parent {
+            None => None,
+            Some(pid) => {
+                let res = self
+                    .db
+                    .prepare(sql::POST_IN_THREAD)
+                    .bind(&[pid.as_str().into(), num(thread_id)])
+                    .map_err(backend)?
+                    .all()
+                    .await
+                    .map_err(backend)?;
+                let rows: Vec<PostRowId> = res.results().map_err(backend)?;
+                let row = rows.into_iter().next().ok_or(StoreError::NotFound)?;
+                Some((
+                    row.id,
+                    Path::parse(&row.path)
+                        .map_err(|e| StoreError::Corrupt(format!("parent path: {e}")))?,
+                ))
+            }
+        };
+
+        let parent_path = parent.as_ref().map(|(_, p)| p.clone());
+        let (lo, hi) = NextPath::search_bounds(parent_path.as_ref());
+        let last_res = self
+            .db
+            .prepare(sql::LAST_PATH_IN_RANGE)
+            .bind(&[num(thread_id), lo.into(), hi.into()])
+            .map_err(backend)?
+            .all()
+            .await
+            .map_err(backend)?;
+        let last_rows: Vec<PathRow> = last_res.results().map_err(backend)?;
+        let last = last_rows
+            .into_iter()
+            .next()
+            .map(|r| Path::parse(&r.path))
+            .transpose()
+            .map_err(|e| StoreError::Corrupt(format!("sibling path: {e}")))?;
+        let path = NextPath::allocate(parent_path.as_ref(), last.as_ref())?;
+        let depth = path.depth() as i64;
+
+        let insert = self
+            .db
+            .prepare(sql::INSERT_POST)
+            .bind(&[
+                new.public_id.as_str().into(),
+                num(thread_id),
+                match parent.as_ref() {
+                    Some((id, _)) => num(*id),
+                    None => worker::wasm_bindgen::JsValue::NULL,
+                },
+                path.as_str().into(),
+                num(depth),
+                num(new.author_id),
+                new.body_md.as_str().into(),
+                new.body_html.as_str().into(),
+                num(new.created_at),
+            ])
+            .map_err(backend)?;
+        let bump = self
+            .db
+            .prepare(sql::BUMP_THREAD)
+            .bind(&[num(thread_id), num(new.created_at)])
+            .map_err(backend)?;
+
+        // One batch: the post and the counter move together or not at all.
+        let row_id = match self.db.batch(vec![insert, bump]).await {
+            Ok(results) => {
+                // The row id has to come back from D1's own meta -- there is no
+                // `last_insert_rowid()` to call afterwards, and a placeholder here would be a
+                // lie the caller cannot detect. The conformance suite caught exactly that.
+                results
+                    .first()
+                    .and_then(|r| r.meta().ok().flatten())
+                    .and_then(|m| m.last_row_id)
+                    .ok_or_else(|| StoreError::Backend("insert reported no row id".into()))?
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                // D1 surfaces constraint failures as a message, not a code. Only a UNIQUE
+                // violation is a race; anything else is a bug the caller must see.
+                if msg.contains("UNIQUE constraint failed") {
+                    return Err(StoreError::Conflict);
+                }
+                return Err(StoreError::Backend(msg));
+            }
+        };
+
+        Ok(Post {
+            id: row_id,
+            public_id: new.public_id.clone(),
+            thread_id,
+            parent_id: parent.map(|(id, _)| id),
+            path,
+            depth: depth as u32,
+            author_id: new.author_id,
+            author_name: String::new(),
+            body_md: Some(new.body_md.clone()),
+            body_html: new.body_html.as_str().to_string(),
+            created_at: new.created_at,
+            edited_at: None,
+            score: 0.0,
+            state: PostState::Visible,
         })
     }
 
@@ -351,5 +509,9 @@ impl Store for D1Store {
 
     async fn locate_post(&self, post: &PublicId) -> StoreResult<PostLocation> {
         self.fetch_post_location(post).await
+    }
+
+    async fn insert_post(&self, new: &NewPost) -> StoreResult<Post> {
+        self.append_post(new).await
     }
 }

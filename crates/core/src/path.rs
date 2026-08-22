@@ -181,6 +181,23 @@ impl Path {
     }
 
     /// Path of the parent post, or `None` for a top-level post.
+    /// The ancestor at `depth`, using the same convention as [`Path::depth`]: a root path is
+    /// depth **0**, its children depth 1. `None` if this path is shallower than `depth`.
+    ///
+    /// Used to turn "the last descendant of P" into "the last *direct child* of P": one indexed
+    /// lookup finds the deepest path under P, and truncating it to `P.depth() + 1` gives the
+    /// child ordinal to insert after. Walking the children directly would be a scan.
+    pub fn ancestor_at_depth(&self, depth: usize) -> Option<Self> {
+        if depth > self.depth() {
+            return None;
+        }
+        let mut p = self.clone();
+        while p.depth() > depth {
+            p = p.parent()?;
+        }
+        Some(p)
+    }
+
     pub fn parent(&self) -> Option<Self> {
         self.0
             .rfind(SEPARATOR as char)
@@ -321,6 +338,27 @@ mod tests {
         for b in [b'.', b'/', b'I', b'L', b'O', b'U', b'a', b'z', 0u8, 255u8] {
             assert_eq!(digit_value(b), INVALID, "{} should be invalid", b as char);
         }
+    }
+
+    /// The convention is the trap: `depth()` counts separators, so a root is depth 0. An
+    /// earlier `ancestor_at_depth` treated it as a segment count and rejected depth 0, which
+    /// made every path allocation fall back to "first post in the thread" and collide.
+    #[test]
+    fn ancestor_at_depth_uses_the_same_convention_as_depth() {
+        let root = Path::parse("0006").unwrap();
+        assert_eq!(root.depth(), 0, "a root path is depth 0");
+        assert_eq!(root.ancestor_at_depth(0).as_ref(), Some(&root));
+        assert_eq!(root.ancestor_at_depth(1), None, "nothing below a root");
+
+        let deep = Path::parse("0001.0002.0003").unwrap();
+        assert_eq!(deep.depth(), 2);
+        assert_eq!(deep.ancestor_at_depth(0).unwrap().as_str(), "0001");
+        assert_eq!(deep.ancestor_at_depth(1).unwrap().as_str(), "0001.0002");
+        assert_eq!(
+            deep.ancestor_at_depth(2).unwrap().as_str(),
+            "0001.0002.0003"
+        );
+        assert_eq!(deep.ancestor_at_depth(3), None);
     }
 
     #[test]

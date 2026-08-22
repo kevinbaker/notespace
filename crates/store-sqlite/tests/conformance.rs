@@ -89,6 +89,10 @@ fn fixture() -> Fixture {
         known_post: post_id(3),
         known_post_path: Path::parse("0001.0002").unwrap(),
         absent: PublicId::new(1_735_689_600_000, 0xDEAD).unwrap(),
+        writable: (0..4)
+            .map(|i| PublicId::new(1_800_000_000_000 + i, 0x0A11_C0DE ^ i as u32).unwrap())
+            .collect(),
+        author_id: 1,
     }
 }
 

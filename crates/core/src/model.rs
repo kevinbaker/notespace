@@ -15,6 +15,56 @@ pub type UserId = i64;
 /// Unix seconds. Deliberately not `std::time::SystemTime`: that panics on wasm (DESIGN.md §3.2).
 pub type Timestamp = i64;
 
+/// HTML that has already been through the sanitizer.
+///
+/// DESIGN.md §3.5: "The client is the attacker. Always sanitize server-side." Client-generated
+/// HTML persisted and served to other readers is stored XSS, and the read path emits
+/// `body_html` verbatim — so the only thing standing between a crafted post and every future
+/// reader of that thread is that this string went through `notespace_render`.
+///
+/// `core` cannot depend on `render` without inverting the layering, so this cannot be enforced
+/// by the type system alone. What it can do is make a bypass obvious: there is exactly one
+/// constructor, it is named [`SanitizedHtml::assert_sanitized`], and any call to it outside the
+/// renderer should fail review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SanitizedHtml(String);
+
+impl SanitizedHtml {
+    /// Assert that `html` has been sanitized. Call this from the renderer and nowhere else.
+    pub fn assert_sanitized(html: String) -> Self {
+        SanitizedHtml(html)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+/// A post to be written.
+///
+/// Ids and timestamps are supplied by the caller rather than generated here: `core` has no clock
+/// and no RNG, because neither exists on wasm (DESIGN.md §3.2, §9).
+#[derive(Debug, Clone)]
+pub struct NewPost {
+    pub public_id: PublicId,
+    /// The thread to append to, by public id.
+    pub thread: PublicId,
+    /// The post being replied to. `None` makes this a new top-level post.
+    ///
+    /// Addressed by public id, not path: a path is a position, and positions move.
+    pub parent: Option<PublicId>,
+    pub author_id: UserId,
+    /// Source of truth, stored verbatim.
+    pub body_md: String,
+    /// Rendered at write time (DESIGN.md §3.3) so the read path never renders markdown.
+    pub body_html: SanitizedHtml,
+    pub created_at: Timestamp,
+}
+
 /// DESIGN.md primitive #1. Owns permissions and the ranking function.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Space {

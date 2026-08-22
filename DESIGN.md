@@ -698,8 +698,42 @@ Both adapters pass all ten checks. They cover what SQL does not enforce and wher
 actually drift: cursor exclusivity, tree order, paging visiting every post exactly once, absent
 rows being `NotFound` rather than an empty page, and the read path never loading `body_md`.
 
-Still open for M1: no write path, so the suite is read-only, and `crates/server` does not exist —
-the native adapter is exercised by tests rather than shipping a binary. That is M5.
+### 8.2 The write path, and what the second adapter caught
+
+`insert_post` allocates a materialized path and appends. Four statements: resolve the thread,
+resolve the parent, find the deepest path under it, then insert and bump the thread counters in
+one batch.
+
+Allocating a child ordinal is O(1), not a sibling scan. One backwards index walk gives the last
+*descendant* of the parent in preorder, and truncating that to `parent.depth() + 1` gives the
+last direct child. Counting children instead would be wrong rather than merely slower, because
+tombstones stay in the table and a count reuses an occupied ordinal.
+
+Allocation is read-then-write, so two replies to the same parent can compute the same ordinal.
+`UNIQUE(thread_id, path)` catches the loser and it surfaces as `StoreError::Conflict` for the
+caller to retry. Adapters must not silently pick another ordinal: a retry has to re-read the
+parent anyway.
+
+**Two real divergences between the targets, both found by running the suite against D1 rather
+than reasoning about it:**
+
+- **D1 rejects `bigint` bindings.** `i64::into::<JsValue>()` produces a JS `BigInt` and D1
+  answers `D1_TYPE_ERROR: Type 'bigint' not supported`. Every integer bind must go through
+  `f64`. rusqlite takes an `i64` without complaint, so the native adapter never sees this. Exact
+  within 2^53, which covers row ids, depths and millisecond timestamps.
+- **D1 has no `last_insert_rowid()`.** The row id has to be read from the batch result's own
+  meta. The first implementation returned a placeholder `0`, which the suite caught immediately
+  by comparing a child's `parent_id` against its parent's returned id.
+
+Neither is exotic, and neither would have been found by a read-only suite — which is why the
+write checks matter more than the read ones. Both adapters now pass all fifteen.
+
+Also closed: DESIGN.md §9's "no system RNG on wasm". Public ids are generated from
+`Date.now()` and `crypto.getRandomValues`, via `getrandom`'s `js` feature. Not `Math.random()`
+— V8's PRNG is predictable from observed output, and a predictable id is an enumerable one.
+
+Still open: `crates/server` does not exist, so the native adapter is exercised by tests rather
+than shipping a binary. That is M5.
 
 
 ## 9. Conventions for implementers

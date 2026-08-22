@@ -18,5 +18,9 @@ worker-macros = { version = "0.8", features = ["http"] }
 axum = { version = "0.8", default-features = false, features = ["query"] }
 tower-service = "0.3"
 console_error_panic_hook = "0.1"
+# `js` routes getrandom at crypto.getRandomValues, which is what makes DESIGN.md §9's
+# "no system RNG on wasm" constraint tractable. v0.2's feature works without RUSTFLAGS,
+# unlike v0.3's backend cfg.
+getrandom = { version = "0.2", features = ["js"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

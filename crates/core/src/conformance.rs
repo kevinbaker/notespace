@@ -20,6 +20,7 @@
 //! and there is no write path yet. [`Fixture`] describes what the suite expects to find.
 
 use crate::id::PublicId;
+use crate::model::{NewPost, SanitizedHtml};
 use crate::path::Path;
 use crate::store::{Page, Store, StoreError};
 
@@ -35,6 +36,12 @@ pub struct Fixture {
     pub known_post_path: Path,
     /// A well-formed id that is definitely absent.
     pub absent: PublicId,
+    /// Ids for posts the write checks will create, and an author to attribute them to.
+    ///
+    /// Supplied rather than generated because `core` has no RNG. Provide at least 4; leave
+    /// empty to skip the write checks entirely, which is what a read-only fixture does.
+    pub writable: Vec<PublicId>,
+    pub author_id: i64,
 }
 
 /// Outcome of one check.
@@ -87,6 +94,177 @@ pub async fn run_all<S: Store>(store: &S, fx: &Fixture) -> Vec<Check> {
         absent_post_is_not_found(store, fx).await,
         posts_never_expose_body_md(store, fx).await,
     ]
+    .into_iter()
+    .chain(write_checks(store, fx).await)
+    .collect()
+}
+
+/// Write checks, skipped when the fixture supplies no ids to write with.
+///
+/// These run last because they mutate the thread: everything above assumes a stable post count.
+async fn write_checks<S: Store>(store: &S, fx: &Fixture) -> Vec<Check> {
+    if fx.writable.len() < 4 {
+        return vec![Check::pass("write checks skipped (read-only fixture)")];
+    }
+    vec![
+        appended_post_is_readable(store, fx).await,
+        replies_nest_under_their_parent(store, fx).await,
+        siblings_get_consecutive_ordinals(store, fx).await,
+        writing_the_same_id_twice_conflicts(store, fx).await,
+        reply_to_absent_parent_is_not_found(store, fx).await,
+    ]
+}
+
+fn draft(fx: &Fixture, id: &PublicId, parent: Option<&PublicId>, body: &str) -> NewPost {
+    NewPost {
+        public_id: id.clone(),
+        thread: fx.thread.clone(),
+        parent: parent.cloned(),
+        author_id: fx.author_id,
+        body_md: body.to_string(),
+        body_html: SanitizedHtml::assert_sanitized(format!("<p>{body}</p>")),
+        created_at: 1_800_000_000_000,
+    }
+}
+
+async fn appended_post_is_readable<S: Store>(store: &S, fx: &Fixture) -> Check {
+    const NAME: &str = "an appended post is readable and bumps the count";
+    let before = match store.thread_page(&fx.thread, &Page::first(1)).await {
+        Ok(p) => p.thread.post_count,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    let post = match store
+        .insert_post(&draft(fx, &fx.writable[0], None, "top level"))
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return Check::fail(NAME, format!("insert: {e}")),
+    };
+    let loc = match store.locate_post(&post.public_id).await {
+        Ok(l) => l,
+        Err(e) => return Check::fail(NAME, format!("locate: {e}")),
+    };
+    require!(NAME, loc.thread == fx.thread, "landed in the wrong thread");
+    require!(
+        NAME,
+        loc.path == post.path,
+        "insert reported {} but the row is at {}",
+        post.path.as_str(),
+        loc.path.as_str()
+    );
+    let after = match store.thread_page(&fx.thread, &Page::first(1)).await {
+        Ok(p) => p.thread.post_count,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    require!(
+        NAME,
+        after == before + 1,
+        "post_count went {before} -> {after}"
+    );
+    Check::pass(NAME)
+}
+
+async fn replies_nest_under_their_parent<S: Store>(store: &S, fx: &Fixture) -> Check {
+    const NAME: &str = "a reply nests under its parent";
+    let parent = match store
+        .insert_post(&draft(fx, &fx.writable[1], None, "parent"))
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return Check::fail(NAME, format!("parent: {e}")),
+    };
+    let child = match store
+        .insert_post(&draft(
+            fx,
+            &fx.writable[2],
+            Some(&parent.public_id),
+            "child",
+        ))
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return Check::fail(NAME, format!("child: {e}")),
+    };
+    require!(
+        NAME,
+        child.path.is_descendant_of(&parent.path),
+        "{} is not under {}",
+        child.path.as_str(),
+        parent.path.as_str()
+    );
+    require!(
+        NAME,
+        child.depth == parent.depth + 1,
+        "depth {} under a parent at {}",
+        child.depth,
+        parent.depth
+    );
+    require!(
+        NAME,
+        child.parent_id == Some(parent.id),
+        "parent_id not set to the parent row"
+    );
+    Check::pass(NAME)
+}
+
+async fn siblings_get_consecutive_ordinals<S: Store>(store: &S, fx: &Fixture) -> Check {
+    const NAME: &str = "siblings get consecutive ordinals, not reused ones";
+    // writable[1] was made a parent above; give it a second child.
+    let parent = match store.locate_post(&fx.writable[1]).await {
+        Ok(l) => l,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    let second = match store
+        .insert_post(&draft(
+            fx,
+            &fx.writable[3],
+            Some(&fx.writable[1]),
+            "sibling",
+        ))
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    require!(
+        NAME,
+        second.path.is_descendant_of(&parent.path),
+        "second child escaped the parent"
+    );
+    // The first child took ordinal 0, so this must be 1 -- not 0 again.
+    require!(
+        NAME,
+        second.path.ordinal() == 1,
+        "expected ordinal 1, got {} ({})",
+        second.path.ordinal(),
+        second.path.as_str()
+    );
+    Check::pass(NAME)
+}
+
+/// The uniqueness that stops a retry from double-posting.
+async fn writing_the_same_id_twice_conflicts<S: Store>(store: &S, fx: &Fixture) -> Check {
+    const NAME: &str = "re-using a public id is rejected, not duplicated";
+    // writable[0] was already written by the first check.
+    match store
+        .insert_post(&draft(fx, &fx.writable[0], None, "duplicate"))
+        .await
+    {
+        Err(StoreError::Conflict) => Check::pass(NAME),
+        Err(e) => Check::fail(NAME, format!("wrong error: {e}")),
+        Ok(_) => Check::fail(NAME, "wrote a second post with an id already in use"),
+    }
+}
+
+async fn reply_to_absent_parent_is_not_found<S: Store>(store: &S, fx: &Fixture) -> Check {
+    const NAME: &str = "replying to a post that does not exist is NotFound";
+    let mut d = draft(fx, &fx.absent, Some(&fx.absent), "orphan");
+    d.public_id = fx.absent.clone();
+    match store.insert_post(&d).await {
+        Err(StoreError::NotFound) => Check::pass(NAME),
+        Err(e) => Check::fail(NAME, format!("wrong error: {e}")),
+        Ok(_) => Check::fail(NAME, "accepted a reply to a nonexistent parent"),
+    }
 }
 
 async fn thread_page_returns_its_space<S: Store>(store: &S, fx: &Fixture) -> Check {
