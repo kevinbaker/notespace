@@ -134,6 +134,10 @@ cookie used before a session exists is `cookie::ANON`.
 The form is a separate uncached page, not part of the baked thread. `/register` still does not
 exist, so accounts come only from the seed CLI.
 
+Not built: the progressive enhancement described in DESIGN.md §7.1 that opens the form in place
+when JS is available. There is no `/api/me/thread/{id}` endpoint yet, which is where the CSRF
+token for that path has to come from.
+
 ## §5 Moderation pipeline
 
 Not implemented. `PostState::Pending` in `crates/core/src/model.rs` is the only part present.

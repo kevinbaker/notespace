@@ -919,6 +919,30 @@ WS   /t/{id}/live               hot threads only, via DO
 
 Reading must work with JavaScript disabled. Voting and live updates may require it.
 
+### 7.1 Replying: JS-free by default, inlined when JS is available
+
+The no-JS path is the real one, in the news.ycombinator sense — it is what ships, what is
+tested, and what everything else degrades to. The baked thread page carries a plain `reply` link
+to `/t/{id}/reply`, which serves a form on its own uncached page and redirects back on success.
+Nothing about that path is a fallback bolted on afterwards.
+
+Where JS is available, the link is progressively enhanced into a form that opens in place. Three
+constraints shape how:
+
+- **The token cannot be baked.** The thread page is shared byte-for-byte between readers, so the
+  script has to fetch a CSRF token rather than read one out of the HTML. `GET /api/me/thread/{id}`
+  is already the endpoint that layers per-viewer state (§3.3) over the shared page; the token
+  goes with it, and no new round trip is introduced.
+- **Anonymous readers fetch nothing.** No session cookie means no `/api/me` call, so the common
+  case stays at exactly one request per pageview — which matters, because requests are the
+  binding free-tier constraint.
+- **The script is external.** The CSP is `script-src 'self'` with no `unsafe-inline`, and that
+  does not get relaxed for convenience.
+
+The enhancement must degrade by *removal*: with the script absent or failed, the link is still a
+link. That rules out rendering a dead `<form>` server-side and animating it open, which is the
+usual shortcut and the usual way the no-JS path quietly rots.
+
 ---
 
 ## 8. Milestones
