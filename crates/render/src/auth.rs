@@ -1,21 +1,14 @@
-//! The login form.
-//!
-//! Server-rendered and works without JavaScript, like every other page. A login
-//! form that needs JS is a login form that fails for the people most likely to be on a bad
-//! connection.
+//! Auth and write forms. Server-rendered and working without JavaScript, like every other page.
 
 use maud::{html, Markup, DOCTYPE};
 
-/// Why the previous attempt failed, if it did.
-///
-/// Deliberately coarse. "No such user" and "wrong password" are one message, because telling
-/// them apart hands over the account list.
+/// Coarse on purpose: separating "no such user" from "wrong password" hands over the account list.
 pub enum LoginError {
     /// Wrong username or password. One message for both.
     Rejected,
     /// Too many attempts.
     RateLimited { retry_after_secs: i64 },
-    /// The form was stale — usually a back button or a page left open past the token's life.
+    /// Stale form — a back button, or a page left open past the token's life.
     Expired,
 }
 
@@ -36,11 +29,7 @@ impl LoginError {
     }
 }
 
-/// Render the login page.
-///
-/// `csrf` is minted against the visitor's session or, when there is none yet, an anonymous
-/// cookie. `next` is where to go afterwards; the caller must have validated it as a local path,
-/// since an unchecked value here is an open redirect.
+/// `next` has to have been validated as a local path by the caller; unchecked, it is an open redirect.
 pub fn login_page(csrf: &str, next: Option<&str>, error: Option<LoginError>) -> Markup {
     html! {
         (DOCTYPE)
@@ -76,8 +65,7 @@ pub fn login_page(csrf: &str, next: Option<&str>, error: Option<LoginError>) -> 
     }
 }
 
-/// Minimal styling, inlined. An external stylesheet would be a second request on the one page
-/// a visitor sees before they have any cached assets.
+/// Inlined, to avoid a second request on the one page a visitor sees before caching anything.
 struct PreEscapedStyle;
 
 impl maud::Render for PreEscapedStyle {
@@ -117,7 +105,7 @@ pub enum ReplyError {
         retry_after_secs: i64,
     },
     Expired,
-    /// Lost the ordinal race repeatedly. Genuinely transient; say so.
+    /// Lost the ordinal race repeatedly. Transient.
     Contended,
 }
 
@@ -145,14 +133,8 @@ impl ReplyError {
     }
 }
 
-/// The reply form, on its own page.
-///
-/// Deliberately **not** part of the thread page. That page is baked and shared byte-for-byte
-/// between every reader, so a per-visitor CSRF token cannot appear in it — putting one there
-/// would hand one visitor's token to everybody else who reads the thread, and would break the
-/// cache sharing the read path depends on.
-///
-/// `thread` and `parent` are public ids. `draft` is echoed back so a rejected reply is not lost.
+/// On its own page, because the baked thread page is shared byte-for-byte and cannot carry a
+/// per-visitor CSRF token. `draft` is echoed back so a rejected reply is not lost.
 pub fn reply_page(
     csrf: &str,
     thread: &str,
@@ -196,7 +178,7 @@ pub fn reply_page(
 
 /// Why a signup was refused.
 pub enum RegisterError {
-    /// The name is not usable. Carries the reason, which is safe to show.
+    /// Carries the reason, which is safe to show.
     BadName(String),
     Taken,
     ShortPassword {
@@ -229,11 +211,7 @@ impl RegisterError {
     }
 }
 
-/// The signup form.
-///
-/// `name` is echoed back so a rejection does not make someone retype it. The password never is:
-/// re-rendering a submitted password puts it in the page, and from there in any cache or proxy
-/// that sees the response.
+/// `name` is echoed back on rejection; the password never is, or it lands in every cache en route.
 pub fn register_page(csrf: &str, name: &str, error: Option<RegisterError>) -> Markup {
     html! {
         (DOCTYPE)

@@ -1,7 +1,4 @@
 //! Cloudflare Workers entrypoint for notespace.
-//!
-//! M0 scope: serve a 200-post thread page from D1 and prove it fits inside the free-tier CPU,
-//! size and query budgets. Auth, writes and baking are M2/M6.
 
 #[cfg(feature = "password")]
 mod auth_config;
@@ -31,13 +28,10 @@ use store::D1Store;
 use tower_service::Service;
 use worker::{event, Context, Env, HttpRequest, Result as WorkerResult};
 
-/// Name of the D1 binding in wrangler.toml.
-/// Must match the `binding` name in `wrangler.toml` (and any binding configured in the
-/// dashboard). A mismatch surfaces at runtime as "no D1 binding", never at build time.
+/// Kept in step with wrangler.toml by `the_d1_binding_name_matches_wrangler_toml`.
 const DB_BINDING: &str = "DATABASE";
 
-/// Posts per page. 200 is the spike target: if a page this size does not fit the budget, the
-/// free-tier premise fails.
+/// Posts per page.
 const PAGE_SIZE: u32 = 200;
 
 #[derive(Deserialize, Default)]
@@ -91,7 +85,6 @@ fn router(env: Env) -> Router {
         .route("/register", get(register_form).post(register_submit))
         .route("/t/{id}/reply", get(reply_form).post(reply_submit))
         // GET runs the read-only checks; POST adds the write checks, which mutate the thread.
-        // A GET that appends posts would be wrong regardless of how convenient it is.
         .route(
             "/__conformance",
             get(conformance).post(conformance_with_writes),
@@ -109,8 +102,7 @@ async fn thread_page_slug(
     UrlPath((id, slug)): UrlPath<(String, String)>,
     query: Query<PageQuery>,
 ) -> Response {
-    // The slug is decorative: it exists for readability and for search engines, and is never
-    // used to resolve the thread. Retitling a thread therefore cannot break its links.
+    // The slug is decorative and never resolves the thread, so retitling cannot break links.
     render_thread(state, headers, id, Some(slug), query).await
 }
 
@@ -123,11 +115,7 @@ async fn thread_page(
     render_thread(state, headers, id, None, query).await
 }
 
-/// The login form.
-///
-/// A visitor here has no session, so the CSRF token binds to a short-lived anonymous cookie set
-/// on this response. Without a binding the token is a signed constant and any visitor's token
-/// works for any other.
+/// The CSRF token binds to a short-lived anonymous cookie, since there is no session yet.
 #[cfg(feature = "password")]
 #[worker::send]
 async fn login_form(
@@ -146,8 +134,7 @@ async fn login_form(
         );
     };
 
-    // Reuse the visitor's anonymous cookie if they have one, so a reload does not invalidate a
-    // form they already have open in another tab.
+    // Reuse an existing anonymous cookie, so a reload does not invalidate an open form.
     let (anon, set_anon) = match cookie::get(cookie_header(&headers), cookie::ANON) {
         Some(existing) => (existing, None),
         None => match ids::random_hex() {
@@ -172,7 +159,7 @@ async fn login_form(
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
-            // Never cached: it carries a token bound to one visitor.
+            // Carries a token bound to one visitor.
             (header::CACHE_CONTROL, "no-store".to_string()),
         ],
         Html(body.into_string()),
@@ -200,11 +187,7 @@ fn parse_error(code: String) -> Option<notespace_render::auth::LoginError> {
     }
 }
 
-/// Handle a submitted login.
-///
-/// Redirects on every outcome rather than rendering in place: a POST that renders leaves the
-/// browser able to resubmit it, and resubmitting a login is a wasted attempt against the
-/// visitor's own rate limit.
+/// Redirects on every outcome, so a reload cannot resubmit the attempt.
 #[cfg(feature = "password")]
 #[worker::send]
 async fn login_submit(
@@ -243,8 +226,7 @@ async fn login_submit(
             "CSRF_KEY is not configured",
         );
     };
-    // The token is bound to the anonymous cookie; without it there is nothing to check against,
-    // which is itself a failure rather than a reason to skip the check.
+    // No anonymous cookie means nothing to bind against, which is a failure not a skip.
     let anon = cookie::get(cookie_header(&headers), cookie::ANON).unwrap_or_default();
     if key.verify(&token, &anon, now).is_err() {
         return redirect_to_login("expired", next.as_deref());
@@ -327,10 +309,7 @@ fn cookie_header(headers: &axum::http::HeaderMap) -> Option<&str> {
     headers.get(header::COOKIE).and_then(|v| v.to_str().ok())
 }
 
-/// The address rate limiting counts against.
-///
-/// `CF-Connecting-IP` is set by Cloudflare's edge and cannot be spoofed by the client — unlike
-/// `X-Forwarded-For`, which is why that one is not consulted.
+/// `CF-Connecting-IP` is set by the edge and unspoofable; `X-Forwarded-For` is not consulted.
 fn client_address(headers: &axum::http::HeaderMap) -> String {
     headers
         .get("cf-connecting-ip")
@@ -369,8 +348,7 @@ fn external_auth() -> Response {
         .into_response()
 }
 
-/// Sign out. `POST` only: a `GET /logout` is a one-pixel image away from being a denial of
-/// service on every reader whose browser prefetches it.
+/// `POST` only, so a prefetched image cannot sign a reader out.
 #[worker::send]
 async fn logout(State(env): State<Env>, headers: axum::http::HeaderMap) -> Response {
     if let (Ok(db), Some(raw)) = (
@@ -378,9 +356,7 @@ async fn logout(State(env): State<Env>, headers: axum::http::HeaderMap) -> Respo
         cookie::get(cookie_header(&headers), cookie::SESSION),
     ) {
         if let Some(token) = SessionToken::parse(&raw) {
-            // A failure here still clears the cookie: the visitor asked to be signed out, and
-            // leaving them holding a live cookie because a write failed is the wrong direction
-            // to err in.
+            // Still clear the cookie, so a failed write cannot leave a live session behind.
             let _ = D1Store::new(db).delete_session(&token.hash()).await;
         }
     }
@@ -394,24 +370,14 @@ async fn logout(State(env): State<Env>, headers: axum::http::HeaderMap) -> Respo
         .into_response()
 }
 
-/// Runs the shared conformance suite against D1 and reports it as plain text.
-///
-/// The other half of `crates/store-sqlite/tests/conformance.rs`: the same
-/// [`notespace_core::conformance::run_all`], the same checks, a different adapter. A `#[test]`
-/// cannot reach D1 — there is no Worker runtime in `cargo test` — so the suite is exposed as a
-/// route and run against a deployed instance instead.
-///
-/// Takes the thread to exercise as `?thread=<public id>` rather than assuming an id the seed
-/// generator picked: a fixture constant duplicated across crates is the drift this suite is
-/// meant to catch.
-///
-/// Reads only that thread, and writes nothing.
+/// Runs the shared conformance suite against D1 and reports it as plain text. Exposed as a
+/// route because `cargo test` has no Worker runtime to reach D1 from. Reads only, writes nothing.
 #[worker::send]
 async fn conformance(state: State<Env>, q: Query<ConformanceQuery>) -> Response {
     run_conformance(state, q, false).await
 }
 
-/// The full suite, write checks included. `POST` because it appends posts to the thread.
+/// The full suite, write checks included; `POST` because it appends posts.
 #[worker::send]
 async fn conformance_with_writes(state: State<Env>, q: Query<ConformanceQuery>) -> Response {
     run_conformance(state, q, true).await
@@ -438,14 +404,12 @@ async fn run_conformance(
         Ok(t) => t,
         Err(e) => return error(StatusCode::BAD_REQUEST, &format!("bad thread id: {e}")),
     };
-    // A well-formed id that is not in the database. Derived from the thread's own timestamp so
-    // it stays plausible, with randomness no generated id would produce.
+    // Well-formed but absent: the thread's own timestamp, with randomness nothing generates.
     let Ok(absent) = PublicId::new(thread.timestamp_ms(), 0xDEAD_BEEF) else {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "fixture id out of range");
     };
 
-    // Post count and a real post path come from the database rather than from a constant: a
-    // fixture duplicated across two crates is the drift this suite exists to catch.
+    // From the database, not a constant: a duplicated fixture is the drift this suite catches.
     let probe = match store.thread_page(&thread, &Page::first(4)).await {
         Ok(p) => p,
         Err(e) => {
@@ -487,7 +451,7 @@ async fn run_conformance(
         known_post_path: known.path.clone(),
         absent,
         writable,
-        // A user that certainly exists: whoever started the thread.
+        // A user that certainly exists.
         author_id: probe.thread.author_id,
     };
     let checks = run_all(&store, &fixture).await;
@@ -521,10 +485,7 @@ async fn run_conformance(
         .into_response()
 }
 
-/// Storage access goes through [`Store`], never through a concrete adapter.
-///
-/// These two functions make that structural: they are generic, so anything they can do the
-/// native adapter can do too.
+/// Generic over [`Store`], so anything the handler does the native adapter can do too.
 async fn fetch_page<S: Store>(
     store: &S,
     thread: &PublicId,
@@ -537,14 +498,8 @@ async fn locate<S: Store>(store: &S, post: &PublicId) -> StoreResult<notespace_c
     store.locate_post(post, PAGE_SIZE).await
 }
 
-/// A durable permalink to a single post.
-///
-/// Resolves where the post lives *now* and redirects to that thread page, anchored at the post.
-/// The indirection is the point: splitting or merging threads moves a post between threads, and
-/// a link that baked in the thread id would break. This one does not.
-///
-/// 302 rather than 301 -- the target legitimately changes when a post is moved, so this must
-/// not be cached permanently by browsers.
+/// A durable permalink: resolves where the post lives now, so splitting or merging a thread
+/// cannot break the link. 302 rather than 301, because the target moves with the post.
 #[worker::send]
 async fn post_permalink(State(env): State<Env>, UrlPath(id): UrlPath<String>) -> Response {
     let post_id = match PublicId::parse(&id) {
@@ -563,9 +518,7 @@ async fn post_permalink(State(env): State<Env>, UrlPath(id): UrlPath<String>) ->
     let store = D1Store::new(db);
     match locate::<D1Store>(&store, &post_id).await {
         Ok(loc) => {
-            // The cursor is what makes the anchor real. Without it a post past the first page
-            // sends the reader to the top of the thread, scrolling to an id that is not in the
-            // document -- which looks exactly like the post having failed to save.
+            // Without the cursor a post past the first page anchors to an id not in the document.
             let target = match &loc.cursor {
                 Some(cursor) => format!(
                     "/t/{}?after={}#p{post_id}",
@@ -575,8 +528,6 @@ async fn post_permalink(State(env): State<Env>, UrlPath(id): UrlPath<String>) ->
                 None => format!("/t/{}#p{post_id}", loc.thread),
             };
             let mut resp = (StatusCode::FOUND, [(header::LOCATION, target)]).into_response();
-            // Three statements, and a redirect that reported none would understate the read
-            // path by the two the cursor lookup costs.
             if let Ok(v) = store.last_stats().server_timing().parse() {
                 resp.headers_mut()
                     .insert(header::HeaderName::from_static("server-timing"), v);
@@ -588,8 +539,7 @@ async fn post_permalink(State(env): State<Env>, UrlPath(id): UrlPath<String>) ->
     }
 }
 
-/// `#[worker::send]` wraps the future so axum's `Send` bound is satisfied. Workers are
-/// single-threaded, so this is sound here and is the pattern workers-rs prescribes.
+/// `#[worker::send]` satisfies axum's `Send` bound; Workers are single-threaded, so it is sound.
 #[worker::send]
 async fn render_thread(
     State(env): State<Env>,
@@ -598,16 +548,12 @@ async fn render_thread(
     slug: Option<String>,
     Query(q): Query<PageQuery>,
 ) -> Response {
-    // Parsing is forgiving in the ways people actually mistype: either case, `I`/`l` for `1`,
-    // `O` for `0`, and grouping hyphens (see `notespace_core::id`). It is strict otherwise.
     let thread_id = match PublicId::parse(&id) {
         Ok(p) => p,
         Err(e) => return error(StatusCode::BAD_REQUEST, &format!("bad thread id: {e}")),
     };
 
-    // Redirect any accepted-but-non-canonical spelling to the canonical lowercase form, so a
-    // thread has exactly one cacheable URL instead of one per way of typing it. Without this,
-    // `/t/ABCD...` and `/t/abcd...` would occupy separate cache entries for identical bytes.
+    // Canonicalize the spelling, so a thread has one cacheable URL rather than one per variant.
     let canonical = thread_id.encode();
     if id != canonical {
         let location = match &slug {
@@ -621,8 +567,7 @@ async fn render_thread(
             .into_response();
     }
 
-    // A malformed cursor is a client error, not a reason to scan from the top: silently
-    // resetting to page 1 would turn a typo into a full-thread read.
+    // Rejecting beats resetting to page 1, which would turn a typo into a full-thread read.
     let after = match q.after.as_deref().filter(|s| !s.is_empty()) {
         Some(raw) => match TreePath::parse(raw) {
             Ok(p) => Some(p),
@@ -643,16 +588,10 @@ async fn render_thread(
 
     let store = D1Store::new(db);
 
-    // One row, to learn the thread's bake version. Every write bumps it, so a key built from it
-    // is invalidated by the write itself: a reply shows up on the very next request instead of
-    // whenever a TTL happens to lapse. That one row is what buys the freshness -- the
-    // alternative pays the page's full 404-row scan every time a TTL turns over.
-    //
-    // A failed or absent version read falls through uncached rather than failing the page; the
-    // query below is what decides whether the thread exists.
+    // Every write bumps the version, so a key built from it is invalidated by the write itself.
+    // A failed read falls through uncached; the query below decides whether the thread exists.
     let version = store.thread_version(&thread_id).await.ok().flatten();
-    // Counted even on a hit: this row is the standing cost of version-keyed caching, and a
-    // Server-Timing that omitted it would understate D1 usage by one row per pageview.
+    // Counted even on a hit: the version row is the standing cost of the cache key.
     let lookup = store.last_stats().server_timing();
     let key = version.and_then(|v| {
         headers
@@ -676,14 +615,10 @@ async fn render_thread(
     match fetch_page::<D1Store>(&store, &thread_id, &page).await {
         Ok(page) => {
             let html = notespace_render::thread_page(&page).into_string();
-            // What D1 actually reported for this request. Empty-ish locally, real in
-            // production -- see QueryStats.
             let stats = store.last_stats();
             let timing = format!("{}, cache;desc=\"miss\"", stats.server_timing());
 
-            // Store before responding. The page is user-agnostic, so one render serves every
-            // reader for the TTL; without this the `s-maxage` header above is inert, because
-            // Cloudflare does not cache a Worker's own response.
+            // Cloudflare does not cache a Worker's own response, so `s-maxage` is inert without this.
             if let Some(k) = &key {
                 cache::put(k, &html, &timing).await;
             }
@@ -710,8 +645,7 @@ async fn render_thread(
 
 fn error(code: StatusCode, msg: &str) -> Response {
     worker::console_log!("notespace error {}: {}", code.as_u16(), msg);
-    // The message goes to the log, not the body: internal errors must not leak schema
-    // details to the public.
+    // The message goes to the log, not the body, so errors cannot leak schema details.
     let public = if code == StatusCode::BAD_REQUEST {
         msg
     } else {
@@ -737,12 +671,7 @@ struct ReplyQuery {
     error: Option<String>,
 }
 
-/// Resolve the visitor's session to a user.
-///
-/// `None` covers every way of not being signed in, deliberately without distinguishing them:
-/// no cookie, an unparseable one, an expired session, a deleted account.
-///
-/// **Budget: 1 statement.**
+/// `None` covers every way of not being signed in, without distinguishing them.
 async fn current_user(
     store: &D1Store,
     headers: &axum::http::HeaderMap,
@@ -771,10 +700,8 @@ fn urlencoding(s: &str) -> String {
     form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
-/// The reply form, on its own uncached page.
-///
-/// Not part of the thread page: that one is baked and shared byte-for-byte between readers, so
-/// a per-visitor CSRF token cannot live in it.
+/// On its own uncached page: the baked thread is shared byte-for-byte, so a per-visitor CSRF
+/// token cannot live in it.
 #[worker::send]
 async fn reply_form(
     State(env): State<Env>,
@@ -852,10 +779,7 @@ fn parse_reply_error(code: String) -> Option<notespace_render::auth::ReplyError>
     }
 }
 
-/// Accept a reply.
-///
-/// Redirects on every outcome: a POST that renders leaves the browser able to resubmit it, and
-/// resubmitting a reply posts it twice.
+/// Redirects on every outcome, so a reload cannot post the reply twice.
 #[worker::send]
 async fn reply_submit(
     State(env): State<Env>,
@@ -900,7 +824,7 @@ async fn reply_submit(
         }
     }
 
-    // CSRF before anything that costs: the token proves the request came from our own form.
+    // CSRF before anything that costs.
     let Some(key) = csrf_key(&env) else {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -921,8 +845,7 @@ async fn reply_submit(
         },
     };
 
-    // Render before storing: the read path never renders, so an unrenderable body must fail
-    // here rather than at every future pageview.
+    // The read path never renders, so an unrenderable body has to fail here.
     let html = notespace_core::model::SanitizedHtml::assert_sanitized(
         notespace_render::markdown_to_html(&form_body),
     );
@@ -980,10 +903,7 @@ struct RegisterQuery {
     error: Option<String>,
 }
 
-/// The signup form.
-///
-/// Like the login form, the CSRF token binds to a short-lived anonymous cookie: a visitor here
-/// has no session to bind to yet.
+/// The CSRF token binds to a short-lived anonymous cookie, since there is no session yet.
 #[cfg(feature = "password")]
 #[worker::send]
 async fn register_form(
@@ -1094,8 +1014,7 @@ async fn register_submit(
         }
     }
 
-    // The name is echoed back on rejection so it does not have to be retyped. The password
-    // never is.
+    // The name is echoed back on rejection; the password never is.
     let back = |e: &str| -> Response {
         (
             StatusCode::SEE_OTHER,
@@ -1196,11 +1115,7 @@ async fn register_submit() -> Response {
 /// Threads shown on the index.
 const INDEX_LIMIT: u32 = 50;
 
-/// The landing page.
-///
-/// Uncached for now, deliberately: every reply bumps a thread and reorders this list, so a
-/// version key would change on nearly every write and buy little. One statement and fifty rows
-/// is cheap enough to serve fresh.
+/// Uncached: every reply reorders this list, so a version key would change on nearly every write.
 #[worker::send]
 async fn index(State(env): State<Env>) -> Response {
     let Ok(db) = env.d1(DB_BINDING) else {

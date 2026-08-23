@@ -1,27 +1,14 @@
 //! Write-time markdown rendering and sanitization.
 //!
-//! # Threat model
-//!
-//! Client-generated HTML persisted and served to other users is stored XSS. The client is the
-//! attacker, so sanitizing happens server-side, always.
-//!
-//! Two independent things are true here, and both matter:
-//!
-//! 1. `pulldown-cmark` passes raw HTML in the source through to its output verbatim. It is a
-//!    markdown parser, not a sanitizer, and must never be trusted as one.
-//! 2. `ammonia` is therefore the sole authority on what reaches the database. Everything
-//!    goes through [`sanitize`]; nothing bypasses it.
-//!
-//! The allowlist below is deliberately tight. It is easier to add a tag on request than to
-//! discover which of forty tags was the one that let script through.
+//! `pulldown-cmark` passes raw HTML in the source straight through — it is a parser, not a
+//! sanitizer — so `ammonia` is the sole authority on what reaches the database, and everything
+//! goes through [`sanitize`]. The allowlist is tight because adding a tag on request is easier
+//! than finding which of forty let script through.
 
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
-/// Build the sanitizer allowlist.
-///
-/// Rebuilt once per isolate and cached: `ammonia::Builder` construction allocates several
-/// hash sets, and doing that per post would waste a measurable slice of the CPU budget.
+/// Cached per isolate: `ammonia::Builder` allocates several hash sets to construct.
 fn sanitizer() -> &'static ammonia::Builder<'static> {
     static SANITIZER: OnceLock<ammonia::Builder<'static>> = OnceLock::new();
     SANITIZER.get_or_init(|| {
@@ -61,8 +48,7 @@ fn sanitizer() -> &'static ammonia::Builder<'static> {
             "img",
         ]))
         .link_rel(Some("nofollow ugc noopener noreferrer"))
-        // Only these schemes may appear in href/src. `javascript:` and `data:` are absent
-        // by construction, which is the point.
+        // `javascript:` and `data:` are absent by construction.
         .url_schemes(HashSet::from(["http", "https", "mailto"]));
         b.tag_attributes(std::collections::HashMap::from([
             ("a", HashSet::from(["href", "title"])),
@@ -77,9 +63,7 @@ fn sanitizer() -> &'static ammonia::Builder<'static> {
     })
 }
 
-/// Sanitize a fragment of HTML against the allowlist.
-///
-/// This is the only path by which HTML may reach storage.
+/// The only path by which HTML may reach storage.
 pub fn sanitize(html: &str) -> String {
     sanitizer().clean(html).to_string()
 }
@@ -91,18 +75,14 @@ fn options() -> pulldown_cmark::Options {
     o.insert(Options::ENABLE_TABLES);
     o.insert(Options::ENABLE_FOOTNOTES);
     o.insert(Options::ENABLE_TASKLISTS);
-    // Deliberately NOT enabled: ENABLE_SMART_PUNCTUATION (mangles code discussion),
-    // ENABLE_HEADING_ATTRIBUTES (lets authors inject id/class into the page).
+    // Not enabled: SMART_PUNCTUATION mangles code discussion, HEADING_ATTRIBUTES injects ids.
     o
 }
 
-/// Render markdown to sanitized HTML. Runs once per post, at write time.
-///
-/// The output is safe to emit verbatim into a page; that is the whole contract.
+/// Runs once per post at write time; the output is safe to emit verbatim.
 pub fn markdown_to_html(md: &str) -> String {
     let parser = pulldown_cmark::Parser::new_ext(md, options());
-    // Markdown expands to roughly its own size in HTML; pre-sizing avoids a few reallocs
-    // on the hot write path.
+    // Markdown expands to roughly its own size in HTML.
     let mut raw = String::with_capacity(md.len() + md.len() / 2);
     pulldown_cmark::html::push_html(&mut raw, parser);
     sanitize(&raw)
@@ -194,7 +174,7 @@ mod tests {
 
     #[test]
     fn sanitize_is_idempotent() {
-        // Re-sanitizing stored HTML must not corrupt it; edits re-render and re-store.
+        // Edits re-render and re-store, so sanitizing twice has to be a no-op.
         let once = markdown_to_html("[a](https://example.com) **b** `c`");
         let twice = sanitize(&once);
         assert_eq!(once, twice);
@@ -215,7 +195,7 @@ mod tests {
 
     #[test]
     fn does_not_panic_on_deeply_nested_input() {
-        // Guards against stack exhaustion, which on wasm is an unrecoverable trap.
+        // Stack exhaustion on wasm is an unrecoverable trap.
         let md = "> ".repeat(500) + "deep";
         let _ = markdown_to_html(&md);
         let md = "*".repeat(2000);

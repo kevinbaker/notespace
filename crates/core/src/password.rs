@@ -1,11 +1,7 @@
 //! Argon2id password hashing.
 //!
-//! Hashes are PHC strings — `$argon2id$v=19$m=19456,t=2,p=1$salt$hash` — so algorithm and cost
-//! travel with the hash and [`needs_rehash`] can upgrade an account on its next login, the one
-//! moment the plaintext is in hand.
-//!
-//! [`Scheme`] selects where the memory-hard work happens; [`PepperSet`] holds the server-side
-//! secrets mixed into every hash.
+//! Hashes are PHC strings — `$argon2id$v=19$m=19456,t=2,p=1$salt$hash` — so cost travels with
+//! the hash and [`needs_rehash`] can upgrade an account on its next login.
 
 use core::fmt;
 use std::collections::BTreeMap;
@@ -13,17 +9,13 @@ use std::collections::BTreeMap;
 use argon2::{Algorithm, Argon2, Version};
 use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt, SaltString};
 
-/// A server-side secret mixed into every hash — Argon2's own `K` parameter.
-///
-/// Held outside the database, so a leaked database does not contain it. Protects nothing against
-/// a full server compromise, where both leak together, and is not a substitute for KDF cost.
-///
-/// Distinct from the salt, which is per-user and stored *with* the hash.
+/// A server-side secret mixed into every hash — Argon2's own `K` parameter. Held outside the
+/// database, unlike the salt, so a leaked database does not contain it.
 #[derive(Clone)]
 pub struct Pepper(Vec<u8>);
 
 impl Pepper {
-    /// Minimum 32 bytes. A short pepper is guessable, and a guessed pepper is no pepper.
+    /// Minimum 32 bytes.
     pub fn new(secret: &[u8]) -> Result<Self, PasswordError> {
         if secret.len() < 32 {
             return Err(PasswordError::WeakPepper(secret.len()));
@@ -39,13 +31,8 @@ impl fmt::Debug for Pepper {
     }
 }
 
-/// Every pepper a deployment has ever used, keyed by id.
-///
-/// Each stored hash records the id that made it, so verification looks up exactly one pepper and
-/// costs the same however many are held.
-///
-/// Storage format: `<id>$<phc>`, e.g. `3$argon2id$v=19$m=4096,t=1,p=1$…`. An empty prefix means
-/// unpeppered — unambiguous, because a PHC string always begins with `$`.
+/// Every pepper a deployment has ever used, keyed by id. Each hash records the id that made it,
+/// stored as `<id>$<phc>`; an empty prefix means unpeppered, since PHC always begins with `$`.
 #[derive(Debug, Clone, Default)]
 pub struct PepperSet {
     peppers: BTreeMap<u32, Pepper>,
@@ -59,10 +46,8 @@ impl PepperSet {
         PepperSet::default()
     }
 
-    /// Add a pepper. The highest id added with `make_current` wins for new hashes.
-    ///
-    /// Ids must be stable across deploys: they are recorded in every hash written under them.
-    /// Reusing an id for a different secret strands every account that used the old one.
+    /// Ids are recorded in every hash written under them, so reusing one for a different secret
+    /// strands every account that used the old one.
     pub fn insert(&mut self, id: u32, pepper: Pepper, make_current: bool) -> &mut Self {
         self.peppers.insert(id, pepper);
         if make_current {
@@ -71,12 +56,8 @@ impl PepperSet {
         self
     }
 
-    /// Parse the deployment's whole pepper history from one string.
-    ///
-    /// Format: `1=<secret>;2=<secret>;…`. Whitespace around entries is ignored, a trailing `;`
-    /// is allowed, and **the highest id is the current one**, so rotating means appending.
-    ///
-    /// Every failure is fatal: a partly-loaded set must never be returned.
+    /// `1=<secret>;2=<secret>;…`, highest id current, so rotating means appending. Every failure
+    /// is fatal, because a partly-loaded set authenticates some accounts and rejects others.
     pub fn parse(spec: &str) -> Result<PepperSet, PasswordError> {
         let mut set = PepperSet::none();
         let mut highest: Option<u32> = None;
@@ -245,44 +226,32 @@ impl Params {
         p: 1,
     };
 
-    /// The strongest setting that fits the 10 ms free-plan budget at p95.
-    ///
-    /// **Below OWASP by ~4.7x in memory.** Requires a [`Pepper`]; see
-    /// [`Scheme::is_below_recommended`], which a deployment should surface at startup.
+    /// The strongest setting that fits the 10 ms free-plan budget at p95; ~4.7x below OWASP in
+    /// memory, which is why a [`Pepper`] is mandatory.
     pub const CONSTRAINED: Params = Params {
         m_kib: 4096,
         t: 1,
         p: 1,
     };
 
-    /// Server-side cost applied to an *already* memory-hard client key, under
-    /// [`Scheme::CLIENT_ARGON`].
-    ///
-    /// Tiny on purpose: the input is already 32 bytes of output from an OWASP-parameter
-    /// Argon2id run, so grinding it slowly buys nothing. This step exists only to apply the
-    /// [`Pepper`], so a stolen database does not yield replayable keys.
+    /// Applied to an already memory-hard client key, so it exists only to fold in the
+    /// [`Pepper`] and stop a stolen database yielding replayable keys.
     pub const HANDOFF: Params = Params {
         m_kib: 1024,
         t: 1,
         p: 1,
     };
 
-    /// Whether these parameters are weaker than OWASP's minimum.
-    ///
-    /// Read this on the *client* half of [`Scheme::CLIENT_ARGON`], never the server half:
-    /// [`Params::HANDOFF`] is below OWASP by design and says nothing about the work actually
-    /// done. [`Scheme::is_below_recommended`] applies it to the right half.
+    /// Read this on the client half of [`Scheme::CLIENT_ARGON`], never the server half;
+    /// [`Scheme::is_below_recommended`] picks the right one.
     pub const fn is_below_recommended(&self) -> bool {
         self.m_kib < Params::OWASP.m_kib || self.t < Params::OWASP.t
     }
 }
 
-/// Where the memory-hard work happens.
-///
-/// Server-side and client-side records are **not interchangeable**, and are kept apart twice
-/// over: stored client records carry a `c` marker that [`verify`] refuses to read across, and
-/// the hashed input is domain-separated ([`CLIENT_KEY_DOMAIN`]) so digests cannot collide even
-/// with a forged marker. Both failures are closed — a mismatch rejects the login.
+/// Where the memory-hard work happens. Records are kept apart twice over: a `c` marker
+/// [`verify`] refuses to read across, and domain separation so a forged marker still cannot
+/// make the digests collide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scheme {
     /// The server receives the password and does the whole KDF.
@@ -299,11 +268,8 @@ impl Scheme {
     /// Everything server-side, at the strongest setting a free Worker can afford. Below OWASP.
     pub const CONSTRAINED: Scheme = Scheme::Server(Params::CONSTRAINED);
 
-    /// OWASP-grade Argon2id in the browser; the server only peppers the result.
-    ///
-    /// Requires a client that performs the derivation and posts
-    /// [`CLIENT_KEY_BYTES`] bytes as hex. A plaintext password is rejected, not accepted
-    /// weakly. No browser client ships yet.
+    /// OWASP-grade Argon2id in the browser; the server only peppers the result. No browser
+    /// client ships yet.
     pub const CLIENT_ARGON: Scheme = Scheme::Client {
         client: Params::OWASP,
         server: Params::HANDOFF,
@@ -355,15 +321,11 @@ impl Default for Scheme {
 /// Bytes of client-derived key [`Scheme::CLIENT_ARGON`] expects, hex-encoded on the wire.
 pub const CLIENT_KEY_BYTES: usize = 32;
 
-/// Domain prefix mixed into a client key before the server hashes it, so a client-scheme digest
-/// can never equal a server-scheme one over the same bytes.
+/// Mixed into a client key so a client-scheme digest cannot equal a server-scheme one.
 pub const CLIENT_KEY_DOMAIN: &[u8] = b"notespace/client-argon/v1\0";
 
-/// The bytes fed to Argon2id for `secret` under `scheme`, after checking the shape is right.
-///
-/// Under [`Scheme::Server`] that is the password, length-checked. Under [`Scheme::Client`] it is
-/// the domain prefix plus the decoded key; `MIN_PASSWORD_CHARS` does *not* apply there, because
-/// the server never sees the password. Enforcing it becomes the client's responsibility.
+/// The bytes fed to Argon2id, after checking the shape. `MIN_PASSWORD_CHARS` does not apply
+/// under [`Scheme::Client`], where the server never sees the password.
 fn kdf_input(secret: &str, scheme: Scheme) -> Result<Vec<u8>, PasswordError> {
     match scheme {
         Scheme::Server(_) => {
@@ -381,8 +343,6 @@ fn kdf_input(secret: &str, scheme: Scheme) -> Result<Vec<u8>, PasswordError> {
     }
 }
 
-/// Decode a hex client key, rejecting anything that is not exactly [`CLIENT_KEY_BYTES`].
-///
 /// A plaintext password reaching a [`Scheme::Client`] deployment lands here and is rejected.
 fn decode_client_key(hex: &str) -> Result<Vec<u8>, PasswordError> {
     let b = hex.as_bytes();
@@ -427,8 +387,7 @@ pub enum PasswordError {
     BadSalt(String),
     #[error("hashing failed: {0}")]
     Hash(String),
-    /// The hash names a pepper this deployment does not hold. Not a failed login: the account
-    /// cannot be verified at all and needs a reset.
+    /// Names a pepper this deployment does not hold; the account needs a reset, not a retry.
     #[error("hash was made with pepper {0}, which is not configured")]
     UnknownPepper(u32),
     #[error("PASSWORD_PEPPER is malformed: {0}")]
@@ -446,10 +405,8 @@ pub enum PasswordError {
     },
 }
 
-/// Hash a secret with the set's current pepper.
-///
-/// `salt_b64` must be at least 16 bytes of CSPRNG output, base64 unpadded. The salt is a
-/// parameter because `core` has no RNG on wasm.
+/// `salt_b64` is at least 16 bytes of CSPRNG output, base64 unpadded, passed in because `core`
+/// has no RNG.
 pub fn hash(
     secret: &str,
     salt_b64: &str,
@@ -482,14 +439,8 @@ pub fn encode_salt(bytes: &[u8]) -> Result<String, PasswordError> {
         .map_err(|e| PasswordError::BadSalt(e.to_string()))
 }
 
-/// Verify a secret against a stored credential.
-///
-/// Returns [`Verified::YesRehash`] when the secret is right but the stored hash is stale.
-/// `Err` means the *stored* hash is unusable, which is a bug rather than a failed login; a
-/// wrong password is [`Verified::No`].
-///
-/// The work factor is read from the hash, so an account written under old parameters still
-/// verifies after the defaults change.
+/// `Err` means the stored hash is unusable, which is a bug; a wrong password is
+/// [`Verified::No`]. The work factor is read from the hash, so old accounts still verify.
 pub fn verify(
     secret: &str,
     stored: &str,
@@ -497,7 +448,7 @@ pub fn verify(
     peppers: &PepperSet,
 ) -> Result<Verified, PasswordError> {
     let rec = split_stored(stored)?;
-    // Never read a record across schemes: name the mismatch rather than absorbing it.
+    // Never read a record across schemes.
     if rec.client != want.is_client() {
         return Err(PasswordError::SchemeMismatch {
             stored_client: rec.client,
@@ -529,20 +480,17 @@ pub fn verify(
     }
 }
 
-/// Whether a stored hash was made with weaker parameters than `want`.
-///
 /// Does not consider the pepper; [`verify`] folds that in.
 pub fn needs_rehash(stored: &str, want: Scheme) -> bool {
     let Ok(rec) = split_stored(stored) else {
         return true;
     };
     if rec.client != want.is_client() {
-        // Not a rehash: no input available here can produce the other scheme's record.
+        // No input available here can produce the other scheme's record.
         return false;
     }
     let want = want.server_params();
     let Ok(parsed) = PasswordHash::new(rec.phc) else {
-        // Unreadable: rewriting it is the only way it becomes readable.
         return true;
     };
     if parsed.algorithm.as_str() != "argon2id" {
@@ -558,7 +506,7 @@ pub fn needs_rehash(stored: &str, want: Scheme) -> bool {
 mod tests {
     use super::*;
 
-    /// Cheap server-side scheme: these tests are about pepper and format handling, not cost.
+    /// Cheap, because these tests are about pepper and format handling, not cost.
     const FAST: Scheme = Scheme::Server(Params {
         m_kib: 64,
         t: 1,
@@ -571,7 +519,6 @@ mod tests {
         Pepper::new(&[b; 32]).unwrap()
     }
 
-    /// Every pepper ever used, which is the point: none has to be retired on a deadline.
     fn many() -> PepperSet {
         let mut s = PepperSet::none();
         for id in 1..=8u32 {
@@ -591,7 +538,6 @@ mod tests {
         );
     }
 
-    /// The whole point of a pepper: the stored hash is useless without the out-of-band secret.
     #[test]
     fn a_peppered_hash_does_not_verify_without_the_pepper() {
         let set = PepperSet::single(1, pepper(1));
@@ -620,7 +566,6 @@ mod tests {
         assert_eq!(split_stored(&plain).unwrap().pepper_id, None);
     }
 
-    /// Holding many peppers must not cost anything at verify time — one lookup, one Argon2 run.
     #[test]
     fn any_pepper_in_the_set_verifies_regardless_of_how_many_there_are() {
         let set = many();
@@ -639,12 +584,10 @@ mod tests {
         }
     }
 
-    /// A wrong password must not walk the whole set — that is the CPU budget blowing up.
     #[test]
     fn a_wrong_password_costs_one_attempt_not_one_per_pepper() {
         let set = many();
         let h = hash(PW, SALT, FAST, &PepperSet::single(3, pepper(3))).unwrap();
-        // Only pepper 3 is consulted; the other seven are never touched.
         assert_eq!(
             verify("wrong password here", &h, FAST, &set),
             Ok(Verified::No)
@@ -652,7 +595,6 @@ mod tests {
         assert_eq!(split_stored(&h).unwrap().pepper_id, Some(3));
     }
 
-    /// Reusing an id for a different secret strands accounts, so it must not silently pass.
     #[test]
     fn a_hash_naming_an_absent_pepper_is_an_error_not_a_failed_login() {
         let h = hash(PW, SALT, FAST, &PepperSet::single(42, pepper(42))).unwrap();
@@ -780,8 +722,6 @@ mod tests {
         assert_eq!(verify(PW, &h, FAST, &b), Ok(Verified::Yes));
     }
 
-    /// Every one of these is fatal on purpose: a partly-correct pepper set authenticates some
-    /// accounts and permanently rejects others.
     #[test]
     fn a_malformed_pepper_list_is_refused_rather_than_partly_loaded() {
         for (spec, why) in [
@@ -807,7 +747,6 @@ mod tests {
         }
     }
 
-    /// Rotation is appending an entry. Nothing already stored changes meaning.
     #[test]
     fn appending_an_entry_rotates_without_stranding_anything() {
         let before = PepperSet::parse(&format!("1={S1}")).unwrap();
@@ -841,7 +780,7 @@ mod client_scheme_tests {
     /// 32 bytes, as a client would send after running Argon2id.
     const KEY: &str = "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0";
 
-    /// Server params only, so the tests stay fast; the scheme logic is what is under test.
+    /// Server params only, so the tests stay fast.
     const CHEAP: Params = Params {
         m_kib: 64,
         t: 1,
@@ -869,9 +808,6 @@ mod client_scheme_tests {
         assert!(s.starts_with("1$"), "server record unmarked: {s}");
     }
 
-    /// The property the whole `Scheme` split exists for. Without it, flipping a deployment back
-    /// to `constrained` would start fast-hashing plaintext passwords into records that look
-    /// exactly like the sound ones.
     #[test]
     fn a_password_cannot_be_verified_against_a_client_record() {
         let p = peppers();
@@ -907,8 +843,6 @@ mod client_scheme_tests {
         );
     }
 
-    /// A plaintext password posted to a client-scheme deployment must fail closed, not be
-    /// accepted and stored under a 1 MiB hash.
     #[test]
     fn a_plaintext_password_is_refused_by_a_client_scheme() {
         let p = peppers();
@@ -922,8 +856,6 @@ mod client_scheme_tests {
         ));
     }
 
-    /// Domain separation, checked independently of the marker: even stripping the `c` must not
-    /// let the two schemes collide over the same bytes.
     #[test]
     fn the_two_schemes_do_not_collide_over_identical_input() {
         let p = peppers();
@@ -938,8 +870,6 @@ mod client_scheme_tests {
         );
     }
 
-    /// `MIN_PASSWORD_CHARS` is meaningless server-side here: the server sees a key, never the
-    /// password. This pins that the check is skipped deliberately rather than by accident.
     #[test]
     fn client_keys_are_not_subject_to_the_password_length_rule() {
         let p = peppers();
@@ -955,7 +885,6 @@ mod client_scheme_tests {
         assert!(!Scheme::CLIENT_ARGON.is_below_recommended());
         assert!(Scheme::CONSTRAINED.is_below_recommended());
         assert!(!Scheme::OWASP.is_below_recommended());
-        // The server half being cheap is the point, and must not be read as the work factor.
         assert!(Scheme::CLIENT_ARGON.server_params().is_below_recommended());
     }
 

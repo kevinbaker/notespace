@@ -1,21 +1,10 @@
-//! Native [`Store`] over plain SQLite.
+//! Native [`Store`] over plain SQLite: the second implementation of the seam, which is what
+//! makes the dual-target promise checkable. It also puts the read path inside an ordinary
+//! `cargo test`, where the D1 adapter needs wasm and wrangler.
 //!
-//! The second implementation of the seam, and the reason the first one can be trusted. A trait
-//! with one implementation is an interface, not a seam: nothing stops it drifting toward the
-//! quirks of the only thing behind it. This adapter and
-//! [`notespace_core::conformance`] together are what make the dual-target promise checkable
-//! rather than merely stated.
-//!
-//! It also makes the read path testable in an ordinary `cargo test`. Exercising the D1 adapter
-//! means building wasm and booting wrangler; this runs in milliseconds against an in-memory
-//! database.
-//!
-//! The SQL is not written here — it is [`notespace_core::sql`], byte for byte the same
-//! statements the D1 adapter sends. What differs is binding and row decoding.
-//!
-//! Blocking calls inside `async fn` are deliberate. `rusqlite` is synchronous, and against a
-//! local file or `:memory:` there is nothing to await. The `Store` trait is `?Send` because
-//! wasm futures are not `Send`, which suits a synchronous body fine.
+//! SQL comes from [`notespace_core::sql`], byte for byte what D1 gets; binding and row decoding
+//! are what differ. The blocking calls inside `async fn` are fine: `rusqlite` is synchronous and
+//! `Store` is `?Send` anyway, because wasm futures are not `Send`.
 
 use notespace_core::id::PublicId;
 use notespace_core::model::*;
@@ -89,10 +78,7 @@ fn thread_from_row(row: &Row<'_>) -> rusqlite::Result<(Space, Thread)> {
     Ok((space, thread))
 }
 
-/// Unknown enum values fall back to the type's `Default` rather than failing the request.
-///
-/// A row written by a newer version with a state this build does not know is a reason to render
-/// conservatively, not to 500 the page. Matches what the D1 adapter does.
+/// Unknown values fall back to `Default`, as in the D1 adapter, rather than 500ing the page.
 fn parse_enum<T: Default + core::str::FromStr>(s: &str) -> T {
     s.parse().unwrap_or_default()
 }
@@ -263,8 +249,7 @@ impl Store for SqliteStore {
         );
         match inserted {
             Ok(_) => {}
-            // Only a UNIQUE violation means "somebody else took this"; a NOT NULL or foreign
-            // key failure is a bug in the caller and must not be retried forever as a race.
+            // Only a UNIQUE violation is a race; the rest are caller bugs, not things to retry.
             Err(rusqlite::Error::SqliteFailure(e, msg))
                 if e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
                     || e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY =>
@@ -403,8 +388,7 @@ impl Store for SqliteStore {
             rusqlite::params![name, created_at, password_hash],
         ) {
             Ok(_) => Ok(self.conn.last_insert_rowid()),
-            // The name is taken. Registration checks first, but the check and the insert are
-            // not atomic, so the unique index is the real guard and this is the race losing.
+            // Registration's check and this insert are not atomic, so the index is the guard.
             Err(rusqlite::Error::SqliteFailure(e, _))
                 if e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
             {

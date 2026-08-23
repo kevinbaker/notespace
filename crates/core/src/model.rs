@@ -1,7 +1,4 @@
 //! Domain types.
-//!
-//! M0 covers only the read path for a thread page, so this is the Space/Thread/Post/User
-//! subset. Signal, Capability, ActionLog and Rule land in M1-M4.
 
 use crate::id::PublicId;
 use crate::path::Path;
@@ -12,20 +9,12 @@ pub type ThreadId = i64;
 pub type PostId = i64;
 pub type UserId = i64;
 
-/// Unix seconds. Deliberately not `std::time::SystemTime`: that panics on wasm.
+/// Unix seconds. Not `std::time::SystemTime`, which panics on wasm.
 pub type Timestamp = i64;
 
-/// HTML that has already been through the sanitizer.
-///
-/// The client is the attacker, so sanitizing happens server-side, always. Client-generated
-/// HTML persisted and served to other readers is stored XSS, and the read path emits
-/// `body_html` verbatim — so the only thing standing between a crafted post and every future
-/// reader of that thread is that this string went through `notespace_render`.
-///
-/// `core` cannot depend on `render` without inverting the layering, so this cannot be enforced
-/// by the type system alone. What it can do is make a bypass obvious: there is exactly one
-/// constructor, it is named [`SanitizedHtml::assert_sanitized`], and any call to it outside the
-/// renderer should fail review.
+/// HTML that has already been through the sanitizer. The read path emits it verbatim, and
+/// `core` cannot depend on `render` to enforce that, so the single constructor is named to make
+/// a bypass obvious in review.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SanitizedHtml(String);
 
@@ -44,18 +33,13 @@ impl SanitizedHtml {
     }
 }
 
-/// A post to be written.
-///
-/// Ids and timestamps are supplied by the caller rather than generated here: `core` has no clock
-/// and no RNG, because neither exists on wasm.
+/// Ids and timestamps are supplied by the caller, because `core` has no clock and no RNG.
 #[derive(Debug, Clone)]
 pub struct NewPost {
     pub public_id: PublicId,
     /// The thread to append to, by public id.
     pub thread: PublicId,
-    /// The post being replied to. `None` makes this a new top-level post.
-    ///
-    /// Addressed by public id, not path: a path is a position, and positions move.
+    /// `None` makes this a new top-level post. By public id, because a path is a position.
     pub parent: Option<PublicId>,
     pub author_id: UserId,
     /// Source of truth, stored verbatim.
@@ -70,9 +54,8 @@ pub struct NewPost {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Space {
     pub id: SpaceId,
-    /// Materialized URL path, stored with a trailing separator: `"sports/hockey/"`. This is the
-    /// identifier -- there is no separate key column, since the key is the last segment. See
-    /// [`crate::space_key::SpacePath`].
+    /// Materialized URL path with a trailing separator, `"sports/hockey/"`. The identifier
+    /// itself; the key is its last segment. See [`crate::space_key::SpacePath`].
     pub path: String,
     /// Display name, e.g. `"Ice Hockey"`. Never appears in a URL.
     pub name: String,
@@ -141,8 +124,7 @@ pub enum UserState {
     Active,
     /// Account gone. The row and the name remain so neither can be reissued.
     Deleted,
-    /// Suspended. Sessions are revoked on ban, but this is checked on every authenticated
-    /// request too: a ban that depends on a cleanup query having run is not a ban.
+    /// Suspended. Checked per request as well as revoking sessions, so no cleanup job is load-bearing.
     Banned,
 }
 
@@ -173,8 +155,7 @@ pub struct Thread {
     pub cache_version: i64,
 }
 
-/// One row of the thread index. Narrower than [`Thread`] on purpose: a list of fifty does not
-/// need every column, and the read path's cost is the columns it fetches.
+/// One row of the thread index; narrower than [`Thread`] because a list of fifty pays per column.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThreadSummary {
     pub public_id: PublicId,
@@ -190,11 +171,7 @@ pub struct ThreadSummary {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Post {
     pub id: PostId,
-    /// Opaque, time-sortable public id.
-    ///
-    /// A post's other address, `(thread_id, path)`, encodes which thread it is in, so a split
-    /// or merge invalidates it. This one survives the move, which is what makes a permalink
-    /// durable.
+    /// Survives a split or merge, unlike `(thread_id, path)`, which is what makes permalinks durable.
     pub public_id: PublicId,
     pub thread_id: ThreadId,
     pub parent_id: Option<PostId>,
@@ -202,11 +179,7 @@ pub struct Post {
     pub depth: u32,
     pub author_id: UserId,
     pub author_name: String,
-    /// Source of truth. Never served directly.
-    ///
-    /// `None` means "not loaded". The read path deliberately does not select this column:
-    /// a thread page needs only `body_html`, and shipping both doubles the bytes D1 sends
-    /// back for no benefit. The edit path loads it; rendering never does.
+    /// `None` means not loaded: the read path does not select it, only the edit path does.
     pub body_md: Option<String>,
     /// Rendered and sanitized at *write* time. Safe to emit verbatim.
     pub body_html: String,
@@ -219,8 +192,7 @@ pub struct Post {
 /// One page of a thread: metadata plus a preorder-contiguous run of posts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ThreadPage {
-    /// The space the thread lives in, joined in the same query rather than fetched separately.
-    /// The render needs `depth_cap`, and a second round trip for one integer is not in budget.
+    /// Joined in the same query; the render needs `depth_cap` and a second round trip is not in budget.
     pub space: Space,
     pub thread: Thread,
     /// Already in tree preorder: the store returns them `ORDER BY path`.
@@ -240,11 +212,8 @@ impl ThreadPage {
 }
 
 impl Path {
-    /// Indentation level to render at, clamped to a space's `depth_cap`.
-    ///
-    /// A flat board (`depth_cap == 0`) renders every post at the same level regardless of
-    /// its stored path, so a space can be reconfigured between flat and threaded without
-    /// rewriting stored data.
+    /// Clamped to the space's `depth_cap`, so flipping a space between flat and threaded needs
+    /// no stored-data rewrite.
     pub fn render_depth(&self, depth_cap: u32) -> u32 {
         (self.depth() as u32).min(depth_cap)
     }
@@ -271,18 +240,10 @@ mod tests {
 // String representations
 // ---------------------------------------------------------------------------
 //
-// Each of these enums crosses the database boundary as text, and every `Store` implementation
-// has to agree on that text. The D1 adapter arrives at it through serde's `rename_all`; a
-// SQLite adapter reading a `String` out of a column needs the same mapping by another route.
-//
-// Two routes to one mapping is a drift vector: nothing would fail to compile if serde said
-// "score_threshold" and a hand-written parser said "scorethreshold" -- the page would just
-// silently rank wrongly on one target. So the mapping is written once here, and
-// `string_forms_match_serde` asserts the serde representation agrees with it.
-//
-// Unknown input falls back to `Default` rather than erroring. A row written by a newer version
-// with a state this build has never heard of is a reason to render conservatively, not to fail
-// the request.
+// These cross the database boundary as text and both adapters have to agree on it: the D1 one
+// through serde's `rename_all`, the native one by reading a column. `string_forms_match_serde`
+// asserts the two routes agree. Unknown input falls back to `Default`, so a row from a newer
+// build renders conservatively rather than failing the request.
 
 macro_rules! string_enum {
     ($ty:ty { $($variant:ident => $text:literal),+ $(,)? }) => {
@@ -345,7 +306,6 @@ string_enum!(PostState {
 mod string_form_tests {
     use super::*;
 
-    /// The two routes to the same mapping must agree, or the adapters disagree silently.
     macro_rules! check {
         ($ty:ty, [$($variant:expr),+ $(,)?]) => {
             for v in [$($variant),+] {

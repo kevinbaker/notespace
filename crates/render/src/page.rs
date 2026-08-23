@@ -1,25 +1,14 @@
-//! Read-path templates.
-//!
-//! Two constraints shape everything here:
-//!
-//! - **Baked HTML is user-agnostic.** No usernames, no vote state, no unread markers in the
-//!   baked blob, or all cache sharing is lost. Nothing in this module takes a viewer;
-//!   personalisation is layered client-side from `GET /api/me/thread/{id}`.
-//! - **10 ms CPU per request.** Posts arrive already rendered and in preorder, so this is
-//!   a single linear pass with no tree construction and no per-post allocation beyond the
-//!   output buffer.
+//! Read-path templates. Nothing here takes a viewer: the baked HTML is shared byte-for-byte, and
+//! personalisation is layered client-side from `GET /api/me/thread/{id}`. Posts arrive already
+//! rendered and in preorder, so this is one linear pass.
 
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 use notespace_core::model::{PostState, ThreadPage};
 
-/// Deepest visual indent. Beyond this, replies stop nesting further so a deep subthread
-/// cannot squeeze the text column to nothing on a phone.
+/// Deepest visual indent, so a deep subthread cannot squeeze the text column to nothing.
 const MAX_INDENT: u32 = 8;
 
-/// Render a full thread page.
-///
-/// `space` supplies `depth_cap`, which is what makes a flat board and a threaded board the
-/// same code path — presets are data, not code.
+/// `space` supplies `depth_cap`, so flat and threaded boards are the same code path.
 pub fn thread_page(page: &ThreadPage) -> Markup {
     let space = &page.space;
     let t = &page.thread;
@@ -39,8 +28,7 @@ pub fn thread_page(page: &ThreadPage) -> Markup {
                     a href="/" { "notespace" }
                     " / "
                     a href={ "/s/" (space.path.trim_end_matches('/')) } { (space.name) }
-                    // Static, like everything else here. Which of these applies to the reader
-                    // is not knowable in a page baked once and shared with all of them.
+                    // Which of these applies to the reader is not knowable in a baked page.
                     span class="site-auth" {
                         a href="/login" { "sign in" }
                         " · "
@@ -60,9 +48,7 @@ pub fn thread_page(page: &ThreadPage) -> Markup {
                     ol class="posts" {
                         @for post in &page.posts {
                             @let indent = post.path.render_depth(space.depth_cap).min(MAX_INDENT);
-                            // Anchors and permalinks use the PUBLIC id. Emitting post.id here
-                            // would bake the internal sequential integer into every page,
-                            // leaking the post count and making the table enumerable.
+                            // The public id: `post.id` would leak the post count into every page.
                             li class="post" id={ "p" (post.public_id) }
                                style={ "--indent:" (indent) }
                                data-depth=(indent) {
@@ -71,19 +57,13 @@ pub fn thread_page(page: &ThreadPage) -> Markup {
                                         (post.author_name)
                                     }
                                     " "
-                                    // A durable, thread-independent URL: /p/{id} keeps
-                                    // resolving after a split or merge moves the post, which
-                                    // an anchor scoped to this page would not.
+                                    // Keeps resolving after a split or merge moves the post.
                                     a class="permalink" href={ "/p/" (post.public_id) } {
                                         time datetime=(post.created_at) { (post.created_at) }
                                     }
                                     @if post.edited_at.is_some() { span class="edited" { " (edited)" } }
                                     " "
-                                    // A plain link, not a form. The form needs a CSRF token
-                                    // bound to one visitor, and this page is baked once and
-                                    // shared byte-for-byte with every reader -- a token here
-                                    // would be handed to all of them. The link carries nothing
-                                    // viewer-specific, so the page stays cacheable.
+                                    // A link, not a form: a CSRF token here reaches every reader.
                                     a class="reply" href={
                                         "/t/" (t.public_id) "/reply?parent=" (post.public_id)
                                     } { "reply" }
@@ -99,8 +79,7 @@ pub fn thread_page(page: &ThreadPage) -> Markup {
                                     PostState::Pending => div class="post-body tombstone" {
                                         em { "[awaiting review]" }
                                     },
-                                    // Already sanitized at write time (see markdown.rs).
-                                    // This is the one place PreEscaped is legitimate.
+                                    // Sanitized at write time; the one legitimate PreEscaped.
                                     PostState::Visible => div class="post-body" {
                                         (PreEscaped(&post.body_html))
                                     },
@@ -120,8 +99,7 @@ pub fn thread_page(page: &ThreadPage) -> Markup {
                         }
                     }
                 }
-                // Personalisation (vote state, unread markers) is fetched separately so this
-                // document stays identical for every reader and can be cached once.
+                // Personalisation is fetched separately, so this document is identical for all.
                 script defer src="/static/personalize.js" data-thread=(t.public_id) {}
             }
         }
@@ -231,8 +209,6 @@ mod tests {
         assert!(html.contains(&format!(r#"id="p{pid}""#)));
     }
 
-    /// Internal row ids are not for publication: a baked page carrying sequential integers
-    /// leaks the post count and makes the table enumerable.
     #[test]
     fn baked_page_never_exposes_internal_row_ids() {
         let mut posts = Vec::new();
@@ -264,8 +240,6 @@ mod tests {
 
     #[test]
     fn thread_title_is_escaped() {
-        // Titles are plain text and never pass through the markdown sanitizer, so the
-        // template itself must escape them.
         let mut t = thread();
         t.title = "<script>alert(1)</script>".into();
         let p = ThreadPage {
@@ -329,7 +303,7 @@ mod tests {
             post(1, "0001", PostState::Visible, "<p>a</p>"),
             post(2, "0001.0001", PostState::Visible, "<p>b</p>"),
         ]);
-        // depth_cap 0 is the Classic BB preset: the page must flatten regardless of the paths.
+        // depth_cap 0 flattens the page regardless of the stored paths.
         p.space = s;
         let html = thread_page(&p).into_string();
         assert!(
@@ -338,9 +312,6 @@ mod tests {
         );
     }
 
-    /// The reply affordance must be a link, never a form. A form needs a CSRF token bound to
-    /// one visitor, and this page is shared byte-for-byte with every reader — baking a token in
-    /// would hand one visitor's to all of them, and make the page uncacheable besides.
     #[test]
     fn the_reply_affordance_is_a_link_and_carries_no_token() {
         let p = page(vec![post(1, "0001", PostState::Visible, "<p>hi</p>")]);
@@ -357,8 +328,6 @@ mod tests {
 
     #[test]
     fn baked_page_contains_no_viewer_identity() {
-        // The cache-sharing invariant. If this ever fails, every
-        // reader gets their own cache entry and the read path stops being free.
         let p = page(vec![post(1, "0001", PostState::Visible, "<p>hi</p>")]);
         let html = thread_page(&p).into_string();
         for marker in ["logged in", "csrf", "session", "Sign out", "your vote"] {

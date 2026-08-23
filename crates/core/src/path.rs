@@ -1,10 +1,4 @@
-//! Materialized tree paths.
-//!
-//! The `path` column is load-bearing: one indexed range scan returns an entire
-//! correctly-ordered thread page. A recursive CTE would blow both the 50-query and the 10 ms
-//! budgets. Segments are padded to a fixed width so lexicographic order equals tree order.
-//!
-//! A path is a `.`-separated list of zero-padded base32 ordinals, one per level:
+//! Materialized tree paths: a `.`-separated list of zero-padded base32 ordinals, one per level.
 //!
 //! ```text
 //! 000C             a root post (12th top-level reply in its thread)
@@ -12,57 +6,31 @@
 //! 000C.0004.0001   that child's 1st child
 //! ```
 //!
-//! The alphabet is Crockford base32 — `0-9` then `A-Z` minus `I`, `L`, `O` and `U` — shared
-//! with public ids. Four digits address 1,048,576 siblings per level.
-//!
-//! **The alphabet must stay closed under case folding.** Base62 is not, so anything that
-//! lowercases a path — a URL normaliser, a `NOCASE` collation, a stray `to_lowercase()` —
-//! would silently destroy the ordering invariant below.
-//!
-//! # Why this ordering works
-//!
-//! The separator `.` is byte `0x2E`, which sorts *below* every byte in the alphabet (`0` is
-//! `0x30`, `A` is `0x41`). Combined with fixed-width segments and an alphabet that is itself
-//! in ascending ASCII order, plain bytewise `ORDER BY path` is exactly a depth-first preorder
-//! walk of the tree:
-//!
-//! - A parent precedes its children, because the parent's path is a proper prefix and
-//!   shorter strings sort first.
-//! - A whole subtree precedes the next sibling, because at the first differing position the
-//!   subtree has `.` where the sibling has a digit.
-//!
-//! Both properties are property-tested in this module. If you change [`SEGMENT_WIDTH`] or
-//! the separator, those tests are what stop you from silently breaking thread ordering.
+//! The separator `0x2E` sorts below every alphabet byte and segments are fixed-width, so
+//! bytewise `ORDER BY path` is a depth-first preorder walk and one indexed range scan returns a
+//! whole thread page. The property tests in this module are what hold that up.
 
 use core::fmt;
 use std::borrow::Cow;
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
-/// Ordered base32 alphabet (Crockford). Strictly ascending in ASCII, which is what makes
-/// bytewise string comparison agree with numeric comparison.
+/// Crockford base32, strictly ascending in ASCII so bytewise comparison is numeric comparison.
 pub const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-/// Digits per path segment. Four base32 digits give 1_048_576 siblings at any one level.
+/// Four base32 digits give 1_048_576 siblings at any one level.
 pub const SEGMENT_WIDTH: usize = 4;
 
 /// Largest ordinal representable in a single segment (`32^4 - 1`).
 pub const MAX_ORDINAL: u32 = 1_048_575;
 
-/// Hard ceiling on nesting, independent of a space's configured `depth_cap`.
-///
-/// This bounds the stored path to `MAX_DEPTH * (SEGMENT_WIDTH + 1) - 1` = 159 bytes, which
-/// keeps the `idx_post_thread_path` index compact.
+/// Hard ceiling on nesting, independent of a space's `depth_cap`. Bounds a stored path to 159
+/// bytes, keeping `idx_post_thread_path` compact.
 pub const MAX_DEPTH: usize = 32;
 
 const SEPARATOR: u8 = b'.';
 
-/// Reverse of [`ALPHABET`]: byte -> digit value, or [`INVALID`] for anything not in the
-/// alphabet.
-///
-/// Built at compile time. Validation and decoding both run per character on every path the
-/// read path loads, and a linear scan of a 32-byte alphabet there measured ~2x slower than
-/// this table on the deep-nesting fixture.
+/// Reverse of [`ALPHABET`]. A linear scan here measured ~2x slower on the deep-nesting fixture.
 const INVALID: u8 = 0xFF;
 
 const DECODE: [u8; 256] = {
@@ -92,10 +60,7 @@ pub enum PathError {
     Empty,
 }
 
-/// A validated materialized path.
-///
-/// Construct with [`Path::root`], [`Path::child`], or [`Path::parse`]; the invariants
-/// (fixed-width numeric segments, depth within [`MAX_DEPTH`]) hold for every value.
+/// A validated materialized path: fixed-width numeric segments, depth within [`MAX_DEPTH`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Path(String);
 
@@ -118,9 +83,7 @@ impl Path {
         Ok(Path(s))
     }
 
-    /// Path of the next sibling after `self`.
-    ///
-    /// Returns `Err` if `self` is already at [`MAX_ORDINAL`] for its level.
+    /// `Err` if `self` is already at [`MAX_ORDINAL`] for its level.
     pub fn next_sibling(&self) -> Result<Self, PathError> {
         let ordinal = self.ordinal();
         let next = ordinal
@@ -132,7 +95,6 @@ impl Path {
         }
     }
 
-    /// Parse and validate an existing path, e.g. one loaded from the database.
     pub fn parse(s: &str) -> Result<Self, PathError> {
         if s.is_empty() {
             return Err(PathError::Empty);
@@ -169,13 +131,9 @@ impl Path {
         decode_segment(last)
     }
 
-    /// Path of the parent post, or `None` for a top-level post.
-    /// The ancestor at `depth`, using the same convention as [`Path::depth`]: a root path is
-    /// depth **0**, its children depth 1. `None` if this path is shallower than `depth`.
-    ///
-    /// Used to turn "the last descendant of P" into "the last *direct child* of P": one indexed
-    /// lookup finds the deepest path under P, and truncating it to `P.depth() + 1` gives the
-    /// child ordinal to insert after. Walking the children directly would be a scan.
+    /// The ancestor at `depth`, using the [`Path::depth`] convention: a root path is depth 0.
+    /// Truncating the deepest descendant of P to `P.depth() + 1` is how the next child ordinal
+    /// is found without scanning P's children.
     pub fn ancestor_at_depth(&self, depth: usize) -> Option<Self> {
         if depth > self.depth() {
             return None;
@@ -206,14 +164,10 @@ impl Path {
                 && self.0.starts_with(&other.0))
     }
 
-    /// Exclusive upper bound for a range scan over this path's whole subtree.
-    ///
-    /// Yields SQL of the shape `WHERE path >= :path AND path < :bound`, which is one
-    /// indexed range scan rather than a recursive CTE.
+    /// Exclusive upper bound for `WHERE path >= :path AND path < :bound` over the subtree.
     pub fn subtree_end(&self) -> String {
-        // '.' is 0x2E; '/' is 0x2F, the next byte up, and still below every alphabet byte.
-        // Every descendant path begins `<self>.`, so `<self>/` is the tight exclusive upper
-        // bound of the subtree, and it sorts below the next sibling.
+        // '/' (0x2F) is one above the separator and still below every alphabet byte, so it is
+        // the tight bound on `<self>.` descendants and sorts below the next sibling.
         let mut s = String::with_capacity(self.0.len() + 1);
         s.push_str(&self.0);
         s.push('/');
@@ -253,11 +207,7 @@ impl Serialize for Path {
     }
 }
 
-/// Deserialization *validates* rather than trusting the input.
-///
-/// Paths arrive from the database and, once the JSON personalisation layer exists, from the
-/// network. A path that skipped validation would silently break the ordering invariant the
-/// entire read path depends on, so there is no unchecked constructor.
+/// Validates rather than trusting input; there is no unchecked constructor.
 impl<'de> Deserialize<'de> for Path {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
@@ -276,9 +226,7 @@ fn encode_segment(ordinal: u32) -> Result<String, PathError> {
         slot.clone_from(&ALPHABET[(n % 32) as usize]);
         n /= 32;
     }
-    // Built by pushing `char`s rather than validating UTF-8, so there is no fallible step
-    // and no `expect` in shipping code, because the wasm target panics badly.
-    // Every ALPHABET byte is ASCII, so `as char` is exact.
+    // Pushing `char`s avoids a fallible UTF-8 step; every ALPHABET byte is ASCII.
     let mut out = String::with_capacity(SEGMENT_WIDTH);
     for b in buf {
         out.push(b as char);
@@ -286,10 +234,8 @@ fn encode_segment(ordinal: u32) -> Result<String, PathError> {
     Ok(out)
 }
 
-/// Decode a segment previously produced by [`encode_segment`].
-///
-/// Only ever called on strings that passed [`Path::parse`], so an unknown byte cannot occur;
-/// it is mapped to 0 rather than panicking because a panic on wasm is an unrecoverable trap.
+/// Only called on strings that passed [`Path::parse`]; an unknown byte maps to 0 rather than
+/// panicking, because a wasm panic is an unrecoverable trap.
 fn decode_segment(s: &str) -> u32 {
     s.bytes().fold(0u32, |acc, b| {
         let digit = digit_value(b);
@@ -329,9 +275,6 @@ mod tests {
         }
     }
 
-    /// The convention is the trap: `depth()` counts separators, so a root is depth 0. An
-    /// earlier `ancestor_at_depth` treated it as a segment count and rejected depth 0, which
-    /// made every path allocation fall back to "first post in the thread" and collide.
     #[test]
     fn ancestor_at_depth_uses_the_same_convention_as_depth() {
         let root = Path::parse("0006").unwrap();
@@ -352,7 +295,6 @@ mod tests {
 
     #[test]
     fn alphabet_is_ascending_and_unambiguous() {
-        // The ordering invariant rests on this; assert it rather than trusting the literal.
         for w in ALPHABET.windows(2) {
             assert!(w[0] < w[1], "alphabet not ascending at {:?}", w);
         }
@@ -364,7 +306,6 @@ mod tests {
                 c as char
             );
         }
-        // Separator must sort below every alphabet byte, and so must the subtree bound.
         assert!(SEPARATOR < ALPHABET[0]);
         assert!(b'/' < ALPHABET[0]);
     }
@@ -379,7 +320,6 @@ mod tests {
 
     #[test]
     fn encoding_order_matches_numeric_order() {
-        // Exhaustive over a dense range, plus the boundaries where digit carries happen.
         let mut prev = Path::root(0).unwrap();
         for ord in 1..5000u32 {
             let cur = Path::root(ord).unwrap();
@@ -441,8 +381,6 @@ mod tests {
 
     #[test]
     fn descendant_check_is_not_fooled_by_shared_prefix() {
-        // "000C" and "000C" vs "000CX"-style prefixes: fixed width means siblings never
-        // prefix one another, but assert it rather than relying on that reasoning.
         let a = Path::parse("0001").unwrap();
         let b = Path::parse("0012").unwrap();
         assert!(!b.is_descendant_of(&a));
@@ -464,9 +402,7 @@ mod tests {
         assert_eq!(end, "000C/");
     }
 
-    // --- Property tests: the ordering invariant the whole read path rests on. ---
-
-    /// A tree shape: a list of paths built by random walks, plus their preorder.
+    /// A list of paths built by random walks, plus their preorder.
     fn arb_tree() -> impl Strategy<Value = Vec<Path>> {
         prop::collection::vec(prop::collection::vec(0u32..6, 1..5), 1..40).prop_map(|walks| {
             let mut paths: Vec<Path> = walks
@@ -487,7 +423,6 @@ mod tests {
     }
 
     proptest! {
-        /// Sorting paths as plain strings must equal sorting them as trees.
         #[test]
         fn lexicographic_order_equals_preorder(paths in arb_tree()) {
             let mut by_string = paths.clone();
@@ -495,7 +430,7 @@ mod tests {
 
             let mut by_tree = paths.clone();
             by_tree.sort_by(|a, b| {
-                // Preorder: compare ordinal-by-ordinal; a prefix (ancestor) comes first.
+                // Compare ordinal-by-ordinal; a prefix (ancestor) comes first.
                 let (mut x, mut y) = (a.segments(), b.segments());
                 loop {
                     match (x.next(), y.next()) {
@@ -511,7 +446,6 @@ mod tests {
             prop_assert_eq!(by_string, by_tree);
         }
 
-        /// A parent always sorts immediately before its subtree, never after.
         #[test]
         fn parent_precedes_children(paths in arb_tree()) {
             for p in &paths {
@@ -521,7 +455,6 @@ mod tests {
             }
         }
 
-        /// The whole of a subtree sorts inside `[path, subtree_end)`, and nothing else does.
         #[test]
         fn subtree_range_is_exact(paths in arb_tree()) {
             for anchor in &paths {
@@ -537,7 +470,6 @@ mod tests {
             }
         }
 
-        /// Round-tripping through the database representation preserves the value.
         #[test]
         fn parse_round_trips(paths in arb_tree()) {
             for p in &paths {
@@ -545,14 +477,11 @@ mod tests {
             }
         }
 
-        /// A sibling sorts after the entire preceding subtree.
-        /// Encoding and decoding are inverse across the whole representable range.
         #[test]
         fn segment_round_trips(ord in 0u32..=MAX_ORDINAL) {
             prop_assert_eq!(Path::root(ord)?.ordinal(), ord);
         }
 
-        /// Bytewise order agrees with numeric order for arbitrary ordinal pairs.
         #[test]
         fn segment_order_matches_numeric(a in 0u32..=MAX_ORDINAL, b in 0u32..=MAX_ORDINAL) {
             let (pa, pb) = (Path::root(a)?, Path::root(b)?);

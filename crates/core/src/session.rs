@@ -1,13 +1,9 @@
-//! Session tokens and expiry policy.
+//! Session tokens and expiry policy. The cookie carries 256 random bits and the database holds
+//! only their SHA-256; [`Store`](crate::store::Store) accepts a [`TokenHash`], whose only
+//! constructor is [`SessionToken::hash`].
 //!
-//! **The token is never stored.** The cookie carries 256 random bits; the database holds only
-//! their SHA-256, so a leaked backup yields no usable session. Enforced by the types rather
-//! than by discipline: [`Store`](crate::store::Store) accepts a [`TokenHash`], and the only way
-//! to obtain one is [`SessionToken::hash`].
-//!
-//! **Expiry slides, but is refreshed at most once a day.** [`SessionPolicy`] pushes the expiry
-//! out only when the last refresh is older than [`SessionPolicy::refresh_after_ms`], which
-//! keeps a sliding session at roughly one write per user per day rather than one per request.
+//! Expiry slides but refreshes at most once a day, keeping a sliding session at about one write
+//! per user per day rather than one per request.
 
 use core::fmt;
 
@@ -18,15 +14,12 @@ use crate::model::{Timestamp, UserId};
 /// Bytes of randomness in a token. 256 bits, from the platform CSPRNG.
 pub const TOKEN_BYTES: usize = 32;
 
-/// A session secret. Lives in the cookie and in memory; never in the database.
-///
-/// Deliberately not `Serialize`, `Display` or `Debug`-revealing: the ways a secret usually ends
-/// up in a log are all derive macros.
+/// Not `Serialize` or `Display`, and `Debug` is redacted: derive macros are how secrets leak.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SessionToken([u8; TOKEN_BYTES]);
 
 impl SessionToken {
-    /// Wrap bytes from a CSPRNG. The caller supplies them because `core` has no RNG on wasm.
+    /// The caller supplies the bytes, because `core` has no RNG.
     pub fn from_bytes(bytes: [u8; TOKEN_BYTES]) -> Self {
         SessionToken(bytes)
     }
@@ -46,7 +39,7 @@ impl SessionToken {
         hex_encode(&self.0)
     }
 
-    /// What the database stores. The only route from a token to something storable.
+    /// The only route from a token to something storable.
     pub fn hash(&self) -> TokenHash {
         let digest = Sha256::digest(self.0);
         TokenHash(hex_encode(&digest))
@@ -91,16 +84,12 @@ pub struct Session {
 pub struct SessionPolicy {
     /// How far ahead of now a session expires when created or refreshed.
     pub lifetime_ms: i64,
-    /// Minimum gap between refreshes. The whole point of the policy: without it, sliding expiry
-    /// is a database write on every authenticated request.
+    /// Without this, sliding expiry is a write on every authenticated request.
     pub refresh_after_ms: i64,
 }
 
 impl Default for SessionPolicy {
     /// 30-day lifetime, refreshed at most once a day.
-    ///
-    /// A month is long enough that a regular reader is never logged out, and the daily refresh
-    /// keeps it that way for the cost of one write per active user per day.
     fn default() -> Self {
         SessionPolicy {
             lifetime_ms: 30 * 24 * 60 * 60 * 1000,
@@ -114,10 +103,7 @@ impl SessionPolicy {
         now + self.lifetime_ms
     }
 
-    /// Whether this session's expiry should be pushed out now.
-    ///
-    /// False for an already-expired session: that is a logout, not a refresh. Without this
-    /// check a request arriving a month late would silently resurrect the session.
+    /// False for an already-expired session, which is a logout rather than a refresh.
     pub fn should_refresh(&self, session: &Session, now: Timestamp) -> bool {
         !self.is_expired(session, now) && now - session.refreshed_at >= self.refresh_after_ms
     }
@@ -188,12 +174,10 @@ mod tests {
         let h = t.hash();
         assert_ne!(h.as_str(), t.to_cookie_value());
         assert_eq!(h.as_str().len(), 64);
-        // Stable, and distinct per token.
         assert_eq!(t.hash(), token(1).hash());
         assert_ne!(t.hash(), token(2).hash());
     }
 
-    /// A secret that reaches a log is a leaked secret, and `derive(Debug)` is how it gets there.
     #[test]
     fn debug_does_not_reveal_the_token() {
         let t = token(0xFF);
@@ -221,7 +205,6 @@ mod tests {
         assert!(p.should_refresh(&s, now + p.refresh_after_ms));
     }
 
-    /// A request arriving after expiry must not resurrect the session.
     #[test]
     fn an_expired_session_is_never_refreshed() {
         let p = SessionPolicy::default();
@@ -236,7 +219,7 @@ mod tests {
         let later = now + p.lifetime_ms * 2;
         assert!(p.is_expired(&s, later));
         assert!(!p.should_refresh(&s, later));
-        // And exactly at the boundary it is already gone, not still valid.
+        // Exactly at the boundary it is already gone.
         assert!(p.is_expired(&s, s.expires_at));
     }
 }

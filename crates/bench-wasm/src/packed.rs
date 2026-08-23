@@ -1,13 +1,7 @@
-//! Candidate representation for `PublicId`: a packed integer instead of a canonical `String`.
+//! A packed-integer `PublicId`, existing only to be benchmarked against the shipping `String`.
 //!
-//! Exists only to be benchmarked against the shipping type.
-//!
-//! # The 128-bit cap
-//!
-//! A width of 26 characters is 130 bits, which does not fit a `u128`. Capping at 25 characters
-//! (125 bits: 48 of timestamp, 77 random) does fit, and gives up essentially nothing — 77
-//! random bits against ULID's 80 is not a difference any forum can observe. That cap is what
-//! makes this representation possible at all.
+//! Capped at 25 characters rather than 26, because 130 bits does not fit a `u128`; 77 random bits
+//! against ULID's 80 is not a difference any forum can observe.
 
 pub const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 pub const MIN_CHARS: usize = 16;
@@ -134,8 +128,7 @@ impl PackedId {
         self.width as usize
     }
 
-    /// Left-align to a common width so numeric order matches string order across widths, then
-    /// break ties by width: a shorter id is a prefix of a longer one, and a prefix sorts first.
+    /// Left-align to a common width, then break ties by width, since a prefix sorts first.
     fn normalized(&self) -> u128 {
         self.bits << (MAX_PAYLOAD_BITS - payload_bits(self.width as usize))
     }

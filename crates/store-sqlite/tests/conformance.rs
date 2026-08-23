@@ -1,17 +1,12 @@
-//! The shared conformance suite, run against the native adapter.
-//!
-//! The same [`notespace_core::conformance::run_all`] runs against D1 through the Worker's
-//! `/__conformance` route. If these two ever disagree, one adapter is wrong — which is the
-//! entire point of having a second one.
+//! The shared conformance suite, run against the native adapter. The same `run_all` runs against
+//! D1 through the Worker's `/__conformance` route; a disagreement means one adapter is wrong.
 
 use notespace_core::conformance::{run_all, Fixture};
 use notespace_core::id::PublicId;
 use notespace_core::path::Path;
 use notespace_store_sqlite::SqliteStore;
 
-/// `include_str!` needs literal paths, so this list is maintained by hand — and a migration
-/// added without touching it fails as "no such table" somewhere unrelated.
-/// `migration_list_is_complete` below turns that into a clear failure instead.
+/// `include_str!` needs literal paths; `migration_list_is_complete` guards the hand maintenance.
 const MIGRATIONS: [&str; 7] = [
     include_str!("../../../migrations/0001_init.sql"),
     include_str!("../../../migrations/0002_thread_public_id.sql"),
@@ -24,8 +19,7 @@ const MIGRATIONS: [&str; 7] = [
 
 const MIGRATIONS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations");
 
-/// Deterministic ids matching what `notespace-seed` produces, so the fixture below describes
-/// the same data the D1 side is seeded with.
+/// Matching what `notespace-seed` produces, so both sides describe the same data.
 fn thread_id() -> PublicId {
     PublicId::new(1_735_689_600_000, 0xC0FFEE).unwrap()
 }
@@ -52,7 +46,7 @@ fn seeded() -> SqliteStore {
         rusqlite::params![thread_id().as_str(), POSTS],
     )
     .unwrap();
-    // A shape with real nesting, so tree order is actually exercised rather than assumed.
+    // Real nesting, so tree order is exercised rather than assumed.
     let paths = [
         "0001",
         "0001.0001",
@@ -93,7 +87,7 @@ fn fixture() -> Fixture {
     Fixture {
         thread: thread_id(),
         post_count: POSTS,
-        // The 4th post, which is nested -- a leaf at depth 0 would not catch a path bug.
+        // Nested: a leaf at depth 0 would not catch a path bug.
         known_post: post_id(3),
         known_post_path: Path::parse("0001.0002").unwrap(),
         absent: PublicId::new(1_735_689_600_000, 0xDEAD).unwrap(),
@@ -127,8 +121,6 @@ async fn sqlite_adapter_passes_the_shared_suite() {
     );
 }
 
-/// Every migration on disk must be in [`MIGRATIONS`]. Without this, adding one and forgetting
-/// to list it here makes the suite test an older schema than the Worker runs.
 #[test]
 fn migration_list_is_complete() {
     let mut on_disk: Vec<String> = std::fs::read_dir(MIGRATIONS_DIR)
@@ -146,9 +138,7 @@ fn migration_list_is_complete() {
     );
 }
 
-/// The migrations must apply to a plain SQLite as cleanly as they do to D1. This is the cheap
-/// half of "identical dialect on both targets" -- a Postgres-ism would fail here in
-/// milliseconds instead of at deploy time.
+/// The cheap half of dialect parity: a Postgres-ism fails here in milliseconds, not at deploy.
 #[test]
 fn migrations_apply_to_plain_sqlite() {
     let store = SqliteStore::in_memory(&MIGRATIONS).expect("migrations apply");
@@ -177,7 +167,7 @@ use notespace_core::store::Store;
 
 const NOW: i64 = 1_800_000_000_000;
 const PW: &str = "correct horse battery staple";
-/// Cheap on purpose: these tests exercise the flow, not the work factor.
+/// Cheap on purpose: these exercise the flow, not the work factor.
 const FAST: Scheme = Scheme::Server(Params {
     m_kib: 64,
     t: 1,
@@ -236,7 +226,6 @@ async fn a_correct_password_creates_a_session() {
     assert_eq!(user.name, "alice2");
     assert_eq!(session.expires_at, cfg.sessions.expiry_from(NOW));
 
-    // The session is real: it resolves.
     let found = store
         .lookup_session(&session.token_hash, NOW + 1000)
         .await
@@ -277,13 +266,11 @@ async fn a_wrong_password_is_rejected_and_counted() {
     assert_eq!(client.map(|a| a.count), Some(1), "client not counted");
 }
 
-/// The property the whole shape of `attempt` exists for.
 #[tokio::test]
 async fn an_unknown_account_is_indistinguishable_from_a_wrong_password() {
     let store = seeded();
     let cfg = config();
     with_account(&store, &cfg, "real", Some(PW)).await;
-    // An account with no local password -- an OIDC user -- is the third case that must match.
     with_account(&store, &cfg, "external", None).await;
 
     for (name, label) in [
@@ -339,7 +326,7 @@ async fn the_limiter_bites_before_the_password_is_checked() {
             "attempt {i} not merely rejected"
         );
     }
-    // Now even the CORRECT password is refused -- which is the point.
+    // Now even the correct password is refused.
     let out = attempt(&store, &cfg, try_login("target", PW, "203.0.113.6", 7))
         .await
         .unwrap();
@@ -369,7 +356,6 @@ async fn a_successful_login_clears_the_counters() {
     assert_eq!(client, None, "client counter survived a success");
 }
 
-/// Logging in under weaker stored parameters must upgrade the hash in place.
 #[tokio::test]
 async fn login_rehashes_a_stale_credential() {
     let store = seeded();
@@ -469,7 +455,7 @@ async fn a_reply_is_posted_and_lands_at_the_end_of_the_thread() {
         _ => panic!("expected a post"),
     }
 
-    // The write must bump the version, or the cached page keeps serving without the reply.
+    // Without the version bump the cached page keeps serving without the reply.
     let after = store.thread_version(&thread_id()).await.unwrap().unwrap();
     assert!(
         after > before,
@@ -495,8 +481,6 @@ async fn an_oversized_body_never_reaches_the_database() {
     );
 }
 
-/// The limiter has to bite before the insert, not after: the write is the expensive part and
-/// the whole point is that a flood does not reach it.
 #[tokio::test]
 async fn the_limiter_bites_before_the_write() {
     let store = seeded();
@@ -535,8 +519,6 @@ async fn a_reply_to_an_unknown_thread_is_rejected_not_an_error() {
     }
 }
 
-/// Every id offered must be distinct, or a retry re-submits the id that just lost and cannot
-/// possibly win. Cheap to assert, and the failure would only show under contention.
 #[tokio::test]
 async fn the_retry_ids_are_distinct() {
     let ids = reply_ids(7);
@@ -586,7 +568,6 @@ async fn a_signup_creates_an_account_that_can_then_log_in() {
     match register::signup(&store, &rcfg, a_signup("newcomer", PW, "1.2.3.4", 1)).await {
         Ok(SignupOutcome::Created { user, session }) => {
             assert_eq!(user.name, "newcomer");
-            // Signed in already: the session must be real, not a placeholder.
             let found = store
                 .lookup_session(&session.token_hash, NOW)
                 .await
@@ -596,7 +577,6 @@ async fn a_signup_creates_an_account_that_can_then_log_in() {
         _ => panic!("expected Created"),
     }
 
-    // The credential it wrote must satisfy the login path, not merely exist.
     let lcfg = config();
     match attempt(&store, &lcfg, try_login("newcomer", PW, "1.2.3.4", 2)).await {
         Ok(Outcome::Success { user, .. }) => assert_eq!(user.name, "newcomer"),
@@ -636,15 +616,12 @@ async fn a_taken_name_is_rejected_without_disturbing_the_existing_account() {
         Ok(SignupOutcome::Rejected(SignupRejected::Taken)) => {}
         _ => panic!("expected Taken"),
     }
-    // The incumbent's password must still be theirs.
     match attempt(&store, &lcfg, try_login("incumbent", PW, "1.1.1.1", 6)).await {
         Ok(Outcome::Success { .. }) => {}
         _ => panic!("the original credential was overwritten"),
     }
 }
 
-/// The limit is per client and the name half of the key is constant, so trying a different
-/// name must not buy a fresh budget.
 #[tokio::test]
 async fn the_limiter_counts_signups_per_client_whatever_name_is_tried() {
     let store = seeded();
@@ -682,4 +659,193 @@ async fn a_rejected_signup_writes_no_account() {
             "{name} was created despite rejection"
         );
     }
+}
+
+/// A thread with `roots` top-level subtrees, three posts each.
+fn wide_thread(roots: u32) -> SqliteStore {
+    let store = SqliteStore::in_memory(&MIGRATIONS).expect("migrations apply");
+    let c = store.conn();
+    c.execute_batch(
+        "INSERT INTO user (id, name, created_at) VALUES (1, 'alice', 1735689600000);
+         INSERT INTO space (id, name, ranking, depth_cap, path)
+           VALUES (1, 'General', 'bump', 8, 'general/');",
+    )
+    .unwrap();
+    c.execute(
+        "INSERT INTO thread (id, public_id, space_id, kind, title, author_id, created_at,
+             bumped_at, post_count, state, cache_version)
+         VALUES (1, ?1, 1, 'discussion', 'Wide', 1, 1735689600000, 1735689600000, 0,
+                 'visible', 0)",
+        rusqlite::params![thread_id().as_str()],
+    )
+    .unwrap();
+    let mut id = 0i64;
+    for r in 0..roots {
+        let root = Path::root(r).unwrap();
+        for path in [
+            root.as_str().to_string(),
+            root.child(1).unwrap().as_str().to_string(),
+            root.child(1)
+                .unwrap()
+                .child(1)
+                .unwrap()
+                .as_str()
+                .to_string(),
+        ] {
+            id += 1;
+            c.execute(
+                "INSERT INTO post (id, public_id, thread_id, parent_id, path, depth, author_id,
+                     body_md, body_html, created_at, score, state)
+                 VALUES (?1, ?2, 1, NULL, ?3, ?4, 1, 'md', '<p>x</p>', ?5, 0, 'visible')",
+                rusqlite::params![
+                    id,
+                    post_id(id as u64 + 500).as_str(),
+                    &path,
+                    path.matches('.').count() as i64,
+                    1_735_689_600_000i64 + id
+                ],
+            )
+            .unwrap();
+        }
+    }
+    store
+}
+
+// ---------------------------------------------------------------------------
+// Query budgets
+// ---------------------------------------------------------------------------
+
+use rusqlite::trace::{TraceEvent, TraceEventCodes};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
+
+static STATEMENTS: AtomicUsize = AtomicUsize::new(0);
+static COUNTING: Mutex<()> = Mutex::new(());
+
+fn count_statement(e: TraceEvent<'_>) {
+    if let TraceEvent::Stmt(..) = e {
+        STATEMENTS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `rusqlite`'s trace callback is a plain `fn`, so the counter is process-global and concurrent
+/// budget tests would otherwise add to each other's totals.
+struct Counting<'a> {
+    store: &'a SqliteStore,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl<'a> Counting<'a> {
+    fn start(store: &'a SqliteStore) -> Self {
+        let lock = COUNTING.lock().unwrap_or_else(|e| e.into_inner());
+        STATEMENTS.store(0, Ordering::Relaxed);
+        store
+            .conn()
+            .trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(count_statement));
+        Counting { store, _lock: lock }
+    }
+
+    fn stop(self) -> usize {
+        self.store
+            .conn()
+            .trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, None);
+        STATEMENTS.load(Ordering::Relaxed)
+    }
+}
+
+#[tokio::test]
+async fn the_read_path_stays_inside_its_query_budget() {
+    use notespace_core::store::Page;
+    let store = seeded();
+
+    let c = Counting::start(&store);
+    store
+        .thread_page(&thread_id(), &Page::first(200))
+        .await
+        .expect("thread_page");
+    let n = c.stop();
+    assert_eq!(n, 2, "thread_page ran {n} statements, budget is 2");
+
+    let c = Counting::start(&store);
+    store.thread_version(&thread_id()).await.expect("version");
+    let n = c.stop();
+    assert_eq!(n, 1, "thread_version ran {n} statements, budget is 1");
+
+    let c = Counting::start(&store);
+    store.recent_threads(50).await.expect("recent_threads");
+    let n = c.stop();
+    assert_eq!(n, 1, "recent_threads ran {n} statements, budget is 1");
+}
+
+/// Growing the thread does not grow the query count.
+#[tokio::test]
+async fn the_read_path_does_not_go_per_post() {
+    use notespace_core::store::Page;
+    let small = wide_thread(2);
+    let large = wide_thread(30);
+
+    let c = Counting::start(&small);
+    small
+        .thread_page(&thread_id(), &Page::first(1000))
+        .await
+        .expect("small");
+    let few = c.stop();
+
+    let c = Counting::start(&large);
+    large
+        .thread_page(&thread_id(), &Page::first(1000))
+        .await
+        .expect("large");
+    let many = c.stop();
+
+    assert_eq!(
+        few, many,
+        "a 6-post thread cost {few} statements and a 90-post thread cost {many}"
+    );
+}
+
+#[tokio::test]
+async fn locate_post_stays_inside_its_budget() {
+    let store = seeded();
+
+    let c = Counting::start(&store);
+    let loc = store.locate_post(&post_id(3), 200).await.expect("locate");
+    let n = c.stop();
+    assert!(loc.cursor.is_none(), "post 3 should be on the first page");
+    assert_eq!(
+        n, 2,
+        "first-page locate_post ran {n} statements, budget is 2"
+    );
+
+    let c = Counting::start(&store);
+    let loc = store.locate_post(&post_id(11), 3).await.expect("locate");
+    let n = c.stop();
+    assert!(
+        loc.cursor.is_some(),
+        "post 11 at page size 3 needs a cursor"
+    );
+    assert_eq!(n, 3, "paged locate_post ran {n} statements, budget is 3");
+}
+
+/// A mismatch here is a runtime "no D1 binding", never a build failure.
+#[test]
+fn the_d1_binding_name_matches_wrangler_toml() {
+    let src = include_str!("../../worker/src/lib.rs");
+    let toml = include_str!("../../../wrangler.toml");
+
+    let in_code = src
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("const DB_BINDING: &str = \""))
+        .and_then(|l| l.split('"').next())
+        .expect("DB_BINDING not found in the worker source");
+    let in_toml = toml
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("binding = \""))
+        .and_then(|l| l.split('"').next())
+        .expect("no `binding` in wrangler.toml");
+
+    assert_eq!(
+        in_code, in_toml,
+        "worker binds {in_code:?} but wrangler.toml declares {in_toml:?}"
+    );
 }

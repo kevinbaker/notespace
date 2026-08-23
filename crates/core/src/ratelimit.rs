@@ -1,16 +1,9 @@
-//! Rate limiting for authentication attempts.
+//! Rate limiting for authentication attempts, checked before the hash — an attacker pays nothing
+//! for a wrong guess but the server pays a full KDF run.
 //!
-//! The check must run **before** the hash. An attacker pays nothing for a wrong guess; the
-//! server pays a full KDF run, so an unthrottled login form is also a CPU-exhaustion vector.
-//!
-//! Two buckets, and an attempt must pass both:
-//!
-//! - **Per identity**: one account under a password list. Strict.
-//! - **Per client**: one password sprayed across many accounts, which never trips a per-account
-//!   limit. Looser, because a shared NAT is one client here.
-//!
-//! Windows are fixed, not sliding: one counter and one instant per bucket. An attacker can
-//! straddle a boundary for `2 * limit` attempts in quick succession, which is accepted.
+//! Two buckets, both of which an attempt has to pass: per identity, against a password list, and
+//! per client, against one password sprayed across many accounts. Windows are fixed rather than
+//! sliding, so straddling a boundary allows `2 * limit` in quick succession.
 
 use crate::model::Timestamp;
 
@@ -39,20 +32,13 @@ pub struct Limit {
 }
 
 impl Limit {
-    /// Per-identity: five tries per fifteen minutes.
-    ///
-    /// Enough that a person who mistypes twice and then goes to find their password manager is
-    /// unaffected; far too few to walk a password list.
+    /// Five tries per fifteen minutes.
     pub const PER_IDENTITY: Limit = Limit {
         max: 5,
         window_ms: 15 * 60 * 1000,
     };
 
-    /// Per client address: sixty per fifteen minutes.
-    ///
-    /// Twelve times looser than per-identity because a client is not a person — an office, a
-    /// campus or a mobile carrier can be one address. Still low enough that credential stuffing,
-    /// which needs thousands of attempts to be worth running, dies here.
+    /// Sixty per fifteen minutes: looser, because an office or carrier is one address.
     pub const PER_CLIENT: Limit = Limit {
         max: 60,
         window_ms: 15 * 60 * 1000,
@@ -63,12 +49,10 @@ impl Limit {
         now - state.window_start < self.window_ms
     }
 
-    /// The decision for an attempt arriving now.
-    ///
     /// `state` is what the store holds, or `None` if nothing is recorded.
     pub fn check(&self, state: Option<Attempts>, now: Timestamp) -> Decision {
         match state {
-            // A window that has elapsed is as good as no record: the count restarts.
+            // An elapsed window is as good as no record.
             Some(s) if self.in_window(&s, now) && s.count >= self.max => Decision::Deny {
                 retry_after_ms: (s.window_start + self.window_ms - now).max(0),
             },
@@ -101,11 +85,8 @@ impl Decision {
         matches!(self, Decision::Allow { .. })
     }
 
-    /// The counter to persist, if the attempt turns out to have failed.
-    ///
-    /// Successful logins do not count against the limit — otherwise a busy shared address locks
-    /// out the people using it correctly, and a limiter that punishes success is one an operator
-    /// eventually turns off. The store clears the identity counter on success instead.
+    /// Only failures persist: counting successes would lock out a busy shared address. The store
+    /// clears the identity counter on success instead.
     pub fn next(&self) -> Option<Attempts> {
         match self {
             Decision::Allow { next } => Some(*next),
@@ -121,11 +102,7 @@ impl Decision {
     }
 }
 
-/// The two buckets an attempt is checked against.
-///
-/// Identities are keyed by name rather than by user id on purpose: a login for an account that
-/// does not exist has no id, and skipping the limiter for unknown names would make it free to
-/// enumerate them.
+/// Keyed by name, not user id, so an attempt against an unknown account is still limited.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptKeys {
     pub identity: String,
@@ -133,8 +110,7 @@ pub struct AttemptKeys {
 }
 
 impl AttemptKeys {
-    /// `identity` is lowercased so `Alice` and `alice` share a bucket — otherwise case is a
-    /// free way to multiply the limit.
+    /// `identity` is lowercased, so case cannot multiply the limit.
     pub fn new(identity: &str, client: &str) -> Self {
         AttemptKeys {
             identity: format!("id:{}", identity.to_lowercase()),
@@ -196,12 +172,11 @@ mod tests {
             L.check(exhausted, NOW + 30_000).retry_after_secs(),
             Some(30)
         );
-        // Rounds up: "0 seconds" would invite an immediate retry that still fails.
+        // Rounds up, so the caller is never told to retry immediately.
         assert_eq!(L.check(exhausted, NOW + 59_999).retry_after_secs(), Some(1));
         assert!(L.check(exhausted, NOW).retry_after_secs().unwrap() > 0);
     }
 
-    /// A clock that goes backwards must not hand out a fresh window.
     #[test]
     fn a_backwards_clock_does_not_reset_the_limit() {
         let exhausted = Some(Attempts {
@@ -216,9 +191,7 @@ mod tests {
     fn the_shipped_limits_are_sane() {
         const {
             assert!(Limit::PER_IDENTITY.max < Limit::PER_CLIENT.max);
-            // A person mistyping a couple of times must not be locked out...
             assert!(Limit::PER_IDENTITY.max >= 3);
-            // ...and a password list must not fit.
             assert!(Limit::PER_IDENTITY.max <= 10);
         };
     }
@@ -232,7 +205,6 @@ mod tests {
             "case is a free way to multiply the limit"
         );
         assert_ne!(a.identity, a.client);
-        // Namespaced, so a username can never collide with an address.
         assert!(a.identity.starts_with("id:") && a.client.starts_with("ip:"));
     }
 }

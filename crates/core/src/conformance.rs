@@ -1,23 +1,10 @@
-//! One test suite, run against every [`Store`] implementation.
+//! One test suite, run against every [`Store`] implementation, checking what the SQL does not
+//! enforce: cursor semantics, tree ordering, what "not found" means. Drift there is a silently
+//! wrong page rather than a failed build.
 //!
-//! One shared suite runs against both `Store` implementations; pure unit tests cover
-//! ranking, trust and path logic separately. This is the shared one.
-//!
-//! It lives in `core` rather than in a test directory because it has to be callable from two
-//! very different places: a native `cargo test`, and a Worker running against real D1 where
-//! `#[test]` does not exist. Both call [`run_all`].
-//!
-//! # What it is for
-//!
-//! Not to check that SQLite works. To check that two adapters agree about things the SQL does
-//! not enforce: cursor semantics, tree ordering, what "not found" means, whether the space
-//! comes back with the thread, whether a post's location survives being asked for. Those are
-//! where adapters drift, and drift here is a silently wrong page rather than a failed build.
-//!
-//! # Fixture
-//!
-//! Callers seed the store themselves — this module cannot, because inserting is target-specific
-//! and there is no write path yet. [`Fixture`] describes what the suite expects to find.
+//! It lives in `core` because it has to be callable from a native `cargo test` and from a Worker
+//! against real D1, where `#[test]` does not exist. Callers seed the store; [`Fixture`] says what
+//! the suite expects to find.
 
 use crate::id::PublicId;
 
@@ -41,10 +28,7 @@ pub struct Fixture {
     pub known_post_path: Path,
     /// A well-formed id that is definitely absent.
     pub absent: PublicId,
-    /// Ids for posts the write checks will create, and an author to attribute them to.
-    ///
-    /// Supplied rather than generated because `core` has no RNG. Provide at least 4; leave
-    /// empty to skip the write checks entirely, which is what a read-only fixture does.
+    /// At least 4, or empty to skip the write checks. Supplied because `core` has no RNG.
     pub writable: Vec<PublicId>,
     pub author_id: i64,
 }
@@ -82,10 +66,7 @@ macro_rules! require {
     };
 }
 
-/// Run every check. Returns one [`Check`] per behaviour, in order.
-///
-/// Does not stop at the first failure: when two adapters disagree it is far more useful to see
-/// the whole shape of the disagreement than the first symptom of it.
+/// Runs every check rather than stopping at the first failure, so a disagreement shows its shape.
 pub async fn run_all<S: Store>(store: &S, fx: &Fixture) -> Vec<Check> {
     vec![
         thread_page_returns_its_space(store, fx).await,
@@ -107,9 +88,7 @@ pub async fn run_all<S: Store>(store: &S, fx: &Fixture) -> Vec<Check> {
     .collect()
 }
 
-/// Write checks, skipped when the fixture supplies no ids to write with.
-///
-/// These run last because they mutate the thread: everything above assumes a stable post count.
+/// Run last, because they mutate the thread; everything above assumes a stable post count.
 async fn write_checks<S: Store>(store: &S, fx: &Fixture) -> Vec<Check> {
     if fx.writable.len() < 4 {
         return vec![Check::pass("write checks skipped (read-only fixture)")];
@@ -174,7 +153,7 @@ async fn rate_limit_counters_round_trip<S: Store>(store: &S, fx: &Fixture) -> Ch
         "the limit did not bite after {} attempts",
         limit.max
     );
-    // The client bucket is independent: it saw nothing.
+    // The client bucket is independent.
     match store.login_attempts(&k).await {
         Ok((_, None)) => Check::pass(NAME),
         Ok((_, Some(_))) => Check::fail(NAME, "identity attempts leaked into the client bucket"),
@@ -205,7 +184,7 @@ async fn a_successful_login_clears_its_bucket<S: Store>(store: &S, fx: &Fixture)
         Ok((Some(a), _)) => return Check::fail(NAME, format!("counter survived: {a:?}")),
         Err(e) => return Check::fail(NAME, format!("{e}")),
     }
-    // Idempotent: clearing an absent bucket is success, not an error.
+    // Clearing an absent bucket is success, not an error.
     match store.clear_login_attempts(&k.identity).await {
         Ok(()) => Check::pass(NAME),
         Err(e) => Check::fail(NAME, format!("second clear errored: {e}")),
@@ -293,7 +272,6 @@ async fn sessions_round_trip_and_carry_the_user<S: Store>(store: &S, fx: &Fixtur
         found.session.expires_at == session.expires_at,
         "expiry not preserved"
     );
-    // An unknown token must resolve to nothing, not to somebody.
     let stranger = SessionToken::from_bytes([0xEE; TOKEN_BYTES]);
     match store.lookup_session(&stranger.hash(), NOW).await {
         Ok(None) => {}
@@ -316,7 +294,7 @@ async fn expired_sessions_do_not_resolve<S: Store>(store: &S, fx: &Fixture) -> C
         Ok(None) => return Check::fail(NAME, "did not resolve while still live"),
         Err(e) => return Check::fail(NAME, format!("{e}")),
     }
-    // Exactly at expiry it is already gone, not still valid for one more millisecond.
+    // Exactly at expiry it is already gone.
     match store
         .lookup_session(&token.hash(), session.expires_at)
         .await
@@ -389,7 +367,6 @@ async fn logout_is_immediate_and_idempotent<S: Store>(store: &S, fx: &Fixture) -
         Ok(Some(_)) => return Check::fail(NAME, "session survived logout"),
         Err(e) => return Check::fail(NAME, format!("{e}")),
     }
-    // Deleting again is success: the caller wanted the token dead and it is.
     match store.delete_session(&token.hash()).await {
         Ok(()) => Check::pass(NAME),
         Err(e) => Check::fail(NAME, format!("second delete errored: {e}")),
@@ -538,7 +515,6 @@ async fn siblings_get_consecutive_ordinals<S: Store>(store: &S, fx: &Fixture) ->
         second.path.is_descendant_of(&parent.path),
         "second child escaped the parent"
     );
-    // The first child took ordinal 0, so this must be 1 -- not 0 again.
     require!(
         NAME,
         second.path.ordinal() == 1,
@@ -668,7 +644,7 @@ async fn paging_visits_every_post_exactly_once<S: Store>(store: &S, fx: &Fixture
     const NAME: &str = "paging visits every post exactly once";
     let mut seen: Vec<String> = Vec::new();
     let mut cursor: Option<Path> = None;
-    // Bounded so a broken cursor loops finitely rather than forever.
+    // Bounded so a broken cursor loops finitely.
     for _ in 0..(fx.post_count + 2) {
         let page = match cursor.clone() {
             None => store.thread_page(&fx.thread, &Page::first(7)).await,
@@ -732,9 +708,7 @@ async fn absent_thread_is_not_found<S: Store>(store: &S, fx: &Fixture) -> Check 
     }
 }
 
-/// The cache key depends on this, so both adapters must agree on it -- including that an
-/// unknown thread is `None` rather than an error or a zero, which would key every missing
-/// thread to the same cached page.
+/// An unknown thread is `None`; a zero would key every missing thread to the same cached page.
 async fn thread_version_is_readable_and_absent_for_unknown<S: Store>(
     store: &S,
     fx: &Fixture,
@@ -753,9 +727,7 @@ async fn thread_version_is_readable_and_absent_for_unknown<S: Store>(
     }
 }
 
-/// Registration checks whether a name is free and then inserts, which is not atomic. The
-/// unique index is the real guard, so both adapters must report the loser as `Conflict` --
-/// anything else surfaces to a visitor as a 500 rather than "that name is taken".
+/// The loser of the check-then-insert race is a `Conflict`, not a 500.
 async fn a_duplicate_username_is_a_conflict<S: Store>(store: &S, _fx: &Fixture) -> Check {
     const NAME: &str = "creating a user with a taken name is Conflict, not a backend error";
     let name = "conformance-dup-check";
@@ -769,12 +741,8 @@ async fn a_duplicate_username_is_a_conflict<S: Store>(store: &S, _fx: &Fixture) 
     }
 }
 
-/// The property a permalink depends on: following the cursor must produce a page that actually
-/// contains the post. An off-by-one lands the reader one page away with an anchor that is not
-/// in the document, which is indistinguishable from the post not existing.
-///
-/// Checked at a page size of 1 as well as the real one, because a fixture smaller than a page
-/// never leaves page zero and would pass without exercising a cursor at all.
+/// Following the cursor lands on a page that contains the post. Also checked at a page size of
+/// 1, because a fixture smaller than a page never leaves page zero.
 async fn a_permalink_cursor_lands_on_a_page_holding_the_post<S: Store>(
     store: &S,
     fx: &Fixture,
@@ -844,8 +812,7 @@ async fn posts_never_expose_body_md<S: Store>(store: &S, fx: &Fixture) -> Check 
         Ok(p) => p,
         Err(e) => return Check::fail(NAME, format!("{e}")),
     };
-    // Shipping the markdown alongside the html doubles what the database sends back for a page
-    // that renders only the html. An adapter that selects it will pass every other check here.
+    // Shipping the markdown too doubles what a page that renders only the html sends back.
     for post in &page.posts {
         require!(
             NAME,

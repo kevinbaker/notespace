@@ -1,21 +1,13 @@
-//! Reading and writing cookies.
-//!
-//! Small enough to hand-roll, and hand-rolling avoids a dependency in the wasm bundle for what
-//! is a `split(';')` in one direction and a `format!` in the other.
+//! Reading and writing cookies. Hand-rolled to keep a dependency out of the wasm bundle.
 
-/// Session cookie. `__Host-` is not decoration: the prefix is refused by browsers unless the
-/// cookie is `Secure`, has `Path=/`, and carries no `Domain` — which together mean a subdomain
-/// cannot set or overwrite it. Without it, control of `anything.notespace.org` is enough to
-/// plant a session cookie on the apex.
+/// Session cookie. Browsers refuse the `__Host-` prefix unless the cookie is `Secure`, `Path=/`
+/// and `Domain`-less, which together stop a subdomain setting or overwriting it.
 pub const SESSION: &str = "__Host-ns_session";
 
 /// Binds a CSRF token before there is a session to bind it to.
 pub const ANON: &str = "__Host-ns_anon";
 
-/// Read one cookie's value from a raw `Cookie:` header.
-///
-/// Takes the header rather than a request type so both targets share it — and so the tests run
-/// under `cargo test`, which they do not in `crates/worker`.
+/// Takes the raw header rather than a request type, so both targets share it and it is testable.
 pub fn get(header: Option<&str>, name: &str) -> Option<String> {
     header?
         .split(';')
@@ -24,11 +16,8 @@ pub fn get(header: Option<&str>, name: &str) -> Option<String> {
         .map(|(_, v)| v.trim().to_string())
 }
 
-/// A `Set-Cookie` value.
-///
-/// `HttpOnly` so script cannot read the session; `SameSite=Lax` rather than `Strict` so that
-/// following a link into the forum does not appear logged out; `Secure` and `Path=/` because
-/// `__Host-` requires them.
+/// `SameSite=Lax` rather than `Strict`, so following a link in does not appear logged out;
+/// `Secure` and `Path=/` because `__Host-` requires them.
 pub fn set(name: &str, value: &str, max_age_secs: i64) -> String {
     format!("{name}={value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={max_age_secs}")
 }
@@ -38,12 +27,8 @@ pub fn clear(name: &str) -> String {
     format!("{name}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0")
 }
 
-/// Whether `next` is a safe place to redirect to after login.
-///
-/// Only a local absolute path. Anything else is an open redirect, and a login page that
-/// forwards to an attacker's host is a phishing primitive with the site's own domain on it.
-/// `//evil.example` is the case a naive `starts_with('/')` misses: browsers read it as
-/// protocol-relative and leave the site.
+/// Local absolute paths only; anything else is an open redirect. `//evil.example` is the case a
+/// naive `starts_with('/')` misses, since browsers read it as protocol-relative.
 pub fn safe_next(next: &str) -> Option<&str> {
     let ok = next.starts_with('/')
         && !next.starts_with("//")
@@ -67,7 +52,6 @@ mod tests {
 
     #[test]
     fn a_prefix_is_not_a_match() {
-        // `ns_session` must not satisfy a lookup for `__Host-ns_session`.
         assert_eq!(get(Some("ns_session=wrong"), SESSION), None);
     }
 

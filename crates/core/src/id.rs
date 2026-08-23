@@ -1,12 +1,5 @@
 //! Public ids — opaque, time-sortable, and safe to read aloud or type.
 //!
-//! Ids are two-tier. `INTEGER PRIMARY KEY` stays the internal identity and carries every
-//! foreign key; this type is what appears in URLs.
-//!
-//! # Layout
-//!
-//! 80 bits, rendered as 16 Crockford base32 characters:
-//!
 //! ```text
 //!   48 bits          32 bits
 //! ┌───────────────┬─────────────┐
@@ -15,140 +8,43 @@
 //!   0dwjnnyq         tsdkr5wm       ->  "0dwjnnyqtsdkr5wm"
 //! ```
 //!
-//! This is a ULID truncated from 26 characters to 16: same 48-bit millisecond prefix, 32 bits
-//! of randomness instead of 80. The time prefix is load-bearing — it keeps inserts appending at
-//! the right edge of the index instead of scattering across it.
-//!
-//! Two ids can only collide inside one millisecond, so 32 random bits is ample. Collisions are
-//! caught rather than silent: `public_id` carries a UNIQUE index, so one is a failed insert to
-//! retry with fresh randomness, never a wrong row.
-//!
-//! # Typing and reading aloud
-//!
-//! The alphabet omits `I`, `L`, `O` and `U`. The first three are visually confusable with `1`
-//! and `0`; `U` is dropped so that no id accidentally spells something unfortunate. On the way
-//! in, [`PublicId::parse`] is deliberately forgiving in the ways humans actually get it wrong:
-//!
-//! - either case (canonical output is lowercase)
-//! - `I`/`l` read back as `1`, `O` as `0`
-//! - hyphens ignored, so `0dwj-nnyq-tsdk-r5wm` parses
-//!
-//! It is *not* forgiving about anything else: an unknown character is an error, not a guess.
-//!
-//! # If 32 random bits ever stops being enough
-//!
-//! The id widens while staying base32, provided one rule holds: **keep the 48-bit timestamp in
-//! the top bits and append whole characters at the bottom — never re-align the payload.** Every
-//! shorter id is then a literal prefix of its wider form, and because prefix order is time
-//! order, mixed widths sort correctly with no special handling.
-//!
-//! ```text
-//! same timestamp, three widths
-//!   16 chars ( 80 bits, 32 random)   06a1yabw00000000
-//!   20 chars (100 bits, 52 random)   06a1yabw000000000000
-//!   26 chars (128 bits, 80 random)   06a1yabw0000000000000000000
-//! ```
-//!
-//! # The widest width, and the two reserved bits
-//!
-//! 26 characters is the ceiling. It is 130 bits of encoding space, but the payload stops at 128
-//! so that [`PublicId::to_u128`] is total and exact — and so that a full ULID or UUIDv7 fits
-//! without loss. The two spare bits are **reserved at the bottom and always zero**;
-//! [`PublicId::parse`] rejects an id that sets them.
-//!
-//! Bottom is the only place they can go. A canonical ULID puts its two spare bits at the *top*,
-//! which pushes every character boundary along by two and destroys the prefix relationship:
-//!
-//! ```text
-//!   native   (16)   06a1yabw02f3eyds
-//!   top-aligned     01jgfjjz00krvqkebz99y1a4hm   <- canonical ULID:  1 char in common
-//!   bottom-aligned  06a1yabw02f3eydsfx57r58j6g   <- ours:            16 chars in common
-//! ```
-//!
-//! At 26 characters the payload is 48 bits of timestamp and 80 of randomness — *exactly* a
-//! ULID's budget, since the two bits ULID spends on top padding are the two we reserve at the
-//! bottom.
-//!
-//! # Importing a ULID or UUIDv7
-//!
-//! [`PublicId::from_ulid`], [`PublicId::from_uuid`] and [`PublicId::from_u128_payload`] import a
-//! 128-bit id; [`PublicId::to_ulid`] and [`PublicId::to_uuid`] render it back. The round trip is
-//! exact.
-//!
-//! Be precise about what "exact" covers, though: **the value round-trips, the text does not.**
-//! An imported ULID keeps all 128 bits and its real creation time — both formats put a 48-bit
-//! millisecond timestamp in the top bits — but it is stored re-aligned, so its rendered form is
-//! not the canonical ULID string. That is the deliberate trade: exact value plus prefix-stable
-//! widening, rather than byte-identical text. `imports_a_canonical_ulid_losslessly` pins it.
-//!
-//! This matters for M5 imports and for anywhere an external system already assigned ids.
-//!
-//! [`PublicId::parse`] already accepts any width in [`MIN_CHARS`]`..=`[`MAX_CHARS`], while
-//! [`PublicId::new`] only ever generates [`ID_CHARS`]. That asymmetry is the point: a future
-//! instance can widen what it generates without touching this parser and without stranding a
-//! single existing URL.
-//!
-//! `mixed_width_ids_sort_by_creation_time` and
-//! `imported_ids_interleave_correctly_with_native_ones` keep the safe path tested rather than
-//! assumed.
-//!
+//! Widening appends characters at the bottom, keeping the timestamp in the top bits, so a
+//! 16-character id is a literal prefix of its wider form and mixed widths still sort by time.
+//! Canonical ULIDs pad at the top instead, which is why importing one re-aligns it.
 
 use core::fmt;
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
-/// Canonical alphabet, lowercase, in ascending ASCII order.
-///
-/// Ordering depends on that: `'0'..='9'` is `0x30..=0x39` and `'a'..='z'` is `0x61..=0x7A`, so
-/// bytewise string comparison equals numeric comparison, and SQLite's default BINARY collation
-/// sorts ids by creation time for free.
+/// Lowercase Crockford base32 in ascending ASCII order, so bytewise comparison is numeric
+/// comparison and SQLite's BINARY collation sorts ids by creation time.
 pub const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 
-/// Characters in an id at the default width.
 pub const ID_CHARS: usize = 16;
 
-/// Shortest accepted id. Below this, 48 bits of timestamp leaves too little randomness.
 pub const MIN_CHARS: usize = 16;
 
-/// Longest accepted id: 26 characters, matching a ULID's length.
-///
-/// 26 characters is 130 bits of encoding space for a [`MAX_PAYLOAD_BITS`]-bit payload. The two
-/// spare bits are *reserved at the bottom* and must be zero — see [`RESERVED_BITS`].
-///
-/// Ids are *parsed* anywhere in `MIN_CHARS..=MAX_CHARS` even though this build only ever
-/// *generates* [`ID_CHARS`]. That asymmetry is deliberate: it means widening the generated id
-/// later needs no change here and cannot strand an existing URL.
+/// Ids parse at any width in `MIN_CHARS..=MAX_CHARS` though only `ID_CHARS` is generated, so
+/// widening later needs no parser change and strands no existing URL.
 pub const MAX_CHARS: usize = 26;
 
-/// Payload ceiling: exactly a `u128`, so [`PublicId::to_u128`] is total and exact.
-///
-/// This is what makes a full ULID or UUIDv7 representable without loss.
+/// Payload ceiling, so [`PublicId::to_u128`] is total and a ULID or UUIDv7 fits without loss.
 pub const MAX_PAYLOAD_BITS: u32 = 128;
 
-/// Bits of millisecond timestamp. 48 bits runs to the year 10889.
+/// 48 bits runs to the year 10889.
 pub const TIMESTAMP_BITS: u32 = 48;
 
-/// Bits of randomness at the default width. Widening adds 5 more per extra character.
 pub const RANDOM_BITS: u32 = (ID_CHARS as u32 * 5) - TIMESTAMP_BITS;
 
-/// Largest representable timestamp, in unix milliseconds.
 pub const MAX_TIMESTAMP_MS: u64 = (1 << TIMESTAMP_BITS) - 1;
 
-/// Spare bits at a given width: `chars * 5` of space against a payload capped at 128.
-///
-/// Zero below 26 characters, two at 26. They sit at the *bottom* of the value, which is the
-/// whole trick: the 48-bit timestamp stays in the top bits at every width, so the append rule
-/// in the module docs still holds and a 16-character id remains a literal prefix of a
-/// 26-character one. Padding at the top — what a canonical ULID does — would shift every
-/// character boundary and break that.
+/// Spare low bits at a given width: zero below 26 characters, two at 26.
 pub const fn reserved_bits(chars: usize) -> u32 {
     (chars as u32 * 5).saturating_sub(MAX_PAYLOAD_BITS)
 }
 
-/// Reserved low bits at the widest width.
 pub const RESERVED_BITS: u32 = reserved_bits(MAX_CHARS);
 
-/// Payload bits carried at a given width.
 pub const fn payload_bits(chars: usize) -> u32 {
     let raw = chars as u32 * 5;
     if raw > MAX_PAYLOAD_BITS {
@@ -161,7 +57,6 @@ pub const fn payload_bits(chars: usize) -> u32 {
 const INVALID: u8 = 0xFF;
 const SKIP: u8 = 0xFE;
 
-/// Byte -> digit value. Built at compile time; see the parsing notes in the module docs.
 const DECODE: [u8; 256] = {
     let mut t = [INVALID; 256];
     let mut i = 0;
@@ -174,14 +69,13 @@ const DECODE: [u8; 256] = {
         }
         i += 1;
     }
-    // Transcription rescues, per the Crockford base32 spec.
+    // Transcription rescues, per Crockford base32.
     t[b'i' as usize] = 1;
     t[b'I' as usize] = 1;
     t[b'l' as usize] = 1;
     t[b'L' as usize] = 1;
     t[b'o' as usize] = 0;
     t[b'O' as usize] = 0;
-    // Grouping hyphens are ignored so a chunked id can be typed back in.
     t[b'-' as usize] = SKIP;
     t
 };
@@ -203,29 +97,17 @@ pub enum IdError {
     ReservedBitsSet,
 }
 
-/// An opaque, time-sortable public identifier.
-///
-/// Stored as its canonical rendering rather than as packed integers, so that `Ord` is plain
-/// string comparison. That matters once more than one width is in play: a 16-character id is a
-/// literal prefix of its widened form, and prefix-order *is* time-order, so mixed-width ids sort
-/// correctly with no special handling. Packing into an integer would need a width-aware
-/// comparison and could not hold 130 bits in a `u128` anyway.
+/// An opaque, time-sortable public identifier, held as its canonical rendering so that `Ord` is
+/// string comparison and mixed widths sort by time without special handling.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PublicId(String);
 
 impl PublicId {
-    /// Build an id at the default width.
-    ///
-    /// Both inputs are parameters rather than fetched here, because `core` takes no I/O and
-    /// neither `std::time::SystemTime` nor a system RNG exists on wasm.
-    /// The Worker supplies `Date.now()` and `crypto.getRandomValues`; tests supply fixed values.
+    /// Clock and randomness are parameters because `core` takes no I/O.
     pub fn new(timestamp_ms: u64, random: u32) -> Result<Self, IdError> {
         Self::with_width(timestamp_ms, random as u128, ID_CHARS)
     }
 
-    /// Build an id at an explicit width, for a future instance configured to generate wider
-    /// ids. Extra bits are appended below the existing ones, so an id built
-    /// here is prefix-compatible with one built by [`PublicId::new`].
     pub fn with_width(timestamp_ms: u64, random: u128, chars: usize) -> Result<Self, IdError> {
         if timestamp_ms > MAX_TIMESTAMP_MS {
             return Err(IdError::TimestampOutOfRange(timestamp_ms));
@@ -236,7 +118,6 @@ impl PublicId {
         Ok(PublicId(Self::render(payload, chars)))
     }
 
-    /// Rebuild an id from its integer form. `payload` must fit [`payload_bits`] for the width.
     pub fn from_u128(payload: u128, chars: usize) -> Result<Self, IdError> {
         let _ = Self::random_bits(chars)?;
         let bits = payload_bits(chars);
@@ -246,14 +127,8 @@ impl PublicId {
         Ok(PublicId(Self::render(payload, chars)))
     }
 
-    /// The id as a packed integer: 48 bits of timestamp in the high position, randomness below.
-    ///
-    /// Exact and total at every width — that is what the reserved low bits buy. At 26 characters
-    /// this is a genuine 128-bit value, so it round-trips a ULID or UUIDv7 payload unchanged.
-    ///
-    /// Note that it is *width-relative*: the same timestamp at two widths yields different
-    /// integers, because the randomness below it is wider. Compare [`PublicId`] values directly
-    /// rather than their integer forms unless the widths are known to match.
+    /// Width-relative: the same timestamp at two widths yields different integers, so compare
+    /// [`PublicId`] values rather than these unless the widths match.
     pub fn to_u128(&self) -> u128 {
         let bytes = self.0.as_bytes();
         let reserved = reserved_bits(bytes.len());
@@ -265,16 +140,8 @@ impl PublicId {
         (head << (5 - reserved)) | (last >> reserved)
     }
 
-    /// Import a canonical 128-bit id — a ULID or a UUIDv7 — as a 26-character id.
-    ///
-    /// The payload is re-aligned to this format's layout (shifted up by [`RESERVED_BITS`]), so
-    /// the imported id sorts and prefixes correctly alongside natively generated ones. Because
-    /// both formats put a 48-bit millisecond timestamp in the top bits, an imported UUIDv7 or
-    /// ULID keeps its creation time under [`PublicId::timestamp_ms`].
-    ///
-    /// The rendered string is deliberately *not* the canonical ULID text for the same payload:
-    /// canonical ULID pads at the top, which would re-align every character boundary. Use
-    /// [`PublicId::to_ulid`] to get the canonical text back.
+    /// Import a canonical 128-bit id — a ULID or a UUIDv7 — as a 26-character id. The value
+    /// round-trips exactly; the rendered text does not, since the payload is re-aligned.
     pub fn from_u128_payload(payload: u128) -> Self {
         PublicId(Self::render(payload, MAX_CHARS))
     }
@@ -295,8 +162,7 @@ impl PublicId {
         if digits.len() != MAX_CHARS {
             return Err(IdError::WrongLength(digits.len()));
         }
-        // A canonical ULID carries 128 bits in 130 bits of space, so its leading character can
-        // only be 0-7. Anything larger would overflow a u128 rather than merely be unusual.
+        // A canonical ULID's leading character can only be 0-7; larger overflows a u128.
         if digits[0] >= 8 {
             return Err(IdError::ValueTooWide(digits[0]));
         }
@@ -304,9 +170,7 @@ impl PublicId {
         Ok(Self::from_u128_payload(payload))
     }
 
-    /// Parse a UUID (hex, hyphens optional) and import it. Intended for UUIDv7, whose 48-bit
-    /// millisecond prefix matches this format's; other versions import losslessly but carry no
-    /// meaningful timestamp.
+    /// Intended for UUIDv7; other versions import losslessly but carry no meaningful timestamp.
     pub fn from_uuid(s: &str) -> Result<Self, IdError> {
         let mut payload = 0u128;
         let mut n = 0;
@@ -327,24 +191,18 @@ impl PublicId {
         Ok(Self::from_u128_payload(payload))
     }
 
-    /// Render as a canonical (top-aligned, uppercase) ULID.
-    ///
-    /// Ids narrower than [`MAX_CHARS`] are zero-extended into the 128-bit space first, which
-    /// keeps the timestamp in the right place and is lossless.
+    /// Render as a canonical (top-aligned, uppercase) ULID, zero-extending narrower ids.
     pub fn to_ulid(&self) -> String {
         let p = self.to_u128() << (MAX_PAYLOAD_BITS - payload_bits(self.width()));
         let mut out = String::with_capacity(MAX_CHARS);
         for c in 0..MAX_CHARS {
-            // Top-aligned: 128 bits of payload sitting in 130 bits of space, so the leading
-            // character carries only the top 3 bits and the maximum shift is 125.
             let digit = (p >> (5 * (MAX_CHARS - 1 - c) as u32)) & 31;
             out.push(ALPHABET[digit as usize].to_ascii_uppercase() as char);
         }
         out
     }
 
-    /// Render as a hyphenated UUID string, zero-extending narrower ids as [`PublicId::to_ulid`]
-    /// does. Only meaningful as a UUIDv7 for ids that came from one.
+    /// Only meaningful as a UUIDv7 for ids that came from one.
     pub fn to_uuid(&self) -> String {
         let p = self.to_u128() << (MAX_PAYLOAD_BITS - payload_bits(self.width()));
         let h = format!("{p:032x}");
@@ -358,13 +216,12 @@ impl PublicId {
         )
     }
 
-    /// Parse a rendered id. Accepts either case, `I`/`L`/`O` confusions, grouping hyphens, and
-    /// any width in `MIN_CHARS..=MAX_CHARS`. Always yields the canonical lowercase form.
+    /// Accepts either case, `I`/`L`/`O` confusions, grouping hyphens, and any width in
+    /// `MIN_CHARS..=MAX_CHARS`; always yields the canonical lowercase form.
     pub fn parse(s: &str) -> Result<Self, IdError> {
         let mut out = String::with_capacity(s.len());
         for ch in s.chars() {
-            // Non-ASCII cannot be in the alphabet, and indexing DECODE by a multi-byte char
-            // would be wrong, so reject it before the table lookup.
+            // Indexing DECODE by a multi-byte char would be wrong.
             if !ch.is_ascii() {
                 return Err(IdError::BadCharacter(ch));
             }
@@ -382,8 +239,7 @@ impl PublicId {
         if out.len() < MIN_CHARS {
             return Err(IdError::WrongLength(out.len()));
         }
-        // At the widest width the low bits are reserved. A nonzero value there is not an id
-        // this system ever issued — most likely a canonical ULID, which is top-aligned.
+        // Nonzero reserved bits mean this was never issued here — most likely a canonical ULID.
         let reserved = reserved_bits(out.len());
         if reserved > 0 {
             let last = DECODE[out.as_bytes()[out.len() - 1] as usize];
@@ -394,13 +250,11 @@ impl PublicId {
         Ok(PublicId(out))
     }
 
-    /// Creation time, in unix milliseconds. Read from the top 48 bits, which sit in the same
-    /// place at every width — that invariance is exactly what makes widening safe.
+    /// Creation time, in unix milliseconds.
     pub fn timestamp_ms(&self) -> u64 {
         (self.to_u128() >> (payload_bits(self.width()) - TIMESTAMP_BITS)) as u64
     }
 
-    /// The random component, as an integer.
     pub fn random(&self) -> u128 {
         let random_bits = payload_bits(self.width()) - TIMESTAMP_BITS;
         self.to_u128() & ((1u128 << random_bits) - 1)
@@ -411,11 +265,7 @@ impl PublicId {
         self.0.len()
     }
 
-    /// Canonical rendering: lowercase, no hyphens.
-    ///
-    /// Allocates. Prefer [`PublicId::as_str`] where a borrow will do — the page template
-    /// renders through `Display`, which borrows, and that is why the string representation
-    /// outperforms a packed integer on the read path.
+    /// Allocates; prefer [`PublicId::as_str`] where a borrow will do.
     pub fn encode(&self) -> String {
         self.0.clone()
     }
@@ -424,8 +274,7 @@ impl PublicId {
         &self.0
     }
 
-    /// Rendering grouped into fours, for display where someone may read or type it back.
-    /// Parses again unchanged; the hyphens are ignored on input.
+    /// Grouped into fours for reading aloud; parses again unchanged.
     pub fn encode_grouped(&self) -> String {
         let mut out = String::with_capacity(self.0.len() + self.0.len() / 4);
         for (i, c) in self.0.chars().enumerate() {
@@ -450,7 +299,6 @@ impl PublicId {
         let mut out = String::with_capacity(chars);
         for c in 0..chars {
             let hi = 5 * (chars - 1 - c) as u32;
-            // Shifting left discards high bits, which is fine: only the low 5 survive the mask.
             let digit = if hi >= reserved {
                 payload >> (hi - reserved)
             } else {
@@ -474,7 +322,6 @@ impl Serialize for PublicId {
     }
 }
 
-/// Validates on the way in, like `Path`: an id that skipped validation could not round-trip.
 impl<'de> Deserialize<'de> for PublicId {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
@@ -491,7 +338,6 @@ mod tests {
 
     #[test]
     fn alphabet_is_ascending_lowercase_and_unambiguous() {
-        // The ordering guarantee rests on this, so assert it rather than trusting the literal.
         for w in ALPHABET.windows(2) {
             assert!(w[0] < w[1], "alphabet not ascending at {w:?}");
         }
@@ -539,16 +385,12 @@ mod tests {
         );
     }
 
-    // --- the transcription affordances, which are the point of Crockford base32 ---
-
     #[test]
     fn accepts_uppercase() {
         let id = PublicId::new(T, 0xDEAD_BEEF).unwrap();
         let s = id.encode();
         assert_eq!(PublicId::parse(&s.to_uppercase()), Ok(id));
     }
-
-    // --- widening ---
 
     #[test]
     fn wider_ids_keep_the_narrow_one_as_a_literal_prefix() {
@@ -562,15 +404,13 @@ mod tests {
                 wide.as_str(),
                 narrow.as_str()
             );
-            // The timestamp lives in the same bits regardless of width.
             assert_eq!(wide.timestamp_ms(), T);
         }
     }
 
     #[test]
     fn mixed_width_ids_sort_by_creation_time() {
-        // The realistic rollout: widths interleaved per id, not in clean eras, because during
-        // a deploy some requests still generate the narrow form.
+        // Widths interleave per id during a deploy rather than falling in clean eras.
         let widths = [16usize, 20, 26, 18, 22];
         let mut rows: Vec<(u64, PublicId)> = Vec::new();
         for i in 0..600u64 {
@@ -594,7 +434,6 @@ mod tests {
         );
     }
 
-    /// The invariant the 26-character width rests on: two spare bits, held at the bottom.
     #[test]
     fn widest_ids_have_zero_reserved_low_bits() {
         assert_eq!(RESERVED_BITS, 2);
@@ -614,13 +453,10 @@ mod tests {
             let id = PublicId::with_width(T, r, MAX_CHARS).unwrap();
             let last = DECODE[id.as_str().as_bytes()[MAX_CHARS - 1] as usize];
             assert_eq!(last & 0b11, 0, "reserved bits set in {id}");
-            // And the reserved bits cost nothing: the payload still round-trips exactly.
             assert_eq!(PublicId::from_u128(id.to_u128(), MAX_CHARS).unwrap(), id);
         }
     }
 
-    /// A 26-character id whose low bits are set was never issued here — most likely someone
-    /// pasted a canonical ULID, which is top-aligned.
     #[test]
     fn parse_rejects_set_reserved_bits() {
         let ok = PublicId::with_width(T, 0, MAX_CHARS).unwrap();
@@ -641,9 +477,8 @@ mod tests {
         let id = PublicId::from_ulid(ULID).unwrap();
         assert_eq!(id.width(), MAX_CHARS);
         assert_eq!(id.to_ulid(), ULID, "round trips to the canonical text");
-        // Re-aligned, so the stored text is deliberately not the ULID text.
+        // Re-aligned, so the stored text is not the ULID text.
         assert_ne!(id.encode().to_uppercase(), ULID);
-        // ...but it is a well-formed id of ours, and survives a parse.
         assert_eq!(PublicId::parse(id.as_str()).unwrap(), id);
     }
 
@@ -652,14 +487,11 @@ mod tests {
         const UUID: &str = "01890a5d-ac96-774b-bcce-b302099a8057";
         let id = PublicId::from_uuid(UUID).unwrap();
         assert_eq!(id.to_uuid(), UUID, "round trips to the canonical text");
-        // A UUIDv7 puts a 48-bit unix-ms timestamp in the top bits, same as we do, so the
-        // import keeps its real creation time rather than a re-aligned nonsense value.
         assert_eq!(id.timestamp_ms(), 0x01890a5dac96);
         assert!(PublicId::from_uuid("not-a-uuid").is_err());
         assert!(PublicId::from_uuid("01890a5d").is_err());
     }
 
-    /// The reason for bottom-aligning: an imported id still sorts with natively generated ones.
     #[test]
     fn imported_ids_interleave_correctly_with_native_ones() {
         let base = T;
@@ -673,8 +505,6 @@ mod tests {
         let times: Vec<u64> = ids.iter().map(|i| i.timestamp_ms()).collect();
         assert_eq!(times, vec![base + 10, base + 20, base + 30, base + 40]);
 
-        // And an imported id shares its prefix with a native one from the same millisecond,
-        // which is what would break under top-alignment.
         let native = PublicId::new(T, 0).unwrap();
         let wide = PublicId::from_u128_payload((T as u128) << 80);
         assert_eq!(&wide.as_str()[..ID_CHARS], native.as_str());
@@ -682,8 +512,6 @@ mod tests {
 
     #[test]
     fn integer_form_round_trips_at_every_width() {
-        // Capping the payload at 128 bits is what makes the integer form total: every id has
-        // an exact u128, including the widest.
         for chars in MIN_CHARS..=MAX_CHARS {
             let id = PublicId::with_width(T, 0xDEAD_BEEF_CAFE, chars).unwrap();
             let bits = id.to_u128();
@@ -694,7 +522,6 @@ mod tests {
                     "value exceeds its width"
                 );
             }
-            // Timestamp sits in the top 48 bits at every width.
             assert_eq!(id.timestamp_ms(), T);
         }
         assert_eq!(
@@ -730,7 +557,6 @@ mod tests {
     fn rescues_confusable_characters() {
         let id = PublicId::new(T, 0xABCD_1234).unwrap();
         let canonical = id.encode();
-        // Someone typing the id back may render 1 as I or l, and 0 as O.
         let typed = canonical.replace('1', "I").replace('0', "O");
         assert_eq!(
             PublicId::parse(&typed),
@@ -773,8 +599,7 @@ mod tests {
             Err(IdError::WrongLength(3))
         ));
         assert!(matches!(PublicId::parse(""), Err(IdError::WrongLength(0))));
-        // 17 chars is *not* an error: any width in MIN_CHARS..=MAX_CHARS parses, so that a
-        // future wider id resolves against today's build.
+        // Any width in MIN_CHARS..=MAX_CHARS parses, so a future wider id resolves here.
         assert!(
             PublicId::parse("00000000000000000").is_ok(),
             "17 chars is a valid width"
@@ -783,15 +608,12 @@ mod tests {
 
     #[test]
     fn a_typo_that_lands_on_a_valid_id_is_simply_a_different_id() {
-        // No check digit: a wrong-but-well-formed id must resolve to a different id (and so
-        // a 404), never silently to the intended one.
+        // No check digit: a wrong-but-well-formed id resolves elsewhere, never to the intended.
         let a = PublicId::new(T, 1).unwrap();
         let b = PublicId::new(T, 2).unwrap();
         assert_ne!(a, b);
         assert_ne!(a.encode(), b.encode());
     }
-
-    // --- ordering: the property the index locality measurement depends on ---
 
     #[test]
     fn sorts_by_creation_time() {
@@ -806,8 +628,6 @@ mod tests {
 
     #[test]
     fn same_millisecond_ids_stay_adjacent() {
-        // Ids from one millisecond share a 48-bit prefix, so they cluster in the index
-        // instead of scattering. That clustering is why this costs what an integer costs.
         let a = PublicId::new(T, 0).unwrap().encode();
         let b = PublicId::new(T, u32::MAX).unwrap().encode();
         let common = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
@@ -817,9 +637,6 @@ mod tests {
         );
     }
 
-    /// The documented widening path: appending bits keeps the old id as a literal prefix, so
-    /// old and new ids sort together correctly. This is what makes a future format change a
-    /// migration rather than a rewrite.
     #[test]
     fn extension_by_appending_preserves_order() {
         // A hypothetical 130-bit successor: the same [48 ts][32 rand] head, plus 50 bits.
@@ -835,12 +652,10 @@ mod tests {
             buf.iter().map(|&b| b as char).collect()
         }
 
-        // The old id is a literal prefix of its widened form.
         let old = PublicId::new(T, 0xDEAD_BEEF).unwrap().encode();
         let new = appended(T, 0xDEAD_BEEF, 0x3_FFFF_FFFF_FFFF);
         assert!(new.starts_with(&old), "{new} should start with {old}");
 
-        // Mixing formats across a cutover still sorts by creation time.
         let mut mixed: Vec<(u64, String)> = Vec::new();
         for i in 0..200u64 {
             mixed.push((
@@ -876,19 +691,16 @@ mod tests {
             prop_assert_eq!(PublicId::parse(&id.encode().to_uppercase())?, id);
         }
 
-        /// Any 128-bit payload survives an import and comes back unchanged.
         #[test]
         fn any_128_bit_payload_imports_losslessly(hi in any::<u64>(), lo in any::<u64>()) {
             let payload = ((hi as u128) << 64) | lo as u128;
             let id = PublicId::from_u128_payload(payload);
             prop_assert_eq!(id.to_u128(), payload);
             prop_assert_eq!(id.width(), MAX_CHARS);
-            // The reserved bits are always clear, so it parses back as one of ours.
             prop_assert_eq!(PublicId::parse(id.as_str())?, id.clone());
             prop_assert_eq!(id.timestamp_ms(), (payload >> 80) as u64);
         }
 
-        /// Canonical ULID text survives a round trip through our re-aligned representation.
         #[test]
         fn ulid_text_round_trips(hi in 0u64..(1 << 63), lo in any::<u64>()) {
             let payload = ((hi as u128) << 64) | lo as u128;
@@ -896,7 +708,6 @@ mod tests {
             prop_assert_eq!(PublicId::from_ulid(&id.to_ulid())?, id);
         }
 
-        /// The integer form is an exact, lossless view of the id.
         #[test]
         fn integer_form_is_lossless(
             ms in 0u64..=MAX_TIMESTAMP_MS,
@@ -908,7 +719,6 @@ mod tests {
             prop_assert_eq!(id.timestamp_ms(), ms);
         }
 
-        /// Widening preserves both the prefix relationship and the timestamp, at every width.
         #[test]
         fn widening_preserves_prefix_and_timestamp(
             ms in 0u64..=MAX_TIMESTAMP_MS,
@@ -916,7 +726,6 @@ mod tests {
             chars in MIN_CHARS..=MAX_CHARS,
         ) {
             let narrow = PublicId::new(ms, r)?;
-            // Widen by appending: shift the existing randomness up and fill below it.
             let extra_bits = payload_bits(chars) - payload_bits(ID_CHARS);
             let wide = PublicId::with_width(ms, (r as u128) << extra_bits, chars)?;
             prop_assert!(wide.as_str().starts_with(narrow.as_str()));
@@ -924,7 +733,6 @@ mod tests {
             prop_assert_eq!(narrow.timestamp_ms(), ms);
         }
 
-        /// String order, numeric order and (timestamp, random) order all agree.
         #[test]
         fn string_order_matches_time_order(
             a_ms in 0u64..=MAX_TIMESTAMP_MS, a_r in any::<u32>(),
@@ -936,7 +744,6 @@ mod tests {
             prop_assert_eq!(a.cmp(&b), (a_ms, a_r).cmp(&(b_ms, b_r)));
         }
 
-        /// Every rendered id is exactly 16 characters from the alphabet.
         #[test]
         fn encoding_is_well_formed(ms in 0u64..=MAX_TIMESTAMP_MS, r in any::<u32>()) {
             let s = PublicId::new(ms, r)?.encode();

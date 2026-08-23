@@ -1,12 +1,8 @@
-//! PBKDF2 through the runtime's own `crypto.subtle`.
+//! PBKDF2 through the runtime's own `crypto.subtle`, which links no cryptography into the bundle
+//! — only the glue to call it — where Argon2 is compiled in.
 //!
-//! The point of this module is a size comparison, and the answer is that WebCrypto is a
-//! *platform* API: using it links no cryptography into the bundle at all — only the
-//! wasm-bindgen glue to call it. Argon2, being a Rust crate, is compiled in.
-//!
-//! Runs natively rather than in wasm, but workerd caps PBKDF2 at 100,000 iterations where
-//! OWASP asks for 600,000, and even the capped version exceeds the 10 ms budget. Kept for a
-//! paid-plan deployment; not used by default.
+//! Unused by default: workerd caps PBKDF2 at 100,000 iterations against OWASP's 600,000, and even
+//! the capped version exceeds the 10 ms budget. Kept for a paid-plan deployment.
 
 use worker::js_sys::{global, Array, Object, Promise, Reflect, Uint8Array};
 use worker::wasm_bindgen::{JsCast, JsValue};
@@ -22,8 +18,7 @@ pub async fn derive(password: &str, salt: &[u8], iterations: u32) -> Result<Vec<
             "workerd caps PBKDF2 at {MAX_ITERATIONS} iterations, asked for {iterations}"
         ));
     }
-    // There is no `window` in a Worker; the global object carries `crypto`. Reaching it by
-    // reflection rather than through web-sys bindings keeps this to a few hundred bytes.
+    // No `window` in a Worker; reflection rather than web-sys keeps this to a few hundred bytes.
     let crypto = Reflect::get(&global(), &JsValue::from_str("crypto"))
         .map_err(|e| format!("global.crypto: {e:?}"))?;
     let subtle = Reflect::get(&crypto, &JsValue::from_str("subtle"))

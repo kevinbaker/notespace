@@ -1,11 +1,5 @@
-//! Rendering, split by *when* it runs.
-//!
-//! The rule is: render at write time, never at read time.
-//!
-//! - [`markdown`] runs once per post, on write. It is allowed to be comparatively expensive.
-//! - [`page`] runs on a cold read, assembling already-rendered fragments. It must be cheap.
-//!
-//! The 10ms CPU budget applies to both, but only the read path runs on every request.
+//! Rendering, split by when it runs: [`markdown`] once per post at write time, where it can
+//! afford to be expensive, and [`page`] on a cold read, assembling already-rendered fragments.
 
 pub mod auth;
 pub mod index;

@@ -1,39 +1,25 @@
 //! Resolving the password pepper, and refusing to run without one.
-//!
-//! The pepper is never auto-generated on this target: there is nowhere safe to put it, a Worker
-//! cannot write its own secrets, and concurrent isolates would each generate a different value.
-//! Password login therefore does not start without `PASSWORD_PEPPER`.
-//!
-//! "Refuse" is scoped: **anything touching a password returns 503**, reading continues, and the
-//! reason is logged at `console_error` on every isolate that starts.
 
 use notespace_core::password::{PepperSet, Scheme};
 use worker::{console_error, Env};
 
-/// Optional var selecting where the memory-hard work happens.
-///
-/// `constrained` (default) hashes server-side. `client-argon` expects the client to have run
-/// OWASP-grade Argon2id already and to post the derived key.
 pub const SCHEME_BINDING: &str = "PASSWORD_SCHEME";
 
-/// Secret holding every pepper the deployment has ever used.
-///
-/// Format: `1=<secret>;2=<secret>;…`, highest id current. Rotating means appending an entry;
-/// nothing already stored changes meaning, because every hash names the id that made it.
+/// `1=<secret>;2=<secret>;…`, highest id current.
 pub const PEPPER_BINDING: &str = "PASSWORD_PEPPER";
 
-/// Whether local password login is available, and why not when it is not.
 pub enum AuthConfig {
-    /// Password login is compiled out. Authentication is external (OIDC).
+    /// Password login compiled out; authentication is external.
     External,
-    /// Password login is available.
-    Passwords { peppers: PepperSet, scheme: Scheme },
-    /// Password login is compiled in but refuses to run. Auth routes must answer 503.
+    Passwords {
+        peppers: PepperSet,
+        scheme: Scheme,
+    },
+    /// Compiled in but refusing to run; auth routes answer 503.
     Refused(&'static str),
 }
 
 impl AuthConfig {
-    /// Read the deployment's auth posture from its bindings.
     pub fn resolve(env: &Env) -> AuthConfig {
         if !cfg!(feature = "password") {
             return AuthConfig::External;
@@ -46,7 +32,7 @@ impl AuthConfig {
                  crates/worker/src/auth_config.rs.",
             );
         };
-        // Any error is fatal: a partly-loaded set would strand an arbitrary subset of accounts.
+        // A partly-loaded set would strand an arbitrary subset of accounts.
         let peppers = match PepperSet::parse(&spec) {
             Ok(p) => p,
             Err(_) => {
@@ -67,7 +53,7 @@ impl AuthConfig {
             None | Some("constrained") => Scheme::CONSTRAINED,
             Some("client-argon") => Scheme::CLIENT_ARGON,
             Some(other) => {
-                // Never fall back to the default: a misspelling must not silently weaken.
+                // Refuse rather than default, so a misspelling cannot silently weaken hashing.
                 console_error!(
                     "{SCHEME_BINDING}={other:?} is not a known scheme. Expected \
                      \"constrained\" or \"client-argon\". Password login is disabled."

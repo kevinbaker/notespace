@@ -5,8 +5,7 @@
 use std::cell::Cell;
 
 thread_local! {
-    /// Workers are single-threaded and an isolate serves many requests, so this reports once
-    /// per isolate rather than once per request.
+    /// Once per isolate, not once per request.
     static REPORTED: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -25,8 +24,7 @@ pub enum Posture {
     Refused(&'static str),
 }
 
-/// Log the posture once per isolate. Warnings are `console_error` so they are not lost in
-/// ordinary request logs.
+/// Warnings go to `console_error`, so they are not lost among ordinary request logs.
 pub fn report_once(p: &Posture) {
     if REPORTED.with(|r| r.replace(true)) {
         return;
@@ -44,7 +42,7 @@ pub fn report_once(p: &Posture) {
         #[cfg(feature = "password")]
         Posture::PasswordsWithPepper => {
             worker::console_log!("notespace: local password login is enabled, pepper configured");
-            // True on this target by construction: CONSTRAINED is what fits 10 ms of CPU.
+            // True by construction on this target: CONSTRAINED is what fits 10 ms of CPU.
             worker::console_error!(
                 "notespace: NOTE -- Argon2 parameters are below the OWASP minimum. The free plan \
                  allows 10 ms of CPU per request and OWASP's minimum needs ~57 ms. The pepper is \
@@ -58,8 +56,7 @@ pub fn report_once(p: &Posture) {
                 "notespace: local password login is enabled, pepper configured, \
                  PASSWORD_SCHEME=client-argon (OWASP-grade Argon2id runs on the client)"
             );
-            // Not a weakness warning -- a compatibility one. Said at the same volume because a
-            // login form nobody can use is also an outage, just a quieter one.
+            // A compatibility warning, not a weakness one, at the same volume.
             worker::console_error!(
                 "notespace: NOTE -- client-argon expects the client to post a 32-byte \
                  Argon2id-derived key as hex, not a password. No browser client ships with \

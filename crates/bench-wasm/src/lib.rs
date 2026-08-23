@@ -1,18 +1,8 @@
-//! CPU measurement harness for the M0 spike.
-//!
-//! # Why this exists rather than a native `criterion` benchmark
-//!
-//! The number that matters is CPU *on a Worker*, and a Worker runs wasm under V8.
-//! Native x86 timings would be measuring the wrong machine code on the wrong engine. Node
-//! runs the same V8 that workerd embeds, so timing this module under Node measures the same
-//! compiled wasm, executed by the same JIT, that Cloudflare would run.
-//!
-//! It is not a perfect proxy — workerd's isolate differs in startup and in memory limits,
-//! and production hardware differs from this container. It is close enough to answer the
-//! question M0 actually poses: is this within an order of magnitude of 10ms, or nowhere near?
-//!
-//! `Date.now()` inside a real Worker is coarse and advances only on I/O, which is exactly
-//! why the measurement is taken here instead of in the Worker itself.
+//! CPU measurement harness, run under Node rather than natively: Node embeds the same V8 that
+//! workerd does, so this times the same compiled wasm on the same JIT. Not a perfect proxy —
+//! isolate startup, memory limits and hardware all differ — but enough to answer whether
+//! something is near 10 ms or nowhere near. `Date.now()` inside a real Worker is too coarse to
+//! measure with, which is why this is not in the Worker itself.
 
 pub mod packed;
 
@@ -34,8 +24,7 @@ thread_local! {
     static FIXTURE: RefCell<Option<ThreadPage>> = const { RefCell::new(None) };
 }
 
-/// Parse the fixture. Deliberately outside the timed region: a real Worker gets its posts
-/// from D1, not from JSON, so JSON parsing is not part of the read path.
+/// Outside the timed region: a real Worker gets its posts from D1, not from JSON.
 #[wasm_bindgen]
 pub fn load(json: &str) -> Result<usize, JsError> {
     let f: Fixture = serde_json::from_str(json).map_err(|e| JsError::new(&e.to_string()))?;
@@ -50,11 +39,8 @@ pub fn load(json: &str) -> Result<usize, JsError> {
     Ok(n)
 }
 
-/// **The read path.** What runs on every cold thread-page request: take posts whose HTML was
-/// rendered at write time and assemble the document. This is the number that matters, because
-/// it runs on every request that misses cache.
-///
-/// Returns the byte length of the rendered page so the optimiser cannot elide the work.
+/// **The read path**, run on every request that misses cache. Returns the page length so the
+/// optimiser cannot elide the work.
 #[wasm_bindgen]
 pub fn render_read_path() -> usize {
     FIXTURE.with(|c| {
@@ -64,10 +50,8 @@ pub fn render_read_path() -> usize {
     })
 }
 
-/// **The write path, batched 200x.** Re-renders every post's markdown through
-/// pulldown-cmark + ammonia. In production this cost is paid once per post at submit time,
-/// never per page view; measuring 200 at once gives the per-post cost and shows what a
-/// worst-case cold rebuild of a whole thread would cost.
+/// **The write path, batched 200x.** Paid once per post at submit time in production; batching
+/// gives both the per-post cost and a worst-case whole-thread rebuild.
 #[wasm_bindgen]
 pub fn render_write_path() -> usize {
     FIXTURE.with(|c| {
@@ -94,9 +78,7 @@ pub fn depth_stats() -> Vec<f64> {
     })
 }
 
-/// **Path parsing on the read path.** `D1Store` validates every path it loads, so a thread
-/// page pays this once per post. Measured separately because it is pure nested-tree logic:
-/// if materialized paths were expensive to handle, this is where it would show.
+/// **Path parsing on the read path**, paid once per post because `D1Store` validates each one.
 #[wasm_bindgen]
 pub fn bench_path_parse() -> usize {
     FIXTURE.with(|c| {
@@ -110,8 +92,7 @@ pub fn bench_path_parse() -> usize {
     })
 }
 
-/// **Path construction on the write path.** Computing a reply's path from its parent's,
-/// which is the only tree bookkeeping an insert has to do.
+/// **Path construction on the write path**: the only tree bookkeeping an insert does.
 #[wasm_bindgen]
 pub fn bench_path_build() -> usize {
     FIXTURE.with(|c| {
@@ -125,8 +106,7 @@ pub fn bench_path_build() -> usize {
     })
 }
 
-/// **Ordering.** SQLite does this in the index, but the cost of comparing paths is what makes
-/// that index cheap, so it is worth knowing.
+/// **Ordering.** SQLite does this in the index; the comparison cost is what makes it cheap.
 #[wasm_bindgen]
 pub fn bench_path_sort() -> usize {
     FIXTURE.with(|c| {
@@ -228,8 +208,7 @@ pub fn id_setup(n: usize) -> usize {
     len
 }
 
-/// Verify the two representations agree before timing them. Returns the number of mismatches;
-/// a nonzero result invalidates every timing below.
+/// A nonzero result invalidates every timing below.
 #[wasm_bindgen]
 pub fn id_cross_check() -> usize {
     IDS.with(|c| {
@@ -251,13 +230,12 @@ pub fn id_cross_check() -> usize {
             if strs[i].width() != packs[i].width() {
                 bad += 1;
             }
-            // Both must accept the messy form and normalise to the same canonical text.
             match (PublicId::parse(&messy[i]), PackedId::parse(&messy[i])) {
                 (Ok(x), Some(y)) if x.encode() == canon[i] && y.encode() == canon[i] => {}
                 _ => bad += 1,
             }
         }
-        // Sort order must agree across widths, which is the subtle part for the packed form.
+        // Sort order across widths is the subtle part for the packed form.
         let mut sa: Vec<&PublicId> = strs.iter().collect();
         let mut sb: Vec<&PackedId> = packs.iter().collect();
         sa.sort();
@@ -360,12 +338,9 @@ id_bench!(id_sort_packed, |_, packs: &Vec<PackedId>, _, _| {
     v.len()
 });
 
-/// The mix as the real template runs it.
-///
-/// `page.rs` renders the id through `Display`, which for the string form borrows and for the
-/// packed form must materialise a `String` every time. Measuring `.encode()` instead (as
-/// `id_page_mix_string` does) charges the string form for a clone that the render path never
-/// performs, so this is the honest comparison.
+/// The mix as the real template runs it: through `Display`, which the string form borrows for
+/// and the packed form must allocate for. `id_page_mix_string` charges a clone the render path
+/// never performs.
 #[wasm_bindgen]
 pub fn id_page_mix_string_display() -> usize {
     IDS.with(|c| {
@@ -384,9 +359,8 @@ pub fn id_page_mix_string_display() -> usize {
     })
 }
 
-/// What one thread-page request actually costs: parse the id from the URL, parse the one that
-/// came back from D1, then render it into the page a few times (canonical URL, RSS link,
-/// pager, personalisation hook).
+/// One request's worth: parse the id from the URL, parse the one D1 returned, render it into the
+/// page a few times.
 #[wasm_bindgen]
 pub fn id_page_mix_string() -> usize {
     IDS.with(|c| {
@@ -434,8 +408,7 @@ pub fn id_sizes() -> Vec<usize> {
 // Password hashing against the 10 ms CPU budget
 // ---------------------------------------------------------------------------
 //
-// Password hashing is deliberately slow and the free-plan CPU limit is 10 ms per request. That
-// is the whole problem, and it is worth numbers rather than assumptions.
+// Password hashing is deliberately slow and the free-plan CPU limit is 10 ms per request.
 
 use argon2::{Algorithm, Argon2, Params, Version};
 
@@ -467,7 +440,7 @@ pub fn kdf_argon2(m_kib: u32, t: u32) -> u8 {
     out[0]
 }
 
-/// Argon2id with a pepper (Argon2's own secret parameter), to confirm it costs nothing.
+/// Argon2id with a pepper (Argon2's own `K` parameter), to confirm it costs nothing.
 #[wasm_bindgen]
 pub fn kdf_argon2_peppered(m_kib: u32, t: u32) -> u8 {
     let params = Params::new(m_kib, t, 1, Some(32)).expect("valid params");

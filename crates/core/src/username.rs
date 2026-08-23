@@ -1,31 +1,12 @@
-//! Usernames — permanent, global, and never reassigned.
+//! Usernames — permanent, global, and never reassigned. `/u/testuser` resolves the account, so
+//! unlike a thread's decorative slug the name is load-bearing.
 //!
-//! `/u/testuser`. The name resolves the account, so unlike a thread's decorative slug it is
-//! load-bearing.
+//! There is no rename operation. A reusable name is an impersonation vector: every old link,
+//! quote and `@mention` naming `alice` would start pointing at whoever claimed it next, and a
+//! forum's four-year-old threads are still cited. Deleting an account leaves a tombstone row
+//! rather than freeing the name.
 //!
-//! # Usernames do not change
-//!
-//! There is no rename. Not "rename is discouraged" — there is no operation. Someone who wants a
-//! different name signs up again.
-//!
-//! That is a deliberate trade of convenience for a property that is otherwise very hard to get.
-//! A renameable username is a reusable one, and a reusable one is an impersonation vector: every
-//! old link, quote and `@mention` naming `alice` silently starts pointing at whoever claimed it
-//! next. Forums are archives — a thread from four years ago is still readable, still cited, and
-//! its attributions must still mean what they meant. Making the name permanent removes the
-//! entire class, and removes the redirect table, the reclaim-window policy and the tombstones
-//! that would otherwise be needed to contain it.
-//!
-//! A consequence worth stating: **the name stays taken after the account is deleted.** The `user`
-//! row becomes a tombstone rather than disappearing, so the name can never be reissued. An old
-//! `/u/` link to a deleted account should 404 (or show a tombstone) — never resolve to a
-//! different person.
-//!
-//! # Reserved names
-//!
-//! Usernames get [`RESERVED`], which is *not* the space list. The concerns differ: a username
-//! must not imply staff authority, and must not shadow a `/u/` sub-route. `new` and `search` are
-//! fine as usernames and reserved as space names; `admin` and `moderator` are the reverse.
+//! [`RESERVED`] is not the space list: it guards authority words and `/u/` sub-routes.
 
 use core::fmt;
 
@@ -36,11 +17,7 @@ use crate::naming::{self, NameError, Rules};
 pub const MIN_CHARS: usize = 2;
 pub const MAX_CHARS: usize = 24;
 
-/// Names no account may claim. Kept sorted — the lookup binary-searches it.
-///
-/// Two groups: words implying authority or system identity, and words that would shadow a
-/// `/u/` sub-route. Deliberately shorter than the space list, since a username never appears
-/// in a hierarchical path.
+/// Names no account may claim, kept sorted for binary search.
 pub const RESERVED: &[&str] = &[
     "about",
     "admin",
@@ -152,7 +129,6 @@ mod tests {
         }
     }
 
-    /// The invisible attack: an ASCII-only charset ends it without any lookalike analysis.
     #[test]
     fn rejects_non_ascii_lookalikes() {
         for input in ["\u{0430}dmin", "t\u{0435}stuser", "n\u{043E}tespace"] {
@@ -172,7 +148,6 @@ mod tests {
                 "accepted {input:?}"
             );
         }
-        // Digit substitution does not get around it.
         for input in ["adm1n", "m0d3rator", "5ystem"] {
             assert!(
                 matches!(Username::parse(input), Err(NameError::Reserved(_))),
@@ -181,8 +156,6 @@ mod tests {
         }
     }
 
-    /// The username and space lists are separate on purpose, and this pins the difference so
-    /// that a word added to one is not silently assumed to be in the other.
     #[test]
     fn reserved_list_differs_from_the_space_list() {
         use crate::space_key::RESERVED as SPACE;

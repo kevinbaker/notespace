@@ -1,30 +1,11 @@
-//! Space names and the paths built from them.
+//! Space names and the paths built from them: `/s/sports/hockey`, one [`SpaceKey`] per segment,
+//! the whole thing a [`SpacePath`].
 //!
-//! `/s/sports/hockey`. `/s/` is the route prefix; everything after it is the path. Each segment
-//! is a [`SpaceKey`], and the whole thing is a [`SpacePath`].
+//! Keys are unique per parent, not globally, so the path is the identifier and resolution is one
+//! indexed lookup rather than a walk. Renames rewrite the path and may leave a tombstone row
+//! carrying `moved_to`, which the same lookup finds, so a redirect costs no extra query.
 //!
-//! # Unique per parent
-//!
-//! `sports/general` and `music/general` are different spaces. The key alone does not identify a
-//! space — the path does — which is the main way this differs from a
-//! [`Username`](crate::username::Username).
-//!
-//! Resolution is one indexed lookup on the materialized path, the same trick `post.path` uses,
-//! rather than a walk parent by parent.
-//!
-//! # Renaming
-//!
-//! Spaces can be renamed and moved, unlike usernames. A rename rewrites the row's path; if the
-//! old URL should keep working, a tombstone row is left behind with a nullable `moved_to`
-//! pointing at the new one. The lookup that resolves any path already finds it, so a redirect
-//! costs **zero extra queries** — and an
-//! instance that does not care simply lets the old path 404.
-//!
-//! # Reserved names
-//!
-//! Spaces get [`RESERVED`], which is *not* the username list. A space name must not shadow a
-//! sub-route under `/s/`, so `new`, `edit` and `search` are reserved here and perfectly fine as
-//! usernames. Authority words like `moderator` are the reverse.
+//! [`RESERVED`] is not the username list: it guards sub-routes under `/s/`.
 
 use core::fmt;
 
@@ -37,17 +18,9 @@ pub const MAX_CHARS: usize = 32;
 pub const PATH_SEP: char = '/';
 
 /// Deepest nesting, counting the top level as depth 1.
-///
-/// Discourse allows two levels and is the most-used hierarchical forum; three leaves room
-/// without producing URLs nobody can read. It also bounds a stored path to roughly
-/// `3 * (MAX_CHARS + 1)` bytes, which keeps the unique index small.
 pub const MAX_DEPTH: usize = 3;
 
-/// Names no space may take. Kept sorted — the lookup binary-searches it.
-///
-/// Mostly sub-routes that would otherwise be ambiguous: `/s/sports/new` must mean "new thread in
-/// sports", not "the child space named new". Shorter on authority words than the username list,
-/// since a space named `support` is a reasonable thing to want.
+/// Names no space may take, kept sorted for binary search. Mostly ambiguous sub-routes.
 pub const RESERVED: &[&str] = &[
     "about",
     "admin",
@@ -92,9 +65,7 @@ impl fmt::Display for SpaceKey {
     }
 }
 
-/// The full path identifying a space: its key and every ancestor's.
-///
-/// Stored **with a trailing separator** (`"sports/hockey/"`), rendered without one.
+/// Stored with a trailing separator (`"sports/hockey/"`), rendered without one.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SpacePath(String);
 
@@ -104,7 +75,7 @@ impl SpacePath {
         SpacePath(format!("{key}{PATH_SEP}"))
     }
 
-    /// A child of this space. Fails past [`MAX_DEPTH`].
+    /// Fails past [`MAX_DEPTH`].
     pub fn child(&self, key: &SpaceKey) -> Result<Self, SpacePathError> {
         let depth = self.depth() + 1;
         if depth > MAX_DEPTH {
@@ -113,7 +84,7 @@ impl SpacePath {
         Ok(SpacePath(format!("{}{key}{PATH_SEP}", self.0)))
     }
 
-    /// Parse the portion of a `/s/...` URL after the prefix, with or without a trailing slash.
+    /// The portion of a `/s/...` URL after the prefix, with or without a trailing slash.
     pub fn parse(url_path: &str) -> Result<Self, SpacePathError> {
         let mut path: Option<SpacePath> = None;
         for seg in url_path.split(PATH_SEP).filter(|s| !s.is_empty()) {
@@ -126,7 +97,7 @@ impl SpacePath {
         path.ok_or(SpacePathError::Empty)
     }
 
-    /// Stored form, trailing separator included. This is what goes in the database.
+    /// Stored form, trailing separator included.
     pub fn as_stored(&self) -> &str {
         &self.0
     }
@@ -160,18 +131,9 @@ impl SpacePath {
         Some(SpacePath(self.as_url()[..=cut].to_string()))
     }
 
-    /// Half-open range `[lo, hi)` selecting this space and every descendant.
-    ///
-    /// The upper bound increments the trailing separator: `/` is 0x2F, so `0` (0x30) is the next
-    /// code point and nothing under this path can reach it.
-    ///
-    /// The trailing separator is load-bearing, not cosmetic. A key may contain `-` (0x2D), which
-    /// sorts *below* `/`, so a range over untrailed paths swallows siblings:
-    ///
-    /// ```text
-    ///   ['sports', 'sports0')    -> sports, sports-betting, sports/hockey   WRONG
-    ///   ['sports/', 'sports0')   -> sports/, sports/hockey/                 right
-    /// ```
+    /// Half-open range `[lo, hi)` selecting this space and every descendant. The trailing
+    /// separator is load-bearing: a key may contain `-` (0x2D), which sorts below `/` (0x2F), so
+    /// an untrailed range would swallow `sports-betting` into `sports`.
     pub fn subtree_range(&self) -> (String, String) {
         let mut hi = self.0.clone();
         hi.pop();
@@ -186,8 +148,7 @@ impl fmt::Display for SpacePath {
     }
 }
 
-/// Distinct from [`crate::path::PathError`], which is about a *post's* materialized path
-/// inside a thread. Same technique, different tree.
+/// Distinct from [`crate::path::PathError`]: same technique, different tree.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SpacePathError {
     #[error(transparent)]
@@ -225,7 +186,6 @@ mod tests {
                 "accepted {input:?}"
             );
         }
-        // Which is what keeps /s/sports/new unambiguous.
         assert!(SpacePath::parse("sports/new").is_err());
     }
 
@@ -264,7 +224,6 @@ mod tests {
         assert!(SpacePath::parse("sports/-bad").is_err());
     }
 
-    /// Per-parent uniqueness: the same key under two parents is two different spaces.
     #[test]
     fn same_key_under_different_parents_is_distinct() {
         let a = SpacePath::root(&key("sports"))
@@ -289,13 +248,11 @@ mod tests {
         for p in ["sports-betting/", "sportswear/", "music/", "sport/"] {
             assert!(!(lo.as_str() <= p && p < hi.as_str()), "{p} leaked in");
         }
-        // Without the trailing separator the sibling does leak -- the failure mode itself.
+        // Without the trailing separator the sibling leaks.
         assert!("sports" <= "sports-betting" && "sports-betting" < "sports0");
     }
 
     proptest! {
-        /// A path round-trips through its URL form, and its subtree range always contains it
-        /// and its children.
         #[test]
         fn paths_round_trip_and_contain_their_children(
             a in "[a-z]{2,8}", b in "[a-z]{2,8}", nest in any::<bool>(),

@@ -12,4 +12,5 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 [dev-dependencies]
 notespace-render = { path = "../render" }
 tokio = { version = "1", features = ["macros", "rt"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+# `trace` lets the suite count statements, which is how the read path's query budget is checked.
+rusqlite = { version = "0.37", features = ["bundled", "trace"] }

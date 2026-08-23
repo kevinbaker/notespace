@@ -1,25 +1,18 @@
-//! Emits seed SQL for the M0 spike to stdout.
+//! Emits seed SQL to stdout. Bodies go through the real renderer, so `body_html` matches what a
+//! live post would store, and the PRNG is fixed-seed so re-runs compare like with like.
 //!
-//! Two properties matter here:
+//! ```text
+//! cargo run -p notespace-seed -- [post_count] sql  > seed.sql
+//! cargo run -p notespace-seed -- [post_count] json > fixture.json
+//! ```
 //!
-//! 1. **It uses the real write path.** Bodies go through `notespace_render::markdown_to_html`,
-//!    so `body_html` in the seeded database is byte-identical to what a live post would
-//!    store. Measuring the read path against hand-written HTML would measure nothing.
-//! 2. **It is deterministic.** A fixed-seed xorshift PRNG, not `rand`, so re-running the
-//!    benchmark compares like with like.
-//!
-//! Usage:
-//!   `cargo run -p notespace-seed -- [post_count] sql  > seed.sql`
-//!   `cargo run -p notespace-seed -- [post_count] json > fixture.json`
-//!
-//! The JSON form feeds the wasm CPU benchmark, so the benchmark and the database measure
-//! the exact same content.
+//! The JSON form feeds the wasm benchmark, so it and the database hold the same content.
 
 use notespace_core::id::PublicId;
 use notespace_core::path::Path;
 use notespace_render::markdown_to_html;
 
-/// Deterministic PRNG. Avoids a dependency and guarantees reproducible measurements.
+/// Deterministic PRNG, so measurements reproduce.
 struct Rng(u64);
 
 impl Rng {
@@ -42,8 +35,7 @@ const USERS: &[&str] = &[
     "niaj", "olivia", "peggy", "rupert", "sybil", "trent", "victor",
 ];
 
-/// Body fragments chosen to exercise the parts of the renderer a real forum hits:
-/// paragraphs, inline code, fenced blocks, links, lists, quotes, emphasis.
+/// Chosen to exercise the parts of the renderer a real forum hits.
 const FRAGMENTS: &[&str] = &[
     "I've been running something similar for about eighteen months now and the maintenance\nburden is genuinely lower than I expected. The tricky part was never the software.",
     "Worth noting that this depends on which version you're on. On 2.x the flag was\n`--strict-mode`, but it got renamed in 3.0 and the old spelling now silently does nothing.",
@@ -94,10 +86,7 @@ fn json_string(s: &str) -> String {
     out
 }
 
-/// Deterministic public id for seeded post `i`.
-///
-/// One millisecond apart so the ids sort in the same order as the posts, which is what a real
-/// instance produces and what M0's index-locality result depends on.
+/// One millisecond apart, so the ids sort in the same order as the posts.
 fn post_public_id(i: usize) -> String {
     const SEED_BASE_MS: u64 = 1_735_689_600_000;
     notespace_core::PublicId::new(SEED_BASE_MS + i as u64, 0x5EED_0000 ^ i as u32)
@@ -105,20 +94,16 @@ fn post_public_id(i: usize) -> String {
         .encode()
 }
 
-/// SQL for a test account with a real Argon2 credential.
-///
-/// `notespace-seed user <name> <password> <pepper-spec>`. The pepper spec is the same string as
-/// PASSWORD_PEPPER, so the hash written here verifies against the running deployment — a fixture
-/// hashed under a different pepper would fail login for reasons that look like a code bug.
+/// `notespace-seed user <name> <password> <pepper-spec>`. The spec is the same string as
+/// PASSWORD_PEPPER, so the hash verifies against the running deployment.
 fn user_sql(name: &str, password: &str, pepper_spec: &str) -> String {
     use notespace_core::password::{self, PepperSet, Scheme};
     let peppers = PepperSet::parse(pepper_spec).expect("valid pepper spec");
-    // Deterministic salt: a seeding tool wants reproducible fixtures.
+    // Deterministic salt, for reproducible fixtures.
     let salt = password::encode_salt(b"notespace-seed01").expect("salt encodes");
     let hash = password::hash(password, &salt, Scheme::CONSTRAINED, &peppers).expect("hash");
     format!(
-        // Upsert: the base seed already creates accounts without credentials, so a plain
-        // INSERT collides with the unique name and silently leaves them unable to log in.
+        // The base seed already creates accounts without credentials, so a plain INSERT collides.
         "INSERT INTO user (name, created_at, password_hash, state) VALUES ('{}', {}, '{}', 'active') \
          ON CONFLICT(name) DO UPDATE SET password_hash = excluded.password_hash, state = 'active';",
         sql_quote(&name.to_lowercase()),
@@ -152,15 +137,13 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(200);
     let json_mode = std::env::args().nth(2).is_some_and(|m| m == "json");
-    // Nesting profile. Reply-tree shape is an independent variable from post count, and the
-    // read path's cost may depend on it, so it has to be controllable to be measured.
+    // Tree shape is independent of post count, so it has to be controllable to be measured.
     let profile = std::env::args().nth(3).unwrap_or_else(|| "mixed".into());
 
     let mut rng = Rng(0x5EED_1234_ABCD_0001);
     let base_time: i64 = 1_735_689_600; // 2025-01-01T00:00:00Z, fixed for reproducibility
 
-    // Built from the thread's own creation time so the id is time-sortable exactly as a live
-    // one would be, and deterministic so re-running the benchmark compares like with like.
+    // From the thread's own creation time, so the id is time-sortable as a live one would be.
     let thread_public_id = PublicId::new(base_time as u64 * 1000, rng.next() as u32)
         .unwrap_or_else(|_| unreachable!("base_time is within the 48-bit range"));
 
@@ -196,16 +179,12 @@ fn main() {
         eprintln!("thread public id: {thread_public_id}  (/t/{thread_public_id})");
     }
 
-    // Build a realistic reply tree: mostly shallow, with occasional deep subthreads.
-    // `frontier` holds candidate parents; picking a recent one biases toward the deep
-    // back-and-forth pattern real threads actually produce.
+    // `frontier` holds candidate parents; recent ones bias toward real back-and-forth.
     let mut roots = 0u32;
     let mut frontier: Vec<(Path, u32)> = Vec::new(); // (path, children so far)
     let mut rows: Vec<(usize, Path, Option<usize>)> = Vec::new();
 
-    // Per-profile knobs: how often a post starts a new top-level subthread, and how far back
-    // in the frontier a reply may attach. `flat` never nests; `deep` always extends the most
-    // recent post, producing one long chain up against MAX_DEPTH.
+    // How often a post starts a new subthread, and how far back in the frontier it may attach.
     let (root_pct, reply_span, force_chain) = match profile.as_str() {
         "flat" => (100, 1, false), // every post top-level: the Classic BB preset
         "shallow" => (45, 24, false), // wide and short, like a busy Q&A page
@@ -249,10 +228,7 @@ fn main() {
         rows.push((i, path, parent_idx));
     }
 
-    // Emit in path order so the table's physical order matches the read order. This is what
-    // a real forum would NOT have (posts arrive chronologically), so it is deliberately
-    // pessimistic to sort here... but the index makes physical order irrelevant, and
-    // sorting keeps the generated file readable.
+    // Path order, which a real forum would not have; the index makes it irrelevant either way.
     let mut ordered: Vec<_> = rows.clone();
     ordered.sort_by(|a, b| a.1.cmp(&b.1));
 
@@ -264,8 +240,7 @@ fn main() {
         let created = base_time + *i as i64 * 300;
 
         if json_mode {
-            // Hand-rolled JSON: the seed crate stays dependency-free so it cannot drift
-            // from what the wasm benchmark compiles against.
+            // Hand-rolled, to keep the seed crate dependency-free.
             json_posts.push(format!(
                 "{{\"id\":{},\"public_id\":\"{}\",\"thread_id\":1,\"parent_id\":{},\
                  \"path\":\"{}\",\"depth\":{},\

@@ -1,15 +1,9 @@
-//! The thread index.
-//!
-//! User-agnostic like the thread page, for the same reason: it is the landing page and has to be
-//! shareable between readers. The nav is therefore static links, never "signed in as …".
+//! The thread index. User-agnostic like the thread page, so the nav is static links.
 
 use maud::{html, Markup, DOCTYPE};
 use notespace_core::model::ThreadSummary;
 
-/// The site nav.
-///
-/// Deliberately identical for everyone. Showing who is signed in here would make every page
-/// per-viewer, which is the one thing the read path cannot afford.
+/// Identical for everyone: a "signed in as …" here would make every page per-viewer.
 pub fn nav() -> Markup {
     html! {
         nav class="site" {
@@ -109,8 +103,6 @@ mod tests {
         assert!(html.contains("&lt;script&gt;"));
     }
 
-    /// The index is shared between readers like the thread page, so it must not carry viewer
-    /// state either. This is the same invariant, one page over.
     #[test]
     fn the_index_contains_no_viewer_identity() {
         let html = index_page(&[thread("Hello", 1)]).into_string();

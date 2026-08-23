@@ -2,12 +2,9 @@
 //!
 //! `<expiry-ms>.<hex HMAC-SHA256(secret, session_hash || "." || expiry)>`
 //!
-//! The token binds to the **session**, not just the server secret, so one visitor's token
-//! cannot be replayed by another. It carries its own expiry, so a token scraped from a cached
-//! page stops working.
-//!
-//! Independent of `SameSite=Lax`, deliberately: that attribute does not cover same-site
-//! subdomain takeover, and neither control should be the only one.
+//! Binding to the session rather than to the server secret alone is what stops one visitor's
+//! token being replayed by another. Kept independent of `SameSite=Lax`, which does not cover
+//! same-site subdomain takeover.
 
 use core::fmt;
 
@@ -18,8 +15,7 @@ use subtle::ConstantTimeEq;
 use crate::model::Timestamp;
 use crate::session::TokenHash;
 
-/// How long a minted token stays valid. Long enough to write a post, short enough that one
-/// scraped from a cached page is useless.
+/// Long enough to write a post, short enough that one scraped from a cached page is useless.
 pub const DEFAULT_LIFETIME_MS: i64 = 4 * 60 * 60 * 1000;
 
 /// The server-side signing key. Distinct from any session secret.
@@ -43,12 +39,8 @@ impl CsrfKey {
         hex(&mac.finalize().into_bytes())
     }
 
-    /// Mint a token bound to `binding`, valid until `now + lifetime_ms`.
-    ///
-    /// `binding` is whatever identifies this visitor: a session's [`TokenHash`] once logged in,
-    /// or — on the login form itself, where there is no session yet — the value of a short-lived
-    /// anonymous cookie. Binding to *something* is what stops a token minted for one visitor
-    /// being replayed by another, and the login form is exactly where that matters.
+    /// `binding` identifies the visitor: a session's [`TokenHash`], or an anonymous cookie on
+    /// the forms that run before there is a session.
     pub fn mint(&self, binding: &str, now: Timestamp, lifetime_ms: i64) -> CsrfToken {
         let expires_at = now + lifetime_ms;
         CsrfToken(format!("{expires_at}.{}", self.sign(binding, expires_at)))
@@ -64,11 +56,7 @@ impl CsrfKey {
         self.mint(session.as_str(), now, lifetime_ms)
     }
 
-    /// Check a token submitted with a form.
-    ///
-    /// Every failure is the same to the caller: there is nothing useful to tell someone whose
-    /// token did not verify, and distinguishing "expired" from "forged" leaks whether a guess
-    /// had the right shape.
+    /// Every failure looks the same, so "expired" cannot be told from "forged".
     pub fn verify(&self, token: &str, binding: &str, now: Timestamp) -> Result<(), CsrfError> {
         let (expiry, mac) = token.split_once('.').ok_or(CsrfError::Invalid)?;
         let expires_at: Timestamp = expiry.parse().map_err(|_| CsrfError::Invalid)?;
@@ -76,8 +64,7 @@ impl CsrfKey {
             return Err(CsrfError::Invalid);
         }
         let expected = self.sign(binding, expires_at);
-        // Constant time: a byte-by-byte comparison leaks how much of a forged MAC was right,
-        // which is enough to forge one a byte at a time.
+        // Constant time: a short-circuiting compare forges a MAC one byte at a time.
         if expected.as_bytes().ct_eq(mac.as_bytes()).into() {
             Ok(())
         } else {
@@ -86,7 +73,7 @@ impl CsrfKey {
     }
 }
 
-/// Redacted: the key is a secret and `derive(Debug)` is how secrets reach logs.
+/// Redacted: `derive(Debug)` is how secrets reach logs.
 impl fmt::Debug for CsrfKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("CsrfKey(<redacted>)")
@@ -112,7 +99,6 @@ impl fmt::Display for CsrfToken {
 pub enum CsrfError {
     #[error("csrf key must be at least 32 bytes, got {0}")]
     WeakKey(usize),
-    /// Deliberately undifferentiated. See [`CsrfKey::verify`].
     #[error("csrf token is missing, malformed, expired, or does not match this session")]
     Invalid,
 }
@@ -165,7 +151,6 @@ mod tests {
         );
     }
 
-    /// The property a bare signed constant would not have.
     #[test]
     fn a_token_is_bound_to_its_session() {
         let k = key();
@@ -193,7 +178,6 @@ mod tests {
             String::new(),
             "nodot".into(),
             format!("{exp}."),
-            // Extending the expiry without re-signing must not work.
             format!("{}.{mac}", NOW + DEFAULT_LIFETIME_MS * 10),
             // One flipped MAC character.
             format!(

@@ -1,14 +1,5 @@
-//! D1 implementation of [`Store`].
-//!
-//! The whole point of this file is the query count. The D1 free plan allows 50 queries per
-//! Worker invocation, and a thread page has to cost 1-3 of them rather than one per post. This
-//! implementation uses **two statements in a single batched round trip**:
-//!
-//! 1. thread metadata + its author
-//! 2. one indexed range scan over `(thread_id, path)` for the posts, joined to authors
-//!
-//! `D1Database::batch` sends both in one request, so the invocation costs two queries
-//! against the 50 budget and one network round trip against the CPU budget.
+//! D1 implementation of [`Store`]. A thread page is two statements in one `batch()`: metadata
+//! plus one indexed range scan over `(thread_id, path)`.
 
 use core::cell::Cell;
 use notespace_core::id::PublicId;
@@ -25,30 +16,16 @@ use notespace_core::store::{
 use serde::Deserialize;
 use worker::{D1Database, D1Result, D1ResultMeta};
 
-// The SQL lives in `notespace_core::sql`, shared verbatim with the native adapter so the two
-// cannot drift. What is target-specific is binding and row decoding, below.
+// SQL lives in `notespace_core::sql`, shared verbatim; binding and row decoding are the
+// target-specific parts.
 
-/// Bind an integer for D1.
-///
-/// `i64::into::<JsValue>()` produces a JS `BigInt`, and D1 rejects it outright:
-/// `D1_TYPE_ERROR: Type 'bigint' not supported`. Every integer bind has to go through a `f64`,
-/// which is a JS `number`.
-///
-/// This is a real difference between the two targets rather than a quirk of one: rusqlite takes
-/// an `i64` without complaint, so the native adapter never sees it. The conformance suite's
-/// write checks are what surfaced it.
-///
-/// Exact for anything inside 2^53 — row ids, depths, and millisecond timestamps all are, and a
-/// forum reaching 9 quadrillion of anything has other problems.
+/// D1 rejects JS bigints (`D1_TYPE_ERROR: Type 'bigint' not supported`), so integers cross as
+/// `f64`. Exact inside 2^53, which covers row ids, depths and millisecond timestamps.
 fn num(v: i64) -> worker::wasm_bindgen::JsValue {
     worker::wasm_bindgen::JsValue::from_f64(v as f64)
 }
 
-/// Sum D1's per-statement meta into one figure per request.
-///
-/// A statement whose meta is absent contributes nothing rather than zero, so a partial report
-/// cannot masquerade as a complete one: if any statement is missing a field, the total for that
-/// field stays `None`.
+/// Absent meta keeps the total `None`, so a partial report cannot look like a complete one.
 fn collect_stats(results: &[&D1Result]) -> QueryStats {
     let metas: Vec<_> = results.iter().map(|r| r.meta().ok().flatten()).collect();
     let all = |f: fn(&D1ResultMeta) -> Option<f64>| -> Option<f64> {
@@ -156,12 +133,11 @@ struct RankRow {
 
 /// One row of the post read path.
 fn post_from_row(r: PostRow) -> StoreResult<Post> {
-    // A path that fails validation would silently corrupt thread ordering, so it is an error
-    // rather than something to paper over.
+    // A path that fails validation would silently corrupt thread ordering.
     let path = Path::parse(&r.path).map_err(|e| {
         StoreError::Corrupt(format!("post {} has invalid path {:?}: {e}", r.id, r.path))
     })?;
-    // A row that cannot round-trip its own id is corrupt, not merely unexpected.
+    // A row that cannot round-trip its own id is corrupt.
     let public_id = PublicId::parse(&r.public_id).map_err(|e| {
         StoreError::Backend(format!("post {} has an unparseable public_id: {e}", r.id))
     })?;
@@ -220,8 +196,7 @@ fn thread_kind(s: &str) -> ThreadKind {
     }
 }
 
-/// Unknown states fail closed: anything the code does not recognise is treated as hidden
-/// rather than shown. A typo in a migration must not publish moderated content.
+/// Unknown states fail closed, so a typo in a migration cannot publish moderated content.
 fn post_state(s: &str) -> PostState {
     match s {
         "visible" => PostState::Visible,
@@ -244,29 +219,18 @@ fn backend<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(e.to_string())
 }
 
-/// What D1 reported about the queries behind one page render.
-///
-/// `rows_read` and `duration` come from D1 itself and are `None` under `wrangler dev --local`,
-/// where the database is in-process SQLite with no network in the path.
-///
-/// Reported per request via `Server-Timing`.
+/// What D1 reported, emitted per request as `Server-Timing`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct QueryStats {
-    /// Statements run. **The thread page must stay at 2**: the read path must never go
-    /// per-post. Other operations state their own budget on the `Store` method.
     pub statements: u32,
-    /// Summed across statements. `None` under local dev.
+    /// `None` under local dev.
     pub rows_read: Option<usize>,
-    /// Summed across statements, in milliseconds. `None` under local dev.
+    /// `None` under local dev.
     pub duration_ms: Option<f64>,
 }
 
 impl QueryStats {
-    /// Fold in another round trip's stats.
-    ///
-    /// An operation that cannot be one batch still costs what all of its statements cost, and
-    /// reporting only the last one would understate it. `None` is absent information rather
-    /// than zero, so it does not drag a real total down to nothing.
+    /// `None` is absent information, not zero.
     pub fn plus(self, other: QueryStats) -> QueryStats {
         QueryStats {
             statements: self.statements + other.statements,
@@ -281,7 +245,7 @@ impl QueryStats {
         }
     }
 
-    /// `Server-Timing` value, readable in browser devtools and by `curl -D-`.
+    /// `Server-Timing` value.
     pub fn server_timing(&self) -> String {
         let mut out = format!("d1;desc=\"statements={}\"", self.statements);
         if let Some(rows) = self.rows_read {
@@ -296,11 +260,7 @@ impl QueryStats {
 
 pub struct D1Store {
     db: D1Database,
-    /// Stats from the most recent query, for the handler to read afterwards.
-    ///
-    /// Interior mutability rather than a return-value change on purpose: `Store` is the seam
-    /// the dual-target promise rests on, and D1's telemetry has no business in its
-    /// signatures. A native SQLite adapter reports different things, or nothing.
+    /// Interior mutability, so D1's telemetry stays out of the `Store` signatures.
     last_stats: Cell<QueryStats>,
 }
 
@@ -312,15 +272,7 @@ impl D1Store {
         }
     }
 
-    /// Resolve a post's public id to the thread it currently lives in, and its page cursor.
-    ///
-    /// One query. The point of this indirection is that a post's thread can CHANGE -- splitting
-    /// and merging threads is routine moderation -- so a permalink cannot bake in a thread id
-    /// and stay correct. `/p/{id}` asks where the post is *now*.
-    /// Locate a post and work out which page it is on.
-    ///
-    /// Two round trips, not three: the post has to be found before its rank can be counted, but
-    /// the rank and the cursor lookup go in one batch. Both of those are index-only.
+    /// The post has to be found before its rank can be counted, so this cannot be one batch.
     async fn fetch_post_location(
         &self,
         post: &PublicId,
@@ -386,12 +338,9 @@ impl D1Store {
         })
     }
 
-    /// Append a post, allocating its path.
-    ///
-    /// Four statements. D1 has no interactive transaction, so the allocation is a read followed
-    /// by a write rather than one atomic step — which is exactly why `UNIQUE(thread_id, path)`
-    /// exists. The insert and the counter bump go in one `batch()`, which D1 runs atomically,
-    /// so a post can never be written without its thread being bumped.
+    /// D1 has no interactive transaction, so path allocation is a read then a write and
+    /// `UNIQUE(thread_id, path)` is the real guard. The insert and the counter bump share a
+    /// `batch()`, so a post cannot land without its thread being bumped.
     async fn append_post(&self, new: &NewPost) -> StoreResult<Post> {
         let thread_row = self
             .db
@@ -472,9 +421,7 @@ impl D1Store {
         // One batch: the post and the counter move together or not at all.
         let row_id = match self.db.batch(vec![insert, bump]).await {
             Ok(results) => {
-                // The row id has to come back from D1's own meta -- there is no
-                // `last_insert_rowid()` to call afterwards, and a placeholder here would be a
-                // lie the caller cannot detect. The conformance suite caught exactly that.
+                // No `last_insert_rowid()` to call afterwards, so this has to come from D1's meta.
                 results
                     .first()
                     .and_then(|r| r.meta().ok().flatten())
@@ -483,8 +430,7 @@ impl D1Store {
             }
             Err(e) => {
                 let msg = e.to_string();
-                // D1 surfaces constraint failures as a message, not a code. Only a UNIQUE
-                // violation is a race; anything else is a bug the caller must see.
+                // D1 surfaces constraint failures as a message, not a code.
                 if msg.contains("UNIQUE constraint failed") {
                     return Err(StoreError::Conflict);
                 }
@@ -547,9 +493,6 @@ impl D1Store {
         // Over-fetch by one to detect "is there a next page?" without a second COUNT query.
         let fetch = page.limit.saturating_add(1);
 
-        // Both statements key off the public id, which crosses as TEXT. Integer parameters
-        // would need to cross as f64: D1 rejects JS bigints outright
-        // (`D1_TYPE_ERROR: Type 'bigint' not supported`).
         let public = thread.encode();
         let thread_stmt = self
             .db
@@ -562,7 +505,6 @@ impl D1Store {
             .bind(&[public.as_str().into(), cursor.into(), (fetch as f64).into()])
             .map_err(backend)?;
 
-        // One round trip, two statements. This is the line that must not regress.
         let mut results = self
             .db
             .batch(vec![thread_stmt, posts_stmt])
@@ -576,8 +518,7 @@ impl D1Store {
             StoreError::Backend("batch returned fewer results than statements".into())
         })?;
 
-        // Record what D1 reported before consuming the results. Both fields are None under
-        // local dev; in production they are the real numbers.
+        // Record before consuming the results; both fields are None under local dev.
         self.last_stats
             .set(collect_stats(&[&thread_res, &posts_res]));
 
@@ -595,8 +536,7 @@ impl D1Store {
 
         let t = Thread {
             id: tr.id,
-            // Re-parsed rather than reusing the request's id: a row whose stored id does not
-            // round-trip is corrupt, and should say so instead of being papered over.
+            // Re-parsed rather than reusing the request's id, so a corrupt row says so.
             public_id: PublicId::parse(&tr.public_id).map_err(|e| {
                 StoreError::Corrupt(format!(
                     "thread {} has invalid public_id {:?}: {e}",
@@ -618,8 +558,7 @@ impl D1Store {
 
         let mut rows: Vec<PostRow> = posts_res.results().map_err(backend)?;
 
-        // We asked for limit+1. If we got it, there is another page; drop the extra row and
-        // use the last *kept* post's path as the cursor.
+        // The over-fetched row, if it arrived, means another page; the cursor is the last kept path.
         let has_more = rows.len() > page.limit as usize;
         if has_more {
             rows.truncate(page.limit as usize);
@@ -743,9 +682,7 @@ impl Store for D1Store {
             .run()
             .await
             .map_err(|e| {
-                // The name is taken. Registration checks first, but the check and the insert
-                // are not atomic, so the unique index is the real guard and this is the race
-                // losing. D1 surfaces constraint failures as a message, not a code.
+                // Registration's check and this insert are not atomic, so the index is the guard.
                 let msg = e.to_string();
                 if msg.contains("UNIQUE constraint failed") {
                     StoreError::Conflict

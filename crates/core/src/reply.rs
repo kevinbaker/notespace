@@ -1,70 +1,36 @@
-//! Posting a reply.
-//!
-//! The counterpart to [`crate::login`]: the order of operations is the security property, so it
-//! lives here where it can be tested rather than in a handler.
-//!
-//! ```text
-//!   validate  ->  rate limit  ->  insert (retrying a path collision)
-//!       |              |
-//!       |              +-- before the write, so a flood costs a lookup
-//!       +-- before anything, so an oversized body never reaches D1
-//! ```
-//!
-//! Three invariants any change here must preserve:
-//!
-//! - **A body is bounded before it is stored.** D1 rows are a fixed budget and the render cost
-//!   is linear in length; an unbounded body is both a storage and a CPU problem.
-//! - **A path collision is retried, not papered over.** Two replies to the same parent in the
-//!   same moment compute the same ordinal; the `UNIQUE(thread_id, path)` index rejects the
-//!   loser. Retrying re-reads the parent, which is the only way to get a correct ordinal.
-//! - **The retry is bounded.** An unbounded loop under contention is a CPU exhaustion vector on
-//!   a 10 ms budget.
+//! Posting a reply. Ordering is the security property, so it lives here rather than a handler:
+//! validate, then rate limit, then insert — each step before the one it protects.
 
 use crate::id::PublicId;
 use crate::model::{NewPost, Post, SanitizedHtml, Timestamp, UserId};
 use crate::ratelimit::{AttemptKeys, Limit};
 use crate::store::{Store, StoreError, StoreResult};
 
-/// Shortest body accepted, in characters. An empty reply is a misclick.
+/// Shortest body accepted, in characters.
 pub const MIN_BODY_CHARS: usize = 2;
 
-/// Longest body accepted, in characters.
-///
-/// Generous for prose and still far below anything that threatens a row budget or the render
-/// cost. A body over this is rejected rather than truncated: silently storing something other
-/// than what someone wrote is worse than refusing it.
+/// Longest body accepted, in characters. Rejected rather than truncated.
 pub const MAX_BODY_CHARS: usize = 32_768;
 
-/// How many times a path collision is retried before giving up.
-///
-/// Each retry is a fresh read of the parent plus an insert. Bounded because the loop runs inside
-/// a request that has 10 ms of CPU, and an unbounded one under contention is a way to spend it.
+/// Bounded: an unbounded retry loop under contention spends the whole CPU budget.
 pub const MAX_PATH_RETRIES: u32 = 3;
 
-/// What a deployment's write path is configured with.
 pub struct ReplyConfig {
-    /// Replies allowed per author per window.
     pub per_author: Limit,
-    /// Replies allowed per client address per window. Looser: a shared NAT is one client.
+    /// Looser than `per_author`: a shared NAT is one client.
     pub per_client: Limit,
 }
 
-/// One reply attempt.
 pub struct Reply<'a> {
     pub thread: PublicId,
     /// `None` posts at top level.
     pub parent: Option<PublicId>,
     pub author: UserId,
-    /// As typed. Stored verbatim as the source of truth.
     pub body_md: &'a str,
-    /// Rendered and sanitized by the caller — `core` has no markdown renderer.
-    ///
-    /// Must be the rendering of `body_md`. Nothing here can check that, which is why the type
-    /// is [`SanitizedHtml`] rather than `String`: it is at least provably sanitized.
+    /// Must be the rendering of `body_md`; nothing here can check that.
     pub body_html: SanitizedHtml,
-    /// Client address, for the second rate-limit bucket.
     pub client: &'a str,
-    /// Caller-generated, because `core` has no RNG on wasm. Regenerated per retry.
+    /// Caller-generated: `core` has no RNG on wasm. One per retry.
     pub ids: &'a [PublicId],
     pub now: Timestamp,
 }
@@ -76,7 +42,6 @@ pub enum Rejected {
         chars: usize,
         max: usize,
     },
-    /// The space's `depth_cap` would be exceeded.
     TooDeep {
         cap: u32,
     },
@@ -92,9 +57,7 @@ pub enum Outcome {
     RateLimited { retry_after_secs: i64 },
 }
 
-/// Validate a body without touching storage.
-///
-/// Separate so a handler can check before rendering markdown, which is the expensive step.
+/// Separate from [`post`] so a handler can check before rendering markdown.
 pub fn check_body(body_md: &str) -> Result<(), Rejected> {
     let chars = body_md.trim().chars().count();
     if chars < MIN_BODY_CHARS {
@@ -109,21 +72,15 @@ pub fn check_body(body_md: &str) -> Result<(), Rejected> {
     Ok(())
 }
 
-/// Post one reply.
+/// **Budget: 2-6 statements.** A rate-limited attempt costs one and no write.
 ///
-/// **Budget: 2-6 statements.** Attempt counters, then the insert's own batch. A rate-limited
-/// attempt costs one statement and no write at all.
-///
-/// `r.ids` supplies one public id per attempt: a retry needs a fresh one, because the losing
-/// insert may or may not have consumed it. Supply [`MAX_PATH_RETRIES`] + 1 to allow every retry.
+/// Supply [`MAX_PATH_RETRIES`] + 1 ids: a retry needs a fresh one.
 pub async fn post<S: Store>(store: &S, cfg: &ReplyConfig, r: Reply<'_>) -> StoreResult<Outcome> {
-    // 1. Validate first. The cheapest rejection, and it keeps an oversized body out of both the
-    //    rate-limit counters and the renderer.
     if let Err(why) = check_body(r.body_md) {
         return Ok(Outcome::Rejected(why));
     }
 
-    // 2. Rate limit before the write, for the same reason login limits before the hash.
+    // Before the write, for the same reason login limits before the hash.
     let keys = AttemptKeys::new(&r.author.to_string(), r.client);
     let (author_state, client_state) = store.login_attempts(&keys).await?;
     let author = cfg.per_author.check(author_state, r.now);
@@ -140,7 +97,7 @@ pub async fn post<S: Store>(store: &S, cfg: &ReplyConfig, r: Reply<'_>) -> Store
         });
     }
 
-    // 3. Insert, retrying only the collision. Every other error is returned as itself.
+    // Only a collision is retried; every other error is returned as itself.
     let mut last = Rejected::Contended;
     for public_id in r.ids.iter().take(MAX_PATH_RETRIES as usize + 1) {
         let new = NewPost {
@@ -154,8 +111,7 @@ pub async fn post<S: Store>(store: &S, cfg: &ReplyConfig, r: Reply<'_>) -> Store
         };
         match store.insert_post(&new).await {
             Ok(post) => {
-                // A successful write counts against the author's budget. Unlike login, success
-                // does not clear it: the limit is there to bound how fast anyone can post.
+                // Unlike login, success does not clear the counter: the limit bounds post rate.
                 if let Some(next) = author.next() {
                     store.record_login_attempt(&keys.identity, next).await?;
                 }
@@ -202,8 +158,7 @@ mod tests {
         assert!(check_body(&"a".repeat(MAX_BODY_CHARS)).is_ok());
     }
 
-    /// Length is counted in characters, not bytes: a limit that counts bytes rejects the same
-    /// number of words differently depending on the language they are written in.
+    /// A byte limit would reject the same words differently per language.
     #[test]
     fn the_limit_counts_characters_not_bytes() {
         let emoji = "🙂".repeat(MAX_BODY_CHARS);

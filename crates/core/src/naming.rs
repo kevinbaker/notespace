@@ -1,8 +1,4 @@
-//! Shared validation for the two *identifying* names, and nothing else.
-//!
-//! # Three different things were all called "slug"
-//!
-//! They are not the same, and conflating them produced a type that was wrong for all three:
+//! Shared character rules for the two names that resolve something:
 //!
 //! | | resolves the thing? | mutable? | unique? |
 //! |---|---|---|---|
@@ -10,13 +6,8 @@
 //! | [`crate::space_key::SpaceKey`] | yes, `/s/sports/hockey` | yes, with a redirect | per parent |
 //! | thread title slug, `/t/{id}/{slug}` | **no** — decorative | freely | never |
 //!
-//! The third is not modelled here at all. `/t/{id}/anything-at-all` serves the same thread
-//! because the id resolves it; the trailing text exists for readers and search engines. It needs
-//! no type, because nothing reads it.
-//!
-//! The first two do resolve, so they need validating — but their *policies* differ enough that
-//! they are separate types with separate reserved lists. What they share is the character rules
-//! below, and only because duplicating a charset check is how the two drift apart.
+//! The third is not modelled: `/t/{id}/anything-at-all` serves the same thread. The first two
+//! have policies different enough to be separate types; only the charset check is shared.
 
 /// Characters allowed in any identifying name, plus the length and reserved rules that vary.
 pub(crate) struct Rules {
@@ -49,16 +40,8 @@ pub enum NameError {
     NoLetter(&'static str),
 }
 
-/// Validate and normalize. Normalization is **case, and only case** — anything else is rejected
-/// rather than silently rewritten, so what someone typed is what they get or a clear error.
-///
-/// `test-user` and `testuser` are therefore two different names, as they are on GitHub. An
-/// earlier draft folded separators and `0`/`o` into a "skeleton" and enforced uniqueness on
-/// that; it cost real names (`ice-hockey` and `icehockey` collapsed into one) for a little
-/// impersonation resistance, and is gone.
-///
-/// The defence that remains is the ASCII restriction, which is a rejection rather than a fold
-/// and kills every Cyrillic and Greek homoglyph outright — those being the invisible ones.
+/// Normalization is case and only case, so `test-user` and `testuser` are two names. The
+/// homoglyph defence is the ASCII restriction, which rejects rather than folds.
 pub(crate) fn validate(input: &str, rules: &Rules) -> Result<String, NameError> {
     let n = input.chars().count();
     if !(rules.min..=rules.max).contains(&n) {
@@ -93,7 +76,7 @@ pub(crate) fn validate(input: &str, rules: &Rules) -> Result<String, NameError> 
         out.push(c);
     }
 
-    // An all-digit name is not a name, and reads as an id in a URL.
+    // An all-digit name reads as an id in a URL.
     if !has_letter {
         return Err(NameError::NoLetter(rules.kind));
     }
@@ -103,13 +86,8 @@ pub(crate) fn validate(input: &str, rules: &Rules) -> Result<String, NameError> 
     Ok(out)
 }
 
-/// Whether `s` is on `list`, directly or through a leetspeak reading of it.
-///
-/// This is the one place a folding still happens, and it is a different trade from the one
-/// [`validate`] rejects. Uniqueness between *users* must not fold, because a false collision
-/// blocks a real name with no recourse. A reserved list is a few dozen words nobody legitimately
-/// needs, so blocking `adm1n` alongside `admin` costs nothing and closes the way reserved names
-/// actually get claimed.
+/// The one place a folding happens: a false collision against a few dozen reserved words costs
+/// nothing, whereas folding for user-to-user uniqueness would block real names.
 pub(crate) fn is_reserved(s: &str, list: &[&str]) -> bool {
     list.binary_search(&s).is_ok() || list.binary_search(&leet(s).as_str()).is_ok()
 }
