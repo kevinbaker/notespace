@@ -20,6 +20,9 @@
 //! and there is no write path yet. [`Fixture`] describes what the suite expects to find.
 
 use crate::id::PublicId;
+
+/// Page size the suite paginates by. Only has to be self-consistent.
+const PAGE_SIZE: u32 = 200;
 use crate::model::{NewPost, SanitizedHtml};
 use crate::path::Path;
 use crate::ratelimit::{AttemptKeys, Attempts, Limit};
@@ -94,6 +97,7 @@ pub async fn run_all<S: Store>(store: &S, fx: &Fixture) -> Vec<Check> {
         absent_thread_is_not_found(store, fx).await,
         thread_version_is_readable_and_absent_for_unknown(store, fx).await,
         a_duplicate_username_is_a_conflict(store, fx).await,
+        a_permalink_cursor_lands_on_a_page_holding_the_post(store, fx).await,
         locate_post_finds_its_thread(store, fx).await,
         absent_post_is_not_found(store, fx).await,
         posts_never_expose_body_md(store, fx).await,
@@ -443,7 +447,7 @@ async fn appended_post_is_readable<S: Store>(store: &S, fx: &Fixture) -> Check {
         Ok(p) => p,
         Err(e) => return Check::fail(NAME, format!("insert: {e}")),
     };
-    let loc = match store.locate_post(&post.public_id).await {
+    let loc = match store.locate_post(&post.public_id, PAGE_SIZE).await {
         Ok(l) => l,
         Err(e) => return Check::fail(NAME, format!("locate: {e}")),
     };
@@ -513,7 +517,7 @@ async fn replies_nest_under_their_parent<S: Store>(store: &S, fx: &Fixture) -> C
 async fn siblings_get_consecutive_ordinals<S: Store>(store: &S, fx: &Fixture) -> Check {
     const NAME: &str = "siblings get consecutive ordinals, not reused ones";
     // writable[1] was made a parent above; give it a second child.
-    let parent = match store.locate_post(&fx.writable[1]).await {
+    let parent = match store.locate_post(&fx.writable[1], PAGE_SIZE).await {
         Ok(l) => l,
         Err(e) => return Check::fail(NAME, format!("{e}")),
     };
@@ -765,9 +769,46 @@ async fn a_duplicate_username_is_a_conflict<S: Store>(store: &S, _fx: &Fixture) 
     }
 }
 
+/// The property a permalink depends on: following the cursor must produce a page that actually
+/// contains the post. An off-by-one lands the reader one page away with an anchor that is not
+/// in the document, which is indistinguishable from the post not existing.
+///
+/// Checked at a page size of 1 as well as the real one, because a fixture smaller than a page
+/// never leaves page zero and would pass without exercising a cursor at all.
+async fn a_permalink_cursor_lands_on_a_page_holding_the_post<S: Store>(
+    store: &S,
+    fx: &Fixture,
+) -> Check {
+    const NAME: &str = "a permalink cursor lands on a page holding the post";
+    for size in [1u32, 3, PAGE_SIZE] {
+        let loc = match store.locate_post(&fx.known_post, size).await {
+            Ok(l) => l,
+            Err(e) => return Check::fail(NAME, format!("size {size}: {e}")),
+        };
+        let page = Page {
+            after: loc.cursor.clone(),
+            limit: size,
+        };
+        let rendered = match store.thread_page(&fx.thread, &page).await {
+            Ok(p) => p,
+            Err(e) => return Check::fail(NAME, format!("size {size}: {e}")),
+        };
+        require!(
+            NAME,
+            rendered.posts.iter().any(|p| p.path == loc.path),
+            "size {size}: cursor {:?} gave a page of {} starting at {:?}, without {}",
+            loc.cursor.as_ref().map(|c| c.as_str()),
+            rendered.posts.len(),
+            rendered.posts.first().map(|p| p.path.as_str()),
+            loc.path
+        );
+    }
+    Check::pass(NAME)
+}
+
 async fn locate_post_finds_its_thread<S: Store>(store: &S, fx: &Fixture) -> Check {
     const NAME: &str = "locate_post resolves to the right thread and path";
-    let loc = match store.locate_post(&fx.known_post).await {
+    let loc = match store.locate_post(&fx.known_post, PAGE_SIZE).await {
         Ok(l) => l,
         Err(e) => return Check::fail(NAME, format!("{e}")),
     };
@@ -790,7 +831,7 @@ async fn locate_post_finds_its_thread<S: Store>(store: &S, fx: &Fixture) -> Chec
 
 async fn absent_post_is_not_found<S: Store>(store: &S, fx: &Fixture) -> Check {
     const NAME: &str = "absent post is NotFound";
-    match store.locate_post(&fx.absent).await {
+    match store.locate_post(&fx.absent, PAGE_SIZE).await {
         Err(StoreError::NotFound) => Check::pass(NAME),
         Err(e) => Check::fail(NAME, format!("wrong error: {e}")),
         Ok(_) => Check::fail(NAME, "located a post that does not exist"),

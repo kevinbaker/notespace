@@ -77,6 +77,23 @@ impl Page {
 pub struct PostLocation {
     pub thread: PublicId,
     pub path: Path,
+    /// The page cursor that brings this post into view, or `None` when it is on the first page.
+    ///
+    /// A permalink that only carried the thread and an anchor would land on page one and, for
+    /// any post past the page size, scroll to an anchor that is not in the document — the
+    /// visitor sees the top of the thread with no sign their post exists.
+    pub cursor: Option<Path>,
+}
+
+/// Offset of the post whose path is the cursor for the page holding `rank`.
+///
+/// `None` when the post is on the first page, which needs no cursor. Shared by both adapters
+/// because an off-by-one here sends a permalink to the page before or after the one it wants,
+/// and that is not the sort of thing two copies stay agreed on.
+pub fn page_cursor_offset(rank: i64, page_size: u32) -> Option<i64> {
+    let size = page_size.max(1) as i64;
+    let page = rank / size;
+    (page > 0).then(|| page * size - 1)
 }
 
 /// Everything the application needs from storage.
@@ -96,10 +113,16 @@ pub trait Store {
     /// range scan over `(thread_id, path)`.
     async fn thread_page(&self, thread: &PublicId, page: &Page) -> StoreResult<ThreadPage>;
 
-    /// Resolve a post's public id to the thread it is in now.
+    /// Resolve a post's public id to the thread it is in now, and the page it is on.
     ///
-    /// **Budget: 1 statement.**
-    async fn locate_post(&self, post: &PublicId) -> StoreResult<PostLocation>;
+    /// `page_size` must match what the read path paginates by, or the cursor lands on the wrong
+    /// page. The count also has to see exactly the posts [`Store::thread_page`] renders: if that
+    /// ever filters by state, this must filter identically or the arithmetic drifts by however
+    /// many rows disagree.
+    ///
+    /// **Budget: 3 statements**, all index-only. The rank and cursor lookups run inside
+    /// `idx_post_thread_path` without touching a table row.
+    async fn locate_post(&self, post: &PublicId, page_size: u32) -> StoreResult<PostLocation>;
 
     /// Threads for the index, most recently active first.
     ///
@@ -278,5 +301,44 @@ impl NextPath {
             (None, None) => Path::root(0),
         };
         next.map_err(|e| StoreError::Backend(format!("path allocation: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::page_cursor_offset;
+
+    /// The cursor is the *last post of the previous page*, so following it yields a page that
+    /// begins with the first post of the target page.
+    #[test]
+    fn the_first_page_needs_no_cursor() {
+        for rank in 0..200 {
+            assert_eq!(page_cursor_offset(rank, 200), None, "rank {rank}");
+        }
+    }
+
+    #[test]
+    fn later_pages_point_at_the_last_post_before_them() {
+        assert_eq!(page_cursor_offset(200, 200), Some(199));
+        assert_eq!(page_cursor_offset(399, 200), Some(199));
+        assert_eq!(page_cursor_offset(400, 200), Some(399));
+        assert_eq!(page_cursor_offset(205, 200), Some(199));
+    }
+
+    /// Every rank on a page must produce the same cursor, or two permalinks into one page would
+    /// disagree about where that page starts -- and split its cache entry in two.
+    #[test]
+    fn every_rank_on_a_page_agrees_on_the_cursor() {
+        for page in 1..5i64 {
+            let expected = Some(page * 50 - 1);
+            for within in 0..50 {
+                assert_eq!(page_cursor_offset(page * 50 + within, 50), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn a_zero_page_size_does_not_divide_by_zero() {
+        assert_eq!(page_cursor_offset(10, 0), Some(9));
     }
 }

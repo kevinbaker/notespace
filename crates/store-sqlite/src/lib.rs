@@ -480,18 +480,49 @@ impl Store for SqliteStore {
         Ok(n as u32)
     }
 
-    async fn locate_post(&self, post: &PublicId) -> StoreResult<PostLocation> {
-        let row: Option<(String, String)> = self
+    async fn locate_post(&self, post: &PublicId, page_size: u32) -> StoreResult<PostLocation> {
+        let row: Option<(String, i64, String)> = self
             .conn
             .query_row(sql::LOCATE_POST, [post.as_str()], |r| {
-                Ok((r.get("thread_public_id")?, r.get("post_path")?))
+                Ok((
+                    r.get("thread_public_id")?,
+                    r.get("thread_row_id")?,
+                    r.get("post_path")?,
+                ))
             })
             .optional()
             .map_err(backend)?;
-        let (thread, path) = row.ok_or(StoreError::NotFound)?;
+        let (thread, thread_row, path) = row.ok_or(StoreError::NotFound)?;
+
+        let rank: i64 = self
+            .conn
+            .query_row(sql::POST_RANK, rusqlite::params![thread_row, &path], |r| {
+                r.get("rank")
+            })
+            .map_err(backend)?;
+        let cursor = match notespace_core::store::page_cursor_offset(rank, page_size) {
+            None => None,
+            Some(offset) => {
+                let at: Option<String> = self
+                    .conn
+                    .query_row(
+                        sql::PATH_AT_OFFSET,
+                        rusqlite::params![thread_row, offset],
+                        |r| r.get("path"),
+                    )
+                    .optional()
+                    .map_err(backend)?;
+                match at {
+                    Some(p) => Some(Path::parse(&p).map_err(|e| corrupt("cursor path", e))?),
+                    None => None,
+                }
+            }
+        };
+
         Ok(PostLocation {
             thread: PublicId::parse(&thread).map_err(|e| corrupt("thread public_id", e))?,
             path: Path::parse(&path).map_err(|e| corrupt("post path", e))?,
+            cursor,
         })
     }
 }

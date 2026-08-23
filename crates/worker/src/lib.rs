@@ -534,7 +534,7 @@ async fn fetch_page<S: Store>(
 }
 
 async fn locate<S: Store>(store: &S, post: &PublicId) -> StoreResult<notespace_core::PostLocation> {
-    store.locate_post(post).await
+    store.locate_post(post, PAGE_SIZE).await
 }
 
 /// A durable permalink to a single post.
@@ -560,20 +560,28 @@ async fn post_permalink(State(env): State<Env>, UrlPath(id): UrlPath<String>) ->
             )
         }
     };
-    match locate::<D1Store>(&D1Store::new(db), &post_id).await {
+    let store = D1Store::new(db);
+    match locate::<D1Store>(&store, &post_id).await {
         Ok(loc) => {
-            // KNOWN LIMITATION: this lands on page 1 and relies on the fragment. For a thread
-            // longer than one page the anchor will not be present and the reader arrives at
-            // the top.
-            //
-            // Doing better needs "which page contains this path?", and the obvious shortcut --
-            // deriving a cursor by truncating the post's path -- is wrong: an earlier sibling
-            // with a large subtree can still push the post off the page. That belongs with
-            // real pagination in M2, not a cursor trick that fails on exactly the deep threads
-            // permalinks matter most for.
-            let _ = &loc.path;
-            let target = format!("/t/{}#p{post_id}", loc.thread);
-            (StatusCode::FOUND, [(header::LOCATION, target)]).into_response()
+            // The cursor is what makes the anchor real. Without it a post past the first page
+            // sends the reader to the top of the thread, scrolling to an id that is not in the
+            // document -- which looks exactly like the post having failed to save.
+            let target = match &loc.cursor {
+                Some(cursor) => format!(
+                    "/t/{}?after={}#p{post_id}",
+                    loc.thread,
+                    urlencoding(cursor.as_str())
+                ),
+                None => format!("/t/{}#p{post_id}", loc.thread),
+            };
+            let mut resp = (StatusCode::FOUND, [(header::LOCATION, target)]).into_response();
+            // Three statements, and a redirect that reported none would understate the read
+            // path by the two the cursor lookup costs.
+            if let Ok(v) = store.last_stats().server_timing().parse() {
+                resp.headers_mut()
+                    .insert(header::HeaderName::from_static("server-timing"), v);
+            }
+            resp
         }
         Err(StoreError::NotFound) => error(StatusCode::NOT_FOUND, "no such post"),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),

@@ -58,7 +58,7 @@ LIMIT ?3";
 ///
 /// Binds: `?1` = post public id.
 pub const LOCATE_POST: &str = "\
-SELECT t.public_id AS thread_public_id, p.path AS post_path \
+SELECT t.public_id AS thread_public_id, t.id AS thread_row_id, p.path AS post_path \
 FROM post p \
 JOIN thread t ON t.id = p.thread_id \
 WHERE p.public_id = ?1";
@@ -94,6 +94,23 @@ ORDER BY path DESC LIMIT 1";
 /// Binds: `?1` = thread public id.
 pub const THREAD_ROW: &str = "\
 SELECT id, post_count FROM thread WHERE public_id = ?1";
+
+/// How many posts of a thread sort before a given path.
+///
+/// The post's rank in page order, which divided by the page size is the page it lands on. Runs
+/// entirely inside `idx_post_thread_path` -- a covering index, so no table row is touched.
+///
+/// Binds: `?1` = thread row id, `?2` = the post's path.
+pub const POST_RANK: &str = "SELECT COUNT(*) AS rank FROM post WHERE thread_id = ?1 AND path < ?2";
+
+/// The path at a given offset in a thread's page order.
+///
+/// Used to find a page's cursor: page `n` begins after the post at offset `n * size - 1`.
+/// Also index-only.
+///
+/// Binds: `?1` = thread row id, `?2` = offset.
+pub const PATH_AT_OFFSET: &str =
+    "SELECT path FROM post WHERE thread_id = ?1 ORDER BY path LIMIT 1 OFFSET ?2";
 
 /// Threads for the index, most recently active first.
 ///

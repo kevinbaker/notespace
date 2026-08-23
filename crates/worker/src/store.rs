@@ -145,7 +145,13 @@ struct PathRow {
 #[derive(Deserialize)]
 struct PostLocationRow {
     thread_public_id: String,
+    thread_row_id: i64,
     post_path: String,
+}
+
+#[derive(Deserialize)]
+struct RankRow {
+    rank: i64,
 }
 
 /// One row of the post read path.
@@ -246,7 +252,8 @@ fn backend<E: std::fmt::Display>(e: E) -> StoreError {
 /// Reported per request via `Server-Timing`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct QueryStats {
-    /// Statements in the batch. **Must stay at 2**: the read path must never go per-post.
+    /// Statements run. **The thread page must stay at 2**: the read path must never go
+    /// per-post. Other operations state their own budget on the `Store` method.
     pub statements: u32,
     /// Summed across statements. `None` under local dev.
     pub rows_read: Option<usize>,
@@ -255,6 +262,25 @@ pub struct QueryStats {
 }
 
 impl QueryStats {
+    /// Fold in another round trip's stats.
+    ///
+    /// An operation that cannot be one batch still costs what all of its statements cost, and
+    /// reporting only the last one would understate it. `None` is absent information rather
+    /// than zero, so it does not drag a real total down to nothing.
+    pub fn plus(self, other: QueryStats) -> QueryStats {
+        QueryStats {
+            statements: self.statements + other.statements,
+            rows_read: match (self.rows_read, other.rows_read) {
+                (Some(a), Some(b)) => Some(a + b),
+                (a, b) => a.or(b),
+            },
+            duration_ms: match (self.duration_ms, other.duration_ms) {
+                (Some(a), Some(b)) => Some(a + b),
+                (a, b) => a.or(b),
+            },
+        }
+    }
+
     /// `Server-Timing` value, readable in browser devtools and by `curl -D-`.
     pub fn server_timing(&self) -> String {
         let mut out = format!("d1;desc=\"statements={}\"", self.statements);
@@ -291,22 +317,72 @@ impl D1Store {
     /// One query. The point of this indirection is that a post's thread can CHANGE -- splitting
     /// and merging threads is routine moderation -- so a permalink cannot bake in a thread id
     /// and stay correct. `/p/{id}` asks where the post is *now*.
-    async fn fetch_post_location(&self, post: &PublicId) -> StoreResult<PostLocation> {
+    /// Locate a post and work out which page it is on.
+    ///
+    /// Two round trips, not three: the post has to be found before its rank can be counted, but
+    /// the rank and the cursor lookup go in one batch. Both of those are index-only.
+    async fn fetch_post_location(
+        &self,
+        post: &PublicId,
+        page_size: u32,
+    ) -> StoreResult<PostLocation> {
         let stmt = self
             .db
             .prepare(sql::LOCATE_POST)
             .bind(&[post.as_str().into()])
             .map_err(backend)?;
         let res = stmt.all().await.map_err(backend)?;
-        self.last_stats.set(collect_stats(&[&res]));
+        let mut stats = collect_stats(&[&res]);
         let rows: Vec<PostLocationRow> = res.results().map_err(backend)?;
         let row = rows.into_iter().next().ok_or(StoreError::NotFound)?;
+
+        let rank_res = self
+            .db
+            .prepare(sql::POST_RANK)
+            .bind(&[num(row.thread_row_id), row.post_path.as_str().into()])
+            .map_err(backend)?
+            .all()
+            .await
+            .map_err(backend)?;
+        stats = stats.plus(collect_stats(&[&rank_res]));
+        let rank = rank_res
+            .results::<RankRow>()
+            .map_err(backend)?
+            .into_iter()
+            .next()
+            .map(|r| r.rank)
+            .unwrap_or(0);
+
+        let cursor = match notespace_core::store::page_cursor_offset(rank, page_size) {
+            None => None,
+            Some(offset) => {
+                let at = self
+                    .db
+                    .prepare(sql::PATH_AT_OFFSET)
+                    .bind(&[num(row.thread_row_id), num(offset)])
+                    .map_err(backend)?
+                    .all()
+                    .await
+                    .map_err(backend)?;
+                stats = stats.plus(collect_stats(&[&at]));
+                at.results::<PathRow>()
+                    .map_err(backend)?
+                    .into_iter()
+                    .next()
+                    .map(|r| Path::parse(&r.path))
+                    .transpose()
+                    .map_err(|e| StoreError::Corrupt(format!("cursor path: {e}")))?
+            }
+        };
+        self.last_stats.set(stats);
+
         Ok(PostLocation {
             thread: PublicId::parse(&row.thread_public_id).map_err(|e| {
                 StoreError::Backend(format!("thread has an unparseable public_id: {e}"))
             })?,
             path: Path::parse(&row.post_path)
                 .map_err(|e| StoreError::Backend(format!("post has an unparseable path: {e}")))?,
+            cursor,
         })
     }
 
@@ -575,8 +651,8 @@ impl Store for D1Store {
         self.fetch_thread_page(thread, page).await
     }
 
-    async fn locate_post(&self, post: &PublicId) -> StoreResult<PostLocation> {
-        self.fetch_post_location(post).await
+    async fn locate_post(&self, post: &PublicId, page_size: u32) -> StoreResult<PostLocation> {
+        self.fetch_post_location(post, page_size).await
     }
 
     async fn recent_threads(&self, limit: u32) -> StoreResult<Vec<ThreadSummary>> {
