@@ -93,6 +93,7 @@ pub async fn run_all<S: Store>(store: &S, fx: &Fixture) -> Vec<Check> {
         cursor_is_none_on_the_last_page(store, fx).await,
         absent_thread_is_not_found(store, fx).await,
         thread_version_is_readable_and_absent_for_unknown(store, fx).await,
+        a_duplicate_username_is_a_conflict(store, fx).await,
         locate_post_finds_its_thread(store, fx).await,
         absent_post_is_not_found(store, fx).await,
         posts_never_expose_body_md(store, fx).await,
@@ -745,6 +746,22 @@ async fn thread_version_is_readable_and_absent_for_unknown<S: Store>(
         Ok(None) => Check::pass(NAME),
         Ok(Some(v)) => Check::fail(NAME, format!("unknown thread reported version {v}")),
         Err(e) => Check::fail(NAME, format!("unknown thread errored: {e}")),
+    }
+}
+
+/// Registration checks whether a name is free and then inserts, which is not atomic. The
+/// unique index is the real guard, so both adapters must report the loser as `Conflict` --
+/// anything else surfaces to a visitor as a 500 rather than "that name is taken".
+async fn a_duplicate_username_is_a_conflict<S: Store>(store: &S, _fx: &Fixture) -> Check {
+    const NAME: &str = "creating a user with a taken name is Conflict, not a backend error";
+    let name = "conformance-dup-check";
+    if let Err(e) = store.create_user(name, 1_800_000_000_000, None).await {
+        return Check::fail(NAME, format!("first create failed: {e}"));
+    }
+    match store.create_user(name, 1_800_000_000_000, None).await {
+        Err(StoreError::Conflict) => Check::pass(NAME),
+        Err(e) => Check::fail(NAME, format!("wrong error: {e}")),
+        Ok(_) => Check::fail(NAME, "the duplicate was accepted"),
     }
 }
 

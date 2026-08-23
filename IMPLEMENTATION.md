@@ -131,12 +131,27 @@ cookie used before a session exists is `cookie::ANON`.
 | Form | `crates/render/src/auth.rs` — `reply_page` |
 | Session → user | `current_user` in `crates/worker/src/lib.rs` |
 
-The form is a separate uncached page, not part of the baked thread. `/register` still does not
-exist, so accounts come only from the seed CLI.
+The form is a separate uncached page, not part of the baked thread.
 
 Not built: the progressive enhancement described in DESIGN.md §7.1 that opens the form in place
 when JS is available. There is no `/api/me/thread/{id}` endpoint yet, which is where the CSRF
 token for that path has to come from.
+
+## Registration and the index
+
+| what | where |
+|---|---|
+| Signup flow | `crates/core/src/register.rs` — `signup`, `check` |
+| Handlers | `register_form`, `register_submit` in `crates/worker/src/lib.rs` |
+| Form | `crates/render/src/auth.rs` — `register_page` |
+| Thread index | `crates/render/src/index.rs`; `Store::recent_threads`; `sql::RECENT_THREADS` |
+| Index route | `/` in `crates/worker/src/lib.rs` |
+
+The index is uncached: every reply bumps a thread and reorders the list, so a version key would
+change on nearly every write.
+
+Two dangling links in the UI: `/s/{path}` in the thread header and `/u/{name}` on every byline
+both 404, because neither route exists.
 
 ## §5 Moderation pipeline
 
@@ -149,8 +164,8 @@ There is no preset table or selector yet.
 
 ## §7 Routes
 
-`router()` in `crates/worker/src/lib.rs` is the live list. Currently: `/healthz`, `/t/{id}`,
-`/t/{id}/{slug}`, `/p/{id}`, `/t/{id}/reply`, `/login`, `/logout`, `/__conformance`.
+`router()` in `crates/worker/src/lib.rs` is the live list. Currently: `/`, `/healthz`, `/t/{id}`,
+`/t/{id}/{slug}`, `/p/{id}`, `/t/{id}/reply`, `/login`, `/logout`, `/register`, `/__conformance`.
 
 `SpaceKey::RESERVED` and `Username::RESERVED` are hand-maintained and should be derived from this
 router instead.

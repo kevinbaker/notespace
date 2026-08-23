@@ -173,6 +173,19 @@ pub struct Thread {
     pub cache_version: i64,
 }
 
+/// One row of the thread index. Narrower than [`Thread`] on purpose: a list of fifty does not
+/// need every column, and the read path's cost is the columns it fetches.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadSummary {
+    pub public_id: PublicId,
+    pub title: String,
+    pub post_count: u32,
+    pub bumped_at: Timestamp,
+    pub author_name: String,
+    pub space_name: String,
+    pub space_path: String,
+}
+
 /// A single message in a thread, positioned by its materialized `path`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Post {

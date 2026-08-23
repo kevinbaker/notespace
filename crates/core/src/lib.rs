@@ -17,6 +17,8 @@ pub(crate) mod naming;
 pub mod password;
 pub mod path;
 pub mod ratelimit;
+#[cfg(feature = "password")]
+pub mod register;
 pub mod reply;
 pub mod session;
 pub mod space_key;

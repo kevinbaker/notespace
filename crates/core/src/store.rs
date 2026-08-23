@@ -12,7 +12,7 @@
 //!   exist there.
 
 use crate::id::PublicId;
-use crate::model::{NewPost, Post, ThreadPage, Timestamp, User, UserId};
+use crate::model::{NewPost, Post, ThreadPage, ThreadSummary, Timestamp, User, UserId};
 use crate::path::Path;
 use crate::ratelimit::{AttemptKeys, Attempts};
 use crate::session::{Session, TokenHash};
@@ -100,6 +100,11 @@ pub trait Store {
     ///
     /// **Budget: 1 statement.**
     async fn locate_post(&self, post: &PublicId) -> StoreResult<PostLocation>;
+
+    /// Threads for the index, most recently active first.
+    ///
+    /// **Budget: 1 statement.**
+    async fn recent_threads(&self, limit: u32) -> StoreResult<Vec<ThreadSummary>>;
 
     /// The thread's bake version, for building a cache key.
     ///

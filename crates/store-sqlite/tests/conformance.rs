@@ -546,3 +546,140 @@ async fn the_retry_ids_are_distinct() {
     }
     assert!(ids.len() > reply::MAX_PATH_RETRIES as usize, "too few ids");
 }
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+use notespace_core::register::{
+    self, Outcome as SignupOutcome, RegisterConfig, Rejected as SignupRejected, Signup,
+};
+
+fn register_config(per_client: u32) -> RegisterConfig {
+    let peppers = PepperSet::single(0, Pepper::new(&[9u8; 32]).unwrap());
+    RegisterConfig {
+        scheme: FAST,
+        peppers,
+        sessions: SessionPolicy::default(),
+        per_client: Limit {
+            max: per_client,
+            window_ms: 60_000,
+        },
+    }
+}
+
+fn a_signup<'a>(name: &'a str, pw: &'a str, client: &'a str, seed: u8) -> Signup<'a> {
+    Signup {
+        username: name,
+        password: pw,
+        client,
+        token: SessionToken::from_bytes([seed; TOKEN_BYTES]),
+        salt: "c29tZXNhbHR2YWx1ZTE",
+        now: NOW,
+    }
+}
+
+#[tokio::test]
+async fn a_signup_creates_an_account_that_can_then_log_in() {
+    let store = seeded();
+    let rcfg = register_config(10);
+    match register::signup(&store, &rcfg, a_signup("newcomer", PW, "1.2.3.4", 1)).await {
+        Ok(SignupOutcome::Created { user, session }) => {
+            assert_eq!(user.name, "newcomer");
+            // Signed in already: the session must be real, not a placeholder.
+            let found = store
+                .lookup_session(&session.token_hash, NOW)
+                .await
+                .expect("lookup");
+            assert!(found.is_some(), "no session was stored");
+        }
+        _ => panic!("expected Created"),
+    }
+
+    // The credential it wrote must satisfy the login path, not merely exist.
+    let lcfg = config();
+    match attempt(&store, &lcfg, try_login("newcomer", PW, "1.2.3.4", 2)).await {
+        Ok(Outcome::Success { user, .. }) => assert_eq!(user.name, "newcomer"),
+        _ => panic!("the account it created cannot log in"),
+    }
+}
+
+#[tokio::test]
+async fn the_name_is_stored_lowercase_and_matched_either_way() {
+    let store = seeded();
+    let rcfg = register_config(10);
+    match register::signup(&store, &rcfg, a_signup("MixedCase", PW, "1.2.3.4", 3)).await {
+        Ok(SignupOutcome::Created { user, .. }) => assert_eq!(user.name, "mixedcase"),
+        _ => panic!("expected Created"),
+    }
+    // And the same name in any casing is now taken.
+    match register::signup(&store, &rcfg, a_signup("MIXEDCASE", PW, "1.2.3.4", 4)).await {
+        Ok(SignupOutcome::Rejected(SignupRejected::Taken)) => {}
+        _ => panic!("case-different duplicate was accepted"),
+    }
+}
+
+#[tokio::test]
+async fn a_taken_name_is_rejected_without_disturbing_the_existing_account() {
+    let store = seeded();
+    let rcfg = register_config(10);
+    let lcfg = config();
+    with_account(&store, &lcfg, "incumbent", Some(PW)).await;
+
+    match register::signup(
+        &store,
+        &rcfg,
+        a_signup("incumbent", "a different one", "9.9.9.9", 5),
+    )
+    .await
+    {
+        Ok(SignupOutcome::Rejected(SignupRejected::Taken)) => {}
+        _ => panic!("expected Taken"),
+    }
+    // The incumbent's password must still be theirs.
+    match attempt(&store, &lcfg, try_login("incumbent", PW, "1.1.1.1", 6)).await {
+        Ok(Outcome::Success { .. }) => {}
+        _ => panic!("the original credential was overwritten"),
+    }
+}
+
+/// The limit is per client and the name half of the key is constant, so trying a different
+/// name must not buy a fresh budget.
+#[tokio::test]
+async fn the_limiter_counts_signups_per_client_whatever_name_is_tried() {
+    let store = seeded();
+    let rcfg = register_config(2);
+    for (i, name) in ["alpha-one", "beta-two"].iter().enumerate() {
+        match register::signup(&store, &rcfg, a_signup(name, PW, "7.7.7.7", 10 + i as u8)).await {
+            Ok(SignupOutcome::Created { .. }) => {}
+            _ => panic!("signup {name} should have succeeded"),
+        }
+    }
+    match register::signup(&store, &rcfg, a_signup("gamma-three", PW, "7.7.7.7", 20)).await {
+        Ok(SignupOutcome::RateLimited { retry_after_secs }) => assert!(retry_after_secs > 0),
+        _ => panic!("expected RateLimited"),
+    }
+    // A different client is unaffected.
+    match register::signup(&store, &rcfg, a_signup("delta-four", PW, "8.8.8.8", 21)).await {
+        Ok(SignupOutcome::Created { .. }) => {}
+        _ => panic!("a different client should not be limited"),
+    }
+}
+
+#[tokio::test]
+async fn a_rejected_signup_writes_no_account() {
+    let store = seeded();
+    let rcfg = register_config(10);
+    for (name, pw) in [("ok-name", "short"), ("bad name", PW), ("admin", PW)] {
+        match register::signup(&store, &rcfg, a_signup(name, pw, "1.2.3.4", 30)).await {
+            Ok(SignupOutcome::Rejected(_)) => {}
+            _ => panic!("{name:?}/{pw:?} should have been rejected"),
+        }
+    }
+    for name in ["ok-name", "bad name", "admin"] {
+        assert!(
+            store.user_by_name(name).await.unwrap().is_none(),
+            "{name} was created despite rejection"
+        );
+    }
+}

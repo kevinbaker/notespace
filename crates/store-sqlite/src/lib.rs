@@ -122,6 +122,33 @@ fn post_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Post> {
 
 #[async_trait(?Send)]
 impl Store for SqliteStore {
+    async fn recent_threads(&self, limit: u32) -> StoreResult<Vec<ThreadSummary>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(sql::RECENT_THREADS)
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit], |r| {
+                Ok(ThreadSummary {
+                    public_id: PublicId::parse(&r.get::<_, String>("public_id")?).map_err(|e| {
+                        rusqlite::Error::InvalidColumnName(format!("public_id: {e}"))
+                    })?,
+                    title: r.get("title")?,
+                    post_count: r.get::<_, i64>("post_count")? as u32,
+                    bumped_at: r.get("bumped_at")?,
+                    author_name: r.get("author_name")?,
+                    space_name: r.get("space_name")?,
+                    space_path: r.get("space_path")?,
+                })
+            })
+            .map_err(backend)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| corrupt("thread row", e))?);
+        }
+        Ok(out)
+    }
+
     async fn thread_version(&self, thread: &PublicId) -> StoreResult<Option<i64>> {
         self.conn
             .query_row(sql::THREAD_VERSION, [thread.as_str()], |r| r.get(0))
@@ -371,13 +398,20 @@ impl Store for SqliteStore {
         created_at: Timestamp,
         password_hash: Option<&str>,
     ) -> StoreResult<UserId> {
-        self.conn
-            .execute(
-                sql::INSERT_USER,
-                rusqlite::params![name, created_at, password_hash],
-            )
-            .map_err(backend)?;
-        Ok(self.conn.last_insert_rowid())
+        match self.conn.execute(
+            sql::INSERT_USER,
+            rusqlite::params![name, created_at, password_hash],
+        ) {
+            Ok(_) => Ok(self.conn.last_insert_rowid()),
+            // The name is taken. Registration checks first, but the check and the insert are
+            // not atomic, so the unique index is the real guard and this is the race losing.
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+            {
+                Err(StoreError::Conflict)
+            }
+            Err(e) => Err(backend(e)),
+        }
     }
 
     async fn set_password_hash(&self, user: UserId, hash: &str) -> StoreResult<()> {

@@ -95,6 +95,22 @@ ORDER BY path DESC LIMIT 1";
 pub const THREAD_ROW: &str = "\
 SELECT id, post_count FROM thread WHERE public_id = ?1";
 
+/// Threads for the index, most recently active first.
+///
+/// Ordered by `bumped_at`, which is what the denormalized column exists for -- a `MAX(created_at)`
+/// over posts would read the whole table to sort a list of fifty.
+///
+/// Binds: `?1` = limit.
+pub const RECENT_THREADS: &str = "\
+SELECT t.public_id, t.title, t.post_count, t.bumped_at, u.name AS author_name, \
+s.name AS space_name, s.path AS space_path \
+FROM thread t \
+JOIN user u ON u.id = t.author_id \
+JOIN space s ON s.id = t.space_id \
+WHERE t.state = 'visible' \
+ORDER BY t.bumped_at DESC \
+LIMIT ?1";
+
 /// Resolve a post's public id to its row id and path, within a known thread.
 ///
 /// Scoped to the thread on purpose: replying to a post in another thread is not a reparent, it

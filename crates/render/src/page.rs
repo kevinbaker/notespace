@@ -39,6 +39,13 @@ pub fn thread_page(page: &ThreadPage) -> Markup {
                     a href="/" { "notespace" }
                     " / "
                     a href={ "/s/" (space.path.trim_end_matches('/')) } { (space.name) }
+                    // Static, like everything else here. Which of these applies to the reader
+                    // is not knowable in a page baked once and shared with all of them.
+                    span class="site-auth" {
+                        a href="/login" { "sign in" }
+                        " · "
+                        a href="/register" { "register" }
+                    }
                 }
                 main {
                     h1 class="thread-title" { (t.title) }

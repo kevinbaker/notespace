@@ -193,3 +193,79 @@ pub fn reply_page(
         }
     }
 }
+
+/// Why a signup was refused.
+pub enum RegisterError {
+    /// The name is not usable. Carries the reason, which is safe to show.
+    BadName(String),
+    Taken,
+    ShortPassword {
+        min: usize,
+    },
+    RateLimited {
+        retry_after_secs: i64,
+    },
+    Expired,
+}
+
+impl RegisterError {
+    fn message(&self) -> String {
+        match self {
+            RegisterError::BadName(why) => format!("That name will not work: {why}."),
+            RegisterError::Taken => "That name is already taken.".into(),
+            RegisterError::ShortPassword { min } => {
+                format!("Passwords need at least {min} characters.")
+            }
+            RegisterError::RateLimited { retry_after_secs } => {
+                let mins = (retry_after_secs + 59) / 60;
+                format!(
+                    "Too many accounts created from here. Try again in about {} minute{}.",
+                    mins.max(1),
+                    if mins > 1 { "s" } else { "" }
+                )
+            }
+            RegisterError::Expired => "That form had expired. Please try again.".into(),
+        }
+    }
+}
+
+/// The signup form.
+///
+/// `name` is echoed back so a rejection does not make someone retype it. The password never is:
+/// re-rendering a submitted password puts it in the page, and from there in any cache or proxy
+/// that sees the response.
+pub fn register_page(csrf: &str, name: &str, error: Option<RegisterError>) -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { "Create an account" }
+                style { (PreEscapedStyle) }
+            }
+            body {
+                main class="auth" {
+                    h1 { "Create an account" }
+                    @if let Some(e) = error {
+                        p class="error" role="alert" { (e.message()) }
+                    }
+                    form method="post" action="/register" {
+                        input type="hidden" name="csrf" value=(csrf);
+                        label for="username" { "Username" }
+                        input id="username" name="username" value=(name) required
+                            autocomplete="username" autocapitalize="none" autofocus;
+                        label for="password" { "Password" }
+                        input id="password" name="password" type="password" required
+                            autocomplete="new-password";
+                        p class="muted" { "At least 12 characters. Usernames are permanent." }
+                        button type="submit" { "Create account" }
+                    }
+                    p class="muted" {
+                        "Already have one? " a href="/login" { "Sign in" } "."
+                    }
+                }
+            }
+        }
+    }
+}

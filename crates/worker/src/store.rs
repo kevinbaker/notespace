@@ -86,6 +86,17 @@ struct ThreadRow {
 }
 
 #[derive(Deserialize)]
+struct ThreadSummaryRow {
+    public_id: String,
+    title: String,
+    post_count: i64,
+    bumped_at: i64,
+    author_name: String,
+    space_name: String,
+    space_path: String,
+}
+
+#[derive(Deserialize)]
 struct VersionRow {
     cache_version: i64,
 }
@@ -568,6 +579,34 @@ impl Store for D1Store {
         self.fetch_post_location(post).await
     }
 
+    async fn recent_threads(&self, limit: u32) -> StoreResult<Vec<ThreadSummary>> {
+        let res = self
+            .db
+            .prepare(sql::RECENT_THREADS)
+            .bind(&[num(limit as i64)])
+            .map_err(backend)?
+            .all()
+            .await
+            .map_err(backend)?;
+        self.last_stats.set(collect_stats(&[&res]));
+        let rows: Vec<ThreadSummaryRow> = res.results().map_err(backend)?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(ThreadSummary {
+                    public_id: PublicId::parse(&r.public_id).map_err(|e| {
+                        StoreError::Corrupt(format!("thread public_id {:?}: {e}", r.public_id))
+                    })?,
+                    title: r.title,
+                    post_count: r.post_count.max(0) as u32,
+                    bumped_at: r.bumped_at,
+                    author_name: r.author_name,
+                    space_name: r.space_name,
+                    space_path: r.space_path,
+                })
+            })
+            .collect()
+    }
+
     async fn thread_version(&self, thread: &PublicId) -> StoreResult<Option<i64>> {
         let res = self
             .db
@@ -627,7 +666,17 @@ impl Store for D1Store {
             .map_err(backend)?
             .run()
             .await
-            .map_err(backend)?;
+            .map_err(|e| {
+                // The name is taken. Registration checks first, but the check and the insert
+                // are not atomic, so the unique index is the real guard and this is the race
+                // losing. D1 surfaces constraint failures as a message, not a code.
+                let msg = e.to_string();
+                if msg.contains("UNIQUE constraint failed") {
+                    StoreError::Conflict
+                } else {
+                    StoreError::Backend(msg)
+                }
+            })?;
         self.last_stats.set(collect_stats(&[&res]));
         res.meta()
             .ok()

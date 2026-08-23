@@ -81,12 +81,14 @@ fn posture(env: &Env) -> startup::Posture {
 
 fn router(env: Env) -> Router {
     Router::new()
+        .route("/", get(index))
         .route("/healthz", get(healthz))
         .route("/t/{id}", get(thread_page))
         .route("/t/{id}/{slug}", get(thread_page_slug))
         .route("/p/{id}", get(post_permalink))
         .route("/login", get(login_form).post(login_submit))
         .route("/logout", post(logout))
+        .route("/register", get(register_form).post(register_submit))
         .route("/t/{id}/reply", get(reply_form).post(reply_submit))
         // GET runs the read-only checks; POST adds the write checks, which mutate the thread.
         // A GET that appends posts would be wrong regardless of how convenient it is.
@@ -954,6 +956,269 @@ async fn reply_submit(
         Ok(Outcome::Rejected(Rejected::TooDeep { cap })) => back(&format!("deep-{cap}")),
         Ok(Outcome::Rejected(Rejected::Contended)) => back("contended"),
         Ok(Outcome::Rejected(Rejected::NotFound)) => error(StatusCode::NOT_FOUND, "no such thread"),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+/// Query parameters the signup form accepts.
+#[cfg(feature = "password")]
+#[derive(Deserialize, Default)]
+struct RegisterQuery {
+    name: Option<String>,
+    error: Option<String>,
+}
+
+/// The signup form.
+///
+/// Like the login form, the CSRF token binds to a short-lived anonymous cookie: a visitor here
+/// has no session to bind to yet.
+#[cfg(feature = "password")]
+#[worker::send]
+async fn register_form(
+    State(env): State<Env>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<RegisterQuery>,
+) -> Response {
+    if let auth_config::AuthConfig::Refused(why) = auth_config::AuthConfig::resolve(&env) {
+        return (StatusCode::SERVICE_UNAVAILABLE, format!("{why}\n")).into_response();
+    }
+    let Some(key) = csrf_key(&env) else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CSRF_KEY is not configured",
+        );
+    };
+    let (anon, set_anon) = match cookie::get(cookie_header(&headers), cookie::ANON) {
+        Some(existing) => (existing, None),
+        None => match ids::random_hex() {
+            Ok(v) => {
+                let c = cookie::set(cookie::ANON, &v, 60 * 60);
+                (v, Some(c))
+            }
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
+        },
+    };
+    let token = key.mint(
+        &anon,
+        worker::Date::now().as_millis() as i64,
+        csrf::DEFAULT_LIFETIME_MS,
+    );
+    let body = notespace_render::auth::register_page(
+        token.as_str(),
+        q.name.as_deref().unwrap_or(""),
+        q.error.and_then(parse_register_error),
+    );
+    let mut resp = (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        Html(body.into_string()),
+    )
+        .into_response();
+    if let Some(c) = set_anon {
+        if let Ok(v) = c.parse() {
+            resp.headers_mut().append(header::SET_COOKIE, v);
+        }
+    }
+    resp
+}
+
+/// Turn `?error=` back into something to show. Only values this handler itself emits.
+#[cfg(feature = "password")]
+fn parse_register_error(code: String) -> Option<notespace_render::auth::RegisterError> {
+    use notespace_render::auth::RegisterError;
+    match code.as_str() {
+        "taken" => Some(RegisterError::Taken),
+        "expired" => Some(RegisterError::Expired),
+        other => {
+            if let Some(n) = other.strip_prefix("short-") {
+                return n
+                    .parse()
+                    .ok()
+                    .map(|min| RegisterError::ShortPassword { min });
+            }
+            if let Some(why) = other.strip_prefix("name-") {
+                return Some(RegisterError::BadName(why.to_string()));
+            }
+            other
+                .strip_prefix("wait-")
+                .and_then(|s| s.parse().ok())
+                .map(|retry_after_secs| RegisterError::RateLimited { retry_after_secs })
+        }
+    }
+}
+
+/// Create an account, and sign in on success.
+#[cfg(feature = "password")]
+#[worker::send]
+async fn register_submit(
+    State(env): State<Env>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Response {
+    use notespace_core::register::{self, Outcome, RegisterConfig, Rejected, Signup};
+
+    let (peppers, scheme) = match auth_config::AuthConfig::resolve(&env) {
+        auth_config::AuthConfig::Refused(why) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, format!("{why}\n")).into_response()
+        }
+        auth_config::AuthConfig::External => {
+            return error(StatusCode::NOT_FOUND, "local accounts are disabled")
+        }
+        auth_config::AuthConfig::Passwords { peppers, scheme } => (peppers, scheme),
+    };
+
+    let mut form_name = String::new();
+    let mut form_pw = String::new();
+    let mut form_csrf = String::new();
+    for (k, v) in form_urlencoded::parse(body.as_bytes()) {
+        match k.as_ref() {
+            "username" => form_name = v.into_owned(),
+            "password" => form_pw = v.into_owned(),
+            "csrf" => form_csrf = v.into_owned(),
+            _ => {}
+        }
+    }
+
+    // The name is echoed back on rejection so it does not have to be retyped. The password
+    // never is.
+    let back = |e: &str| -> Response {
+        (
+            StatusCode::SEE_OTHER,
+            [(
+                header::LOCATION,
+                format!(
+                    "/register?name={}&error={}",
+                    urlencoding(&form_name),
+                    urlencoding(e)
+                ),
+            )],
+        )
+            .into_response()
+    };
+
+    let Some(key) = csrf_key(&env) else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CSRF_KEY is not configured",
+        );
+    };
+    let anon = cookie::get(cookie_header(&headers), cookie::ANON).unwrap_or_default();
+    let now = worker::Date::now().as_millis() as i64;
+    if key.verify(&form_csrf, &anon, now).is_err() {
+        return back("expired");
+    }
+
+    let Ok(db) = env.d1(DB_BINDING) else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding");
+    };
+    let store = D1Store::new(db);
+
+    let token = match ids::random_session_token() {
+        Ok(t) => t,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    };
+    let salt_bytes = match ids::random_hex() {
+        Ok(h) => h,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    };
+    let salt = match notespace_core::password::encode_salt(&salt_bytes.as_bytes()[..16]) {
+        Ok(s) => s,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    let cfg = RegisterConfig {
+        scheme,
+        peppers,
+        sessions: notespace_core::session::SessionPolicy::default(),
+        per_client: notespace_core::ratelimit::Limit {
+            max: 3,
+            window_ms: 60 * 60_000,
+        },
+    };
+    let attempt = Signup {
+        username: &form_name,
+        password: &form_pw,
+        client: &client_address(&headers),
+        token: token.clone(),
+        salt: &salt,
+        now,
+    };
+
+    match register::signup(&store, &cfg, attempt).await {
+        Ok(Outcome::Created { .. }) => (
+            StatusCode::SEE_OTHER,
+            [
+                (header::LOCATION, "/".to_string()),
+                (
+                    header::SET_COOKIE,
+                    cookie::set(
+                        cookie::SESSION,
+                        &token.to_cookie_value(),
+                        cfg.sessions.lifetime_ms / 1000,
+                    ),
+                ),
+            ],
+        )
+            .into_response(),
+        Ok(Outcome::RateLimited { retry_after_secs }) => back(&format!("wait-{retry_after_secs}")),
+        Ok(Outcome::Rejected(Rejected::Taken)) => back("taken"),
+        Ok(Outcome::Rejected(Rejected::ShortPassword { min })) => back(&format!("short-{min}")),
+        Ok(Outcome::Rejected(Rejected::BadName(why))) => back(&format!("name-{why}")),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// Local accounts compiled out: the endpoints do not exist.
+#[cfg(not(feature = "password"))]
+async fn register_form() -> Response {
+    external_auth()
+}
+#[cfg(not(feature = "password"))]
+async fn register_submit() -> Response {
+    external_auth()
+}
+
+/// Threads shown on the index.
+const INDEX_LIMIT: u32 = 50;
+
+/// The landing page.
+///
+/// Uncached for now, deliberately: every reply bumps a thread and reorders this list, so a
+/// version key would change on nearly every write and buy little. One statement and fifty rows
+/// is cheap enough to serve fresh.
+#[worker::send]
+async fn index(State(env): State<Env>) -> Response {
+    let Ok(db) = env.d1(DB_BINDING) else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding");
+    };
+    let store = D1Store::new(db);
+    match store.recent_threads(INDEX_LIMIT).await {
+        Ok(threads) => {
+            let html = notespace_render::index::index_page(&threads).into_string();
+            let mut resp = (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                    (header::CACHE_CONTROL, "public, max-age=0, s-maxage=10"),
+                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                    (header::REFERRER_POLICY, "strict-origin-when-cross-origin"),
+                ],
+                Html(html),
+            )
+                .into_response();
+            if let Ok(v) = store.last_stats().server_timing().parse() {
+                resp.headers_mut()
+                    .insert(header::HeaderName::from_static("server-timing"), v);
+            }
+            resp
+        }
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
