@@ -267,10 +267,12 @@ fn main() {
             // Hand-rolled JSON: the seed crate stays dependency-free so it cannot drift
             // from what the wasm benchmark compiles against.
             json_posts.push(format!(
-                "{{\"id\":{},\"thread_id\":1,\"parent_id\":{},\"path\":\"{}\",\"depth\":{},\
+                "{{\"id\":{},\"public_id\":\"{}\",\"thread_id\":1,\"parent_id\":{},\
+                 \"path\":\"{}\",\"depth\":{},\
                  \"author_id\":{},\"author_name\":\"{}\",\"body_md\":{},\"body_html\":{},\
                  \"created_at\":{},\"edited_at\":null,\"score\":0.0,\"state\":\"visible\"}}",
                 i + 1,
+                post_public_id(*i),
                 parent_idx
                     .map(|p| (p + 1).to_string())
                     .unwrap_or_else(|| "null".into()),
