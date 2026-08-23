@@ -69,6 +69,30 @@ WHERE p.public_id = ?1";
 /// prepared-statement cache warm and means the first page is not a special case in any adapter.
 pub const PATH_START: &str = "";
 
+/// Sorts above every valid path, so it means "read to the end of the thread".
+///
+/// The counterpart to [`PATH_START`], for the last fragment of a thread, which has no next
+/// top-level ordinal to bound against. `~` is 0x7E; the highest byte any path can contain is
+/// `Z` at 0x5A. `the_end_sentinel_sorts_above_every_path` pins that.
+pub const PATH_END: &str = "~";
+
+/// One fragment's posts: a bounded range scan, where [`POSTS`] is an open-ended one.
+///
+/// Same index, same walk, one extra comparison. The upper bound is what makes a fragment
+/// independently renderable, and therefore independently cacheable.
+///
+/// Binds: `?1` = thread public id, `?2` = start path (inclusive), `?3` = end path (exclusive),
+/// `?4` = limit.
+pub const FRAGMENT_POSTS: &str = "\
+SELECT p.id, p.public_id, p.thread_id, p.parent_id, p.path, p.depth, p.author_id, \
+u.name AS author_name, p.body_html, p.created_at, p.edited_at, p.score, p.state \
+FROM post p \
+JOIN user u ON u.id = p.author_id \
+WHERE p.thread_id = (SELECT id FROM thread WHERE public_id = ?1) \
+AND p.path >= ?2 AND p.path < ?3 \
+ORDER BY p.path \
+LIMIT ?4";
+
 // ---------------------------------------------------------------------------
 // Write path
 // ---------------------------------------------------------------------------
@@ -224,3 +248,23 @@ INSERT INTO user (name, created_at, password_hash, state) VALUES (?1, ?2, ?3, 'a
 ///
 /// Binds: `?1` user id, `?2` password_hash.
 pub const SET_PASSWORD_HASH: &str = "UPDATE user SET password_hash = ?2 WHERE id = ?1";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::path::ALPHABET;
+
+    /// The bounded fragment scan uses this as its upper bound when a fragment has no next
+    /// top-level ordinal. If any path byte could sort above it, the last fragment of a thread
+    /// would silently lose posts.
+    #[test]
+    fn the_end_sentinel_sorts_above_every_path() {
+        let sentinel = PATH_END.as_bytes()[0];
+        for b in ALPHABET.iter() {
+            assert!(*b < sentinel, "{} sorts above the sentinel", *b as char);
+        }
+        // The separator too, since it appears in every nested path.
+        assert!(b'.' < sentinel);
+        assert!(PATH_START < PATH_END);
+    }
+}

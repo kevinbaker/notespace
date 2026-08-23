@@ -138,6 +138,20 @@ Not built: the progressive enhancement described in DESIGN.md §7.1 that opens t
 when JS is available. There is no `/api/me/thread/{id}` endpoint yet, which is where the CSRF
 token for that path has to come from.
 
+## Fragments
+
+| what | where |
+|---|---|
+| Boundaries and identity | `crates/core/src/fragment.rs` — `Fragment`, `FRAGMENT_SPAN` |
+| Bounded range scan | `crates/core/src/sql.rs` — `FRAGMENT_POSTS`, `PATH_END` |
+| Store method | `Store::thread_fragment`, implemented by both adapters |
+| Partition check | `fragments_partition_the_thread` (shared suite); multi-fragment tests in `crates/store-sqlite/tests/conformance.rs` |
+
+**Not yet wired to anything in production.** `thread_fragment` is exercised only by tests. Two
+things are still missing before a page can be assembled from fragments: a header-only read (the
+fragment query returns posts, not the thread and space a render needs), and per-fragment
+versions in the cache key, which needs a version vector on the thread row.
+
 ## §5 Moderation pipeline
 
 Not implemented. `PostState::Pending` in `crates/core/src/model.rs` is the only part present.

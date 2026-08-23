@@ -389,6 +389,41 @@ stay uncompressed and the assembled page is what gets cached.
 
 ---
 
+## `crates/core/src/fragment.rs`
+
+Fixed-arithmetic boundaries, not size-packed ones. Fragment `k` covers top-level ordinals
+`[k·SPAN, (k+1)·SPAN)`, which needs no storage and no extra query because it is pure arithmetic
+over the path.
+
+Measured on a real 204-post thread, the packing question is worth revisiting later but not yet:
+
+| approach | fragments | mean | worst | rebake saving |
+|---|---|---|---|---|
+| per top-level subtree | 55 | 3.7 | 37 | 56× |
+| packed to ~10 posts | 17 | 12.0 | 37 | 17× |
+| packed to ~25 posts | 9 | 22.7 | 37 | 9× |
+
+That thread's subtree sizes were median 1, max 37, with 32 of 55 being singletons, so fixed
+spans give uneven fragments. Packing needs the boundaries stored somewhere — a schema change —
+which is why this version does not do it.
+
+**The range scan is sound because `.` sorts below the alphabet.** A descendant's path is
+`<root>.<...>`, and `.` is 0x2E while the lowest alphabet byte is `0` at 0x30, so a whole
+subtree falls between its root and the next root. That is what keeps a subtree from ever
+straddling a boundary, which is the property the entire scheme rests on: one reply dirties
+exactly one fragment.
+
+`PATH_END` is `~` (0x7E), above `Z` (0x5A), for the last fragment which has no next root to
+bound against. `the_end_sentinel_sorts_above_every_path` pins it against the real alphabet
+rather than against an assumption.
+
+**The shared conformance fixture cannot prove this.** Its top-level ordinals are 1–6, so every
+post lands in fragment 0 and the partition check passes without crossing a boundary. The
+multi-fragment tests in `crates/store-sqlite/tests/conformance.rs` build a wider thread on
+purpose.
+
+---
+
 ## `crates/render/src/page.rs`
 
 The permalink anchor used to emit `id="p{post.id}"`, baking the internal sequential integer into

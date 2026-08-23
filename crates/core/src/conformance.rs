@@ -19,6 +19,7 @@
 //! Callers seed the store themselves — this module cannot, because inserting is target-specific
 //! and there is no write path yet. [`Fixture`] describes what the suite expects to find.
 
+use crate::fragment::Fragment;
 use crate::id::PublicId;
 use crate::model::{NewPost, SanitizedHtml};
 use crate::path::Path;
@@ -93,6 +94,7 @@ pub async fn run_all<S: Store>(store: &S, fx: &Fixture) -> Vec<Check> {
         cursor_is_none_on_the_last_page(store, fx).await,
         absent_thread_is_not_found(store, fx).await,
         thread_version_is_readable_and_absent_for_unknown(store, fx).await,
+        fragments_partition_the_thread(store, fx).await,
         locate_post_finds_its_thread(store, fx).await,
         absent_post_is_not_found(store, fx).await,
         posts_never_expose_body_md(store, fx).await,
@@ -746,6 +748,66 @@ async fn thread_version_is_readable_and_absent_for_unknown<S: Store>(
         Ok(Some(v)) => Check::fail(NAME, format!("unknown thread reported version {v}")),
         Err(e) => Check::fail(NAME, format!("unknown thread errored: {e}")),
     }
+}
+
+/// Fragments must tile the thread exactly: every post in one and only one, in the same order
+/// the paged read gives. A gap loses posts silently; an overlap renders them twice.
+async fn fragments_partition_the_thread<S: Store>(store: &S, fx: &Fixture) -> Check {
+    const NAME: &str = "fragments partition the thread, in order, with no gaps or overlaps";
+    let whole = match store
+        .thread_page(&fx.thread, &Page::first(fx.post_count + 1))
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+
+    // Walk fragments until one past the last that holds anything.
+    let mut collected: Vec<String> = Vec::new();
+    let mut index = 0u32;
+    let mut empty_runs = 0;
+    while empty_runs < 2 && index < 64 {
+        match store
+            .thread_fragment(&fx.thread, Fragment::new(index), fx.post_count + 1)
+            .await
+        {
+            Ok(posts) => {
+                if posts.is_empty() {
+                    empty_runs += 1;
+                } else {
+                    empty_runs = 0;
+                    for p in &posts {
+                        require!(
+                            NAME,
+                            Fragment::containing(&p.path) == Fragment::new(index),
+                            "fragment {index} returned {} which belongs to {:?}",
+                            p.path,
+                            Fragment::containing(&p.path).index()
+                        );
+                    }
+                    collected.extend(posts.iter().map(|p| p.path.as_str().to_string()));
+                }
+            }
+            Err(e) => return Check::fail(NAME, format!("fragment {index}: {e}")),
+        }
+        index += 1;
+    }
+
+    let expected: Vec<String> = whole
+        .posts
+        .iter()
+        .map(|p| p.path.as_str().to_string())
+        .collect();
+    require!(
+        NAME,
+        collected == expected,
+        "fragments gave {} paths, the paged read gave {}: {:?} vs {:?}",
+        collected.len(),
+        expected.len(),
+        collected.first(),
+        expected.first()
+    );
+    Check::pass(NAME)
 }
 
 async fn locate_post_finds_its_thread<S: Store>(store: &S, fx: &Fixture) -> Check {

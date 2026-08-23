@@ -97,8 +97,59 @@ fn parse_enum<T: Default + core::str::FromStr>(s: &str) -> T {
     s.parse().unwrap_or_default()
 }
 
+/// One row of the post read path.
+///
+/// Shared by the paged and fragment reads: two copies would be two chances to disagree about
+/// what a post is.
+fn post_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Post> {
+    Ok(Post {
+        id: r.get("id")?,
+        public_id: PublicId::parse(&r.get::<_, String>("public_id")?)
+            .map_err(|e| rusqlite::Error::InvalidColumnName(format!("public_id: {e}")))?,
+        thread_id: r.get("thread_id")?,
+        parent_id: r.get("parent_id")?,
+        path: Path::parse(&r.get::<_, String>("path")?)
+            .map_err(|e| rusqlite::Error::InvalidColumnName(format!("path: {e}")))?,
+        depth: r.get::<_, i64>("depth")? as u32,
+        author_id: r.get("author_id")?,
+        author_name: r.get("author_name")?,
+        // Never selected on the read path; see notespace_core::sql::POSTS.
+        body_md: None,
+        body_html: r.get("body_html")?,
+        created_at: r.get("created_at")?,
+        edited_at: r.get("edited_at")?,
+        score: r.get("score")?,
+        state: parse_enum(&r.get::<_, String>("state")?),
+    })
+}
+
 #[async_trait(?Send)]
 impl Store for SqliteStore {
+    async fn thread_fragment(
+        &self,
+        thread: &PublicId,
+        fragment: notespace_core::fragment::Fragment,
+        limit: u32,
+    ) -> StoreResult<Vec<Post>> {
+        let (start, end) = fragment.bounds();
+        let end = end.unwrap_or_else(|| sql::PATH_END.to_string());
+        let mut stmt = self
+            .conn
+            .prepare_cached(sql::FRAGMENT_POSTS)
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![thread.as_str(), start, end, limit],
+                post_from_row,
+            )
+            .map_err(backend)?;
+        let mut posts = Vec::new();
+        for row in rows {
+            posts.push(row.map_err(|e| corrupt("post row", e))?);
+        }
+        Ok(posts)
+    }
+
     async fn thread_version(&self, thread: &PublicId) -> StoreResult<Option<i64>> {
         self.conn
             .query_row(sql::THREAD_VERSION, [thread.as_str()], |r| r.get(0))
@@ -126,29 +177,7 @@ impl Store for SqliteStore {
         let rows = stmt
             .query_map(
                 rusqlite::params![thread.as_str(), cursor, fetch],
-                |r| -> rusqlite::Result<Post> {
-                    Ok(Post {
-                        id: r.get("id")?,
-                        public_id: PublicId::parse(&r.get::<_, String>("public_id")?).map_err(
-                            |e| rusqlite::Error::InvalidColumnName(format!("public_id: {e}")),
-                        )?,
-                        thread_id: r.get("thread_id")?,
-                        parent_id: r.get("parent_id")?,
-                        path: Path::parse(&r.get::<_, String>("path")?).map_err(|e| {
-                            rusqlite::Error::InvalidColumnName(format!("path: {e}"))
-                        })?,
-                        depth: r.get::<_, i64>("depth")? as u32,
-                        author_id: r.get("author_id")?,
-                        author_name: r.get("author_name")?,
-                        // Never selected on the read path; see notespace_core::sql::POSTS.
-                        body_md: None,
-                        body_html: r.get("body_html")?,
-                        created_at: r.get("created_at")?,
-                        edited_at: r.get("edited_at")?,
-                        score: r.get("score")?,
-                        state: parse_enum(&r.get::<_, String>("state")?),
-                    })
-                },
+                post_from_row,
             )
             .map_err(backend)?;
 

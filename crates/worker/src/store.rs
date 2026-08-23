@@ -137,6 +137,38 @@ struct PostLocationRow {
     post_path: String,
 }
 
+/// One row of the post read path.
+///
+/// Shared by the paged and fragment reads: two copies of this would be two chances for the
+/// adapters to disagree about what a post is.
+fn post_from_row(r: PostRow) -> StoreResult<Post> {
+    // A path that fails validation would silently corrupt thread ordering, so it is an error
+    // rather than something to paper over.
+    let path = Path::parse(&r.path).map_err(|e| {
+        StoreError::Corrupt(format!("post {} has invalid path {:?}: {e}", r.id, r.path))
+    })?;
+    // A row that cannot round-trip its own id is corrupt, not merely unexpected.
+    let public_id = PublicId::parse(&r.public_id).map_err(|e| {
+        StoreError::Backend(format!("post {} has an unparseable public_id: {e}", r.id))
+    })?;
+    Ok(Post {
+        public_id,
+        id: r.id,
+        thread_id: r.thread_id,
+        parent_id: r.parent_id,
+        depth: r.depth.max(0) as u32,
+        path,
+        author_id: r.author_id,
+        author_name: r.author_name,
+        body_md: None,
+        body_html: r.body_html,
+        created_at: r.created_at,
+        edited_at: r.edited_at,
+        score: r.score,
+        state: post_state(&r.state),
+    })
+}
+
 #[derive(Deserialize)]
 struct PostRow {
     id: i64,
@@ -511,31 +543,7 @@ impl D1Store {
 
         let mut posts = Vec::with_capacity(rows.len());
         for r in rows {
-            // A path that fails validation would silently corrupt thread ordering, so it is
-            // an error rather than something to paper over.
-            let path = Path::parse(&r.path).map_err(|e| {
-                StoreError::Corrupt(format!("post {} has invalid path {:?}: {e}", r.id, r.path))
-            })?;
-            let public_id = PublicId::parse(&r.public_id).map_err(|e| {
-                // A row that cannot round-trip its own id is corrupt, not merely unexpected.
-                StoreError::Backend(format!("post {} has an unparseable public_id: {e}", r.id))
-            })?;
-            posts.push(Post {
-                public_id,
-                id: r.id,
-                thread_id: r.thread_id,
-                parent_id: r.parent_id,
-                depth: r.depth.max(0) as u32,
-                path,
-                author_id: r.author_id,
-                author_name: r.author_name,
-                body_md: None,
-                body_html: r.body_html,
-                created_at: r.created_at,
-                edited_at: r.edited_at,
-                score: r.score,
-                state: post_state(&r.state),
-            });
+            posts.push(post_from_row(r)?);
         }
 
         let next_cursor = if has_more {
@@ -561,6 +569,32 @@ impl Store for D1Store {
 
     async fn locate_post(&self, post: &PublicId) -> StoreResult<PostLocation> {
         self.fetch_post_location(post).await
+    }
+
+    async fn thread_fragment(
+        &self,
+        thread: &PublicId,
+        fragment: notespace_core::fragment::Fragment,
+        limit: u32,
+    ) -> StoreResult<Vec<Post>> {
+        let (start, end) = fragment.bounds();
+        let end = end.unwrap_or_else(|| sql::PATH_END.to_string());
+        let res = self
+            .db
+            .prepare(sql::FRAGMENT_POSTS)
+            .bind(&[
+                thread.as_str().into(),
+                start.as_str().into(),
+                end.as_str().into(),
+                num(limit as i64),
+            ])
+            .map_err(backend)?
+            .all()
+            .await
+            .map_err(backend)?;
+        self.last_stats.set(collect_stats(&[&res]));
+        let rows: Vec<PostRow> = res.results().map_err(backend)?;
+        rows.into_iter().map(post_from_row).collect()
     }
 
     async fn thread_version(&self, thread: &PublicId) -> StoreResult<Option<i64>> {

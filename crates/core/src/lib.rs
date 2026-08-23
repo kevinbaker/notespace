@@ -8,6 +8,7 @@ pub mod cache_key;
 pub mod conformance;
 pub mod cookie;
 pub mod csrf;
+pub mod fragment;
 pub mod id;
 #[cfg(feature = "password")]
 pub mod login;
