@@ -348,6 +348,47 @@ cursor correctly getting its own.
 
 ---
 
+## `crates/core/src/reply.rs` and the reply form
+
+**The form cannot live in the baked thread page.** That page is shared byte-for-byte with every
+reader, so a per-visitor CSRF token in it would be handed to all of them — and would make the
+page uncacheable besides. The affordance in the baked page is therefore a plain *link* to
+`/t/{id}/reply`, which is uncached and carries the token.
+`the_reply_affordance_is_a_link_and_carries_no_token` pins it.
+
+**Ordering, for the same reason login has one.** Validate, then rate limit, then write. The body
+bound is checked before anything else so an oversized body never reaches the renderer or the
+counters; the limiter runs before the insert because the write is the expensive part.
+
+**A path collision is retried, not absorbed.** Two replies to the same parent in the same moment
+compute the same ordinal and `UNIQUE(thread_id, path)` rejects the loser. The adapter must not
+quietly pick another ordinal — a retry has to re-read the parent to get a correct one. The retry
+is bounded at `MAX_PATH_RETRIES`, because an unbounded loop under contention is a way to spend a
+10 ms budget. Each retry uses a *fresh* public id: reusing the one that just lost could not win
+the second time either.
+
+**Length is counted in characters, not bytes.** A byte limit rejects the same number of words
+differently depending on the language they are written in.
+
+`csrf`, `client_address` and `ids::generate_many` were moved out of the `password` feature gate:
+they are form protection and write-path plumbing, not password machinery, and an OIDC deployment
+needs all three.
+
+## Compression
+
+Available: `CompressionStream`/`DecompressionStream` in Workers (`gzip`, `deflate`,
+`deflate-raw`; `br` only behind the `brotli_content_encoding` flag). Responses to browsers are
+already compressed by Cloudflare for free — the 200-post page measures 154 KB of HTML for
+**8.7 KB** on the wire. D1 has no compression and no extensions. R2 has none at rest.
+
+So compression is worth adding **only for archived content**, where the object is read whole and
+passed straight to the client: store gzipped bytes with `content-encoding: gzip` and never
+decompress in the Worker, which costs zero CPU. It is the wrong move for anything the Worker has
+to read — fragments that get stitched server-side must be decompressed on every miss, so they
+stay uncompressed and the assembled page is what gets cached.
+
+---
+
 ## `crates/render/src/page.rs`
 
 The permalink anchor used to emit `id="p{post.id}"`, baking the internal sequential integer into

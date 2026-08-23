@@ -71,6 +71,15 @@ pub fn thread_page(page: &ThreadPage) -> Markup {
                                         time datetime=(post.created_at) { (post.created_at) }
                                     }
                                     @if post.edited_at.is_some() { span class="edited" { " (edited)" } }
+                                    " "
+                                    // A plain link, not a form. The form needs a CSRF token
+                                    // bound to one visitor, and this page is baked once and
+                                    // shared byte-for-byte with every reader -- a token here
+                                    // would be handed to all of them. The link carries nothing
+                                    // viewer-specific, so the page stays cacheable.
+                                    a class="reply" href={
+                                        "/t/" (t.public_id) "/reply?parent=" (post.public_id)
+                                    } { "reply" }
                                 }
                                 @match post.state {
                                     // Tombstones, not deletions: the thread keeps its shape.
@@ -320,6 +329,23 @@ mod tests {
             !html.contains(r#"data-depth="1""#),
             "flat board indented: {html}"
         );
+    }
+
+    /// The reply affordance must be a link, never a form. A form needs a CSRF token bound to
+    /// one visitor, and this page is shared byte-for-byte with every reader — baking a token in
+    /// would hand one visitor's to all of them, and make the page uncacheable besides.
+    #[test]
+    fn the_reply_affordance_is_a_link_and_carries_no_token() {
+        let p = page(vec![post(1, "0001", PostState::Visible, "<p>hi</p>")]);
+        let html = thread_page(&p).into_string();
+        assert!(html.contains("/reply?parent="), "no reply link");
+        assert!(
+            !html.contains("<form"),
+            "a form was baked into the shared page"
+        );
+        for marker in ["csrf", "name=\"body\"", "<textarea"] {
+            assert!(!html.contains(marker), "baked page contains {marker:?}");
+        }
     }
 
     #[test]

@@ -408,3 +408,141 @@ async fn login_rehashes_a_stale_credential() {
         "not rewritten under the current pepper: {after}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The write path, against a real store.
+// ---------------------------------------------------------------------------
+
+use notespace_core::model::SanitizedHtml;
+use notespace_core::reply::{self, Outcome as ReplyOutcome, Rejected, Reply, ReplyConfig};
+
+fn reply_config(per_author: u32) -> ReplyConfig {
+    ReplyConfig {
+        per_author: Limit {
+            max: per_author,
+            window_ms: 60_000,
+        },
+        per_client: Limit {
+            max: 100,
+            window_ms: 60_000,
+        },
+    }
+}
+
+/// Fresh ids per attempt, as `reply::post` requires.
+fn reply_ids(seed: u64) -> Vec<PublicId> {
+    (0..=reply::MAX_PATH_RETRIES as u64)
+        .map(|i| PublicId::new(1_900_000_000_000 + seed * 16 + i, 0xBEEF ^ i as u32).unwrap())
+        .collect()
+}
+
+fn a_reply<'a>(body: &'a str, ids: &'a [PublicId], client: &'a str) -> Reply<'a> {
+    Reply {
+        thread: thread_id(),
+        parent: None,
+        author: 1,
+        body_md: body,
+        body_html: SanitizedHtml::assert_sanitized("<p>body</p>".into()),
+        client,
+        ids,
+        now: NOW,
+    }
+}
+
+#[tokio::test]
+async fn a_reply_is_posted_and_lands_at_the_end_of_the_thread() {
+    let store = seeded();
+    let ids = reply_ids(1);
+    let before = store.thread_version(&thread_id()).await.unwrap().unwrap();
+
+    match reply::post(
+        &store,
+        &reply_config(10),
+        a_reply("hello there", &ids, "1.2.3.4"),
+    )
+    .await
+    {
+        Ok(ReplyOutcome::Posted(p)) => {
+            assert_eq!(p.public_id, ids[0], "stored under the id it was given");
+            assert_eq!(p.depth, 0, "no parent means top level");
+        }
+        _ => panic!("expected a post"),
+    }
+
+    // The write must bump the version, or the cached page keeps serving without the reply.
+    let after = store.thread_version(&thread_id()).await.unwrap().unwrap();
+    assert!(
+        after > before,
+        "cache_version not bumped: {before} -> {after}"
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_body_never_reaches_the_database() {
+    let store = seeded();
+    let ids = reply_ids(2);
+    let huge = "a".repeat(reply::MAX_BODY_CHARS + 1);
+    let before = store.thread_version(&thread_id()).await.unwrap().unwrap();
+
+    match reply::post(&store, &reply_config(10), a_reply(&huge, &ids, "1.2.3.4")).await {
+        Ok(ReplyOutcome::Rejected(Rejected::TooLong { .. })) => {}
+        _ => panic!("expected TooLong"),
+    }
+    assert_eq!(
+        store.thread_version(&thread_id()).await.unwrap().unwrap(),
+        before,
+        "a rejected body still wrote to the thread"
+    );
+}
+
+/// The limiter has to bite before the insert, not after: the write is the expensive part and
+/// the whole point is that a flood does not reach it.
+#[tokio::test]
+async fn the_limiter_bites_before_the_write() {
+    let store = seeded();
+    let cfg = reply_config(2);
+    for i in 0..2u64 {
+        let ids = reply_ids(10 + i);
+        match reply::post(&store, &cfg, a_reply("a real reply", &ids, "9.9.9.9")).await {
+            Ok(ReplyOutcome::Posted(_)) => {}
+            _ => panic!("attempt {i} should have posted"),
+        }
+    }
+    let before = store.thread_version(&thread_id()).await.unwrap().unwrap();
+    let ids = reply_ids(99);
+    match reply::post(&store, &cfg, a_reply("one too many", &ids, "9.9.9.9")).await {
+        Ok(ReplyOutcome::RateLimited { retry_after_secs }) => {
+            assert!(retry_after_secs > 0, "no retry hint");
+        }
+        _ => panic!("expected RateLimited"),
+    }
+    assert_eq!(
+        store.thread_version(&thread_id()).await.unwrap().unwrap(),
+        before,
+        "a rate-limited attempt still wrote"
+    );
+}
+
+#[tokio::test]
+async fn a_reply_to_an_unknown_thread_is_rejected_not_an_error() {
+    let store = seeded();
+    let ids = reply_ids(3);
+    let mut r = a_reply("hello there", &ids, "1.2.3.4");
+    r.thread = PublicId::new(1_735_689_600_000, 0xDEAD).unwrap();
+    match reply::post(&store, &reply_config(10), r).await {
+        Ok(ReplyOutcome::Rejected(Rejected::NotFound)) => {}
+        _ => panic!("expected NotFound"),
+    }
+}
+
+/// Every id offered must be distinct, or a retry re-submits the id that just lost and cannot
+/// possibly win. Cheap to assert, and the failure would only show under contention.
+#[tokio::test]
+async fn the_retry_ids_are_distinct() {
+    let ids = reply_ids(7);
+    let mut seen = std::collections::HashSet::new();
+    for id in &ids {
+        assert!(seen.insert(id.encode()), "duplicate retry id {id}");
+    }
+    assert!(ids.len() > reply::MAX_PATH_RETRIES as usize, "too few ids");
+}

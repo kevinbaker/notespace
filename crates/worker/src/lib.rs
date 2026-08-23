@@ -19,12 +19,13 @@ use axum::routing::{get, post};
 use axum::Router;
 use notespace_core::conformance::{run_all, Fixture};
 use notespace_core::cookie;
+use notespace_core::csrf;
 use notespace_core::id::PublicId;
+#[cfg(feature = "password")]
+use notespace_core::login;
 use notespace_core::path::Path as TreePath;
 use notespace_core::session::SessionToken;
 use notespace_core::store::{Page, Store, StoreError, StoreResult};
-#[cfg(feature = "password")]
-use notespace_core::{csrf, login};
 use serde::Deserialize;
 use store::D1Store;
 use tower_service::Service;
@@ -86,6 +87,7 @@ fn router(env: Env) -> Router {
         .route("/p/{id}", get(post_permalink))
         .route("/login", get(login_form).post(login_submit))
         .route("/logout", post(logout))
+        .route("/t/{id}/reply", get(reply_form).post(reply_submit))
         // GET runs the read-only checks; POST adds the write checks, which mutate the thread.
         // A GET that appends posts would be wrong regardless of how convenient it is.
         .route(
@@ -327,7 +329,6 @@ fn cookie_header(headers: &axum::http::HeaderMap) -> Option<&str> {
 ///
 /// `CF-Connecting-IP` is set by Cloudflare's edge and cannot be spoofed by the client — unlike
 /// `X-Forwarded-For`, which is why that one is not consulted.
-#[cfg(feature = "password")]
 fn client_address(headers: &axum::http::HeaderMap) -> String {
     headers
         .get("cf-connecting-ip")
@@ -336,7 +337,6 @@ fn client_address(headers: &axum::http::HeaderMap) -> String {
         .to_string()
 }
 
-#[cfg(feature = "password")]
 fn csrf_key(env: &Env) -> Option<csrf::CsrfKey> {
     csrf::CsrfKey::new(env.secret("CSRF_KEY").ok()?.to_string().as_bytes()).ok()
 }
@@ -713,4 +713,247 @@ fn error(code: StatusCode, msg: &str) -> Response {
         public.to_owned(),
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// The write path
+// ---------------------------------------------------------------------------
+
+/// Query parameters the reply form accepts.
+#[derive(Deserialize, Default)]
+struct ReplyQuery {
+    /// Public id of the post being replied to. Absent posts at top level.
+    parent: Option<String>,
+    error: Option<String>,
+}
+
+/// Resolve the visitor's session to a user.
+///
+/// `None` covers every way of not being signed in, deliberately without distinguishing them:
+/// no cookie, an unparseable one, an expired session, a deleted account.
+///
+/// **Budget: 1 statement.**
+async fn current_user(
+    store: &D1Store,
+    headers: &axum::http::HeaderMap,
+) -> Option<notespace_core::model::User> {
+    let raw = cookie::get(cookie_header(headers), cookie::SESSION)?;
+    let token = SessionToken::parse(&raw)?;
+    let now = worker::Date::now().as_millis() as i64;
+    let auth = store.lookup_session(&token.hash(), now).await.ok()??;
+    auth.user.state.can_act().then_some(auth.user)
+}
+
+/// Ask for sign-in, preserving where they were trying to go.
+fn needs_sign_in(next: &str) -> Response {
+    (
+        StatusCode::SEE_OTHER,
+        [(
+            header::LOCATION,
+            format!("/login?next={}", urlencoding(next)),
+        )],
+    )
+        .into_response()
+}
+
+/// Percent-encode the few characters that would break out of a query parameter.
+fn urlencoding(s: &str) -> String {
+    form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
+/// The reply form, on its own uncached page.
+///
+/// Not part of the thread page: that one is baked and shared byte-for-byte between readers, so
+/// a per-visitor CSRF token cannot live in it.
+#[worker::send]
+async fn reply_form(
+    State(env): State<Env>,
+    headers: axum::http::HeaderMap,
+    UrlPath(id): UrlPath<String>,
+    Query(q): Query<ReplyQuery>,
+) -> Response {
+    let thread_id = match PublicId::parse(&id) {
+        Ok(p) => p,
+        Err(e) => return error(StatusCode::BAD_REQUEST, &format!("bad thread id: {e}")),
+    };
+    let canonical = thread_id.encode();
+    let Ok(db) = env.d1(DB_BINDING) else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding");
+    };
+    let store = D1Store::new(db);
+
+    let Some(_user) = current_user(&store, &headers).await else {
+        return needs_sign_in(&format!("/t/{canonical}/reply"));
+    };
+    let Some(key) = csrf_key(&env) else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CSRF_KEY is not configured",
+        );
+    };
+    // Bound to the session cookie, so one visitor's token is useless to another.
+    let Some(session) = cookie::get(cookie_header(&headers), cookie::SESSION) else {
+        return needs_sign_in(&format!("/t/{canonical}/reply"));
+    };
+    let token = key.mint(
+        &session,
+        worker::Date::now().as_millis() as i64,
+        csrf::DEFAULT_LIFETIME_MS,
+    );
+
+    let body = notespace_render::auth::reply_page(
+        token.as_str(),
+        &canonical,
+        q.parent.as_deref(),
+        "",
+        q.error.and_then(parse_reply_error),
+    );
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            // Carries a token bound to one visitor.
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        Html(body.into_string()),
+    )
+        .into_response()
+}
+
+/// Turn `?error=` back into something to show. Only values this handler itself emits.
+fn parse_reply_error(code: String) -> Option<notespace_render::auth::ReplyError> {
+    use notespace_render::auth::ReplyError;
+    match code.as_str() {
+        "empty" => Some(ReplyError::Empty),
+        "expired" => Some(ReplyError::Expired),
+        "contended" => Some(ReplyError::Contended),
+        other => {
+            if let Some(n) = other.strip_prefix("long-") {
+                return n.parse().ok().map(|max| ReplyError::TooLong { max });
+            }
+            if let Some(n) = other.strip_prefix("deep-") {
+                return n.parse().ok().map(|cap| ReplyError::TooDeep { cap });
+            }
+            other
+                .strip_prefix("wait-")
+                .and_then(|s| s.parse().ok())
+                .map(|retry_after_secs| ReplyError::RateLimited { retry_after_secs })
+        }
+    }
+}
+
+/// Accept a reply.
+///
+/// Redirects on every outcome: a POST that renders leaves the browser able to resubmit it, and
+/// resubmitting a reply posts it twice.
+#[worker::send]
+async fn reply_submit(
+    State(env): State<Env>,
+    headers: axum::http::HeaderMap,
+    UrlPath(id): UrlPath<String>,
+    body: String,
+) -> Response {
+    use notespace_core::ratelimit::Limit;
+    use notespace_core::reply::{self, Outcome, Rejected, Reply, ReplyConfig};
+
+    let thread_id = match PublicId::parse(&id) {
+        Ok(p) => p,
+        Err(e) => return error(StatusCode::BAD_REQUEST, &format!("bad thread id: {e}")),
+    };
+    let canonical = thread_id.encode();
+    let back = |e: &str| -> Response {
+        (
+            StatusCode::SEE_OTHER,
+            [(header::LOCATION, format!("/t/{canonical}/reply?error={e}"))],
+        )
+            .into_response()
+    };
+
+    let Ok(db) = env.d1(DB_BINDING) else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding");
+    };
+    let store = D1Store::new(db);
+
+    let Some(user) = current_user(&store, &headers).await else {
+        return needs_sign_in(&format!("/t/{canonical}/reply"));
+    };
+
+    let mut form_body = String::new();
+    let mut form_csrf = String::new();
+    let mut form_parent = String::new();
+    for (k, v) in form_urlencoded::parse(body.as_bytes()) {
+        match k.as_ref() {
+            "body" => form_body = v.into_owned(),
+            "csrf" => form_csrf = v.into_owned(),
+            "parent" => form_parent = v.into_owned(),
+            _ => {}
+        }
+    }
+
+    // CSRF before anything that costs: the token proves the request came from our own form.
+    let Some(key) = csrf_key(&env) else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CSRF_KEY is not configured",
+        );
+    };
+    let session = cookie::get(cookie_header(&headers), cookie::SESSION).unwrap_or_default();
+    let now = worker::Date::now().as_millis() as i64;
+    if key.verify(&form_csrf, &session, now).is_err() {
+        return back("expired");
+    }
+
+    let parent = match form_parent.as_str() {
+        "" => None,
+        raw => match PublicId::parse(raw) {
+            Ok(p) => Some(p),
+            Err(_) => return error(StatusCode::BAD_REQUEST, "bad parent id"),
+        },
+    };
+
+    // Render before storing: the read path never renders, so an unrenderable body must fail
+    // here rather than at every future pageview.
+    let html = notespace_core::model::SanitizedHtml::assert_sanitized(
+        notespace_render::markdown_to_html(&form_body),
+    );
+
+    let ids = match ids::generate_many(reply::MAX_PATH_RETRIES as usize + 1) {
+        Ok(v) => v,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    };
+    let cfg = ReplyConfig {
+        per_author: Limit {
+            max: 10,
+            window_ms: 5 * 60_000,
+        },
+        per_client: Limit {
+            max: 30,
+            window_ms: 5 * 60_000,
+        },
+    };
+    let attempt = Reply {
+        thread: thread_id,
+        parent,
+        author: user.id,
+        body_md: &form_body,
+        body_html: html,
+        client: &client_address(&headers),
+        ids: &ids,
+        now,
+    };
+
+    match reply::post(&store, &cfg, attempt).await {
+        Ok(Outcome::Posted(post)) => (
+            StatusCode::SEE_OTHER,
+            [(header::LOCATION, format!("/p/{}", post.public_id))],
+        )
+            .into_response(),
+        Ok(Outcome::RateLimited { retry_after_secs }) => back(&format!("wait-{retry_after_secs}")),
+        Ok(Outcome::Rejected(Rejected::Empty)) => back("empty"),
+        Ok(Outcome::Rejected(Rejected::TooLong { max, .. })) => back(&format!("long-{max}")),
+        Ok(Outcome::Rejected(Rejected::TooDeep { cap })) => back(&format!("deep-{cap}")),
+        Ok(Outcome::Rejected(Rejected::Contended)) => back("contended"),
+        Ok(Outcome::Rejected(Rejected::NotFound)) => error(StatusCode::NOT_FOUND, "no such thread"),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
 }

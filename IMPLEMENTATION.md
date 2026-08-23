@@ -122,6 +122,18 @@ cookie used before a session exists is `cookie::ANON`.
 `crates/core/src/ratelimit.rs` — `Limit`, `Attempts`, `AttemptKeys`. Schema in
 `migrations/0006_login_attempt.sql`. Called from `login::attempt` before any hashing.
 
+## The write path
+
+| what | where |
+|---|---|
+| Validation, rate limiting, collision retry | `crates/core/src/reply.rs` — `post`, `check_body` |
+| Handlers | `reply_form`, `reply_submit` in `crates/worker/src/lib.rs` |
+| Form | `crates/render/src/auth.rs` — `reply_page` |
+| Session → user | `current_user` in `crates/worker/src/lib.rs` |
+
+The form is a separate uncached page, not part of the baked thread. `/register` still does not
+exist, so accounts come only from the seed CLI.
+
 ## §5 Moderation pipeline
 
 Not implemented. `PostState::Pending` in `crates/core/src/model.rs` is the only part present.
@@ -134,7 +146,7 @@ There is no preset table or selector yet.
 ## §7 Routes
 
 `router()` in `crates/worker/src/lib.rs` is the live list. Currently: `/healthz`, `/t/{id}`,
-`/t/{id}/{slug}`, `/p/{id}`, `/login`, `/logout`, `/__conformance`.
+`/t/{id}/{slug}`, `/p/{id}`, `/t/{id}/reply`, `/login`, `/logout`, `/__conformance`.
 
 `SpaceKey::RESERVED` and `Username::RESERVED` are hand-maintained and should be derived from this
 router instead.

@@ -17,6 +17,16 @@ pub fn generate() -> Result<PublicId, IdError> {
     PublicId::new(Date::now().as_millis(), random_u32())
 }
 
+/// Several ids at once, for a write that may have to retry.
+///
+/// Each is generated independently, so a retry never re-submits the id that just lost a path
+/// collision -- which could not win the second time either.
+pub fn generate_many(n: usize) -> Result<Vec<PublicId>, String> {
+    (0..n)
+        .map(|_| generate().map_err(|e| e.to_string()))
+        .collect()
+}
+
 /// 32 random bytes as hex, for anonymous CSRF cookies.
 #[cfg(feature = "password")]
 pub fn random_hex() -> Result<String, String> {
