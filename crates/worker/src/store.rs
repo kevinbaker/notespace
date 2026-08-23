@@ -138,9 +138,6 @@ struct PostLocationRow {
 }
 
 /// One row of the post read path.
-///
-/// Shared by the paged and fragment reads: two copies of this would be two chances for the
-/// adapters to disagree about what a post is.
 fn post_from_row(r: PostRow) -> StoreResult<Post> {
     // A path that fails validation would silently corrupt thread ordering, so it is an error
     // rather than something to paper over.
@@ -569,32 +566,6 @@ impl Store for D1Store {
 
     async fn locate_post(&self, post: &PublicId) -> StoreResult<PostLocation> {
         self.fetch_post_location(post).await
-    }
-
-    async fn thread_fragment(
-        &self,
-        thread: &PublicId,
-        fragment: notespace_core::fragment::Fragment,
-        limit: u32,
-    ) -> StoreResult<Vec<Post>> {
-        let (start, end) = fragment.bounds();
-        let end = end.unwrap_or_else(|| sql::PATH_END.to_string());
-        let res = self
-            .db
-            .prepare(sql::FRAGMENT_POSTS)
-            .bind(&[
-                thread.as_str().into(),
-                start.as_str().into(),
-                end.as_str().into(),
-                num(limit as i64),
-            ])
-            .map_err(backend)?
-            .all()
-            .await
-            .map_err(backend)?;
-        self.last_stats.set(collect_stats(&[&res]));
-        let rows: Vec<PostRow> = res.results().map_err(backend)?;
-        rows.into_iter().map(post_from_row).collect()
     }
 
     async fn thread_version(&self, thread: &PublicId) -> StoreResult<Option<i64>> {

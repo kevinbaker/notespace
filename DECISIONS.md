@@ -389,6 +389,89 @@ stay uncompressed and the assembled page is what gets cached.
 
 ---
 
+## Fragmenting the thread cache — measured, then dropped
+
+The idea: split a thread's post tree into fragments (contiguous runs of top-level subtrees) so a
+reply dirties one fragment instead of the whole page. It was built, measured, and removed. The
+code is in git history at `de9f353` if the numbers below ever change.
+
+**Rendering is not the cost.** Measured in wasm under V8, 25 samples:
+
+| posts | p50 | µs/post |
+|---|---|---|
+| 15 | 0.021 ms | 1.4 |
+| 29 | 0.032 ms | 1.1 |
+| 58 | 0.045 ms | 0.8 |
+| 204 | 0.174 ms | 0.9 |
+
+A whole 204-post page renders in **0.174 ms** — 1.7% of the request budget. A rebuild is ~2.5 ms
+of D1 round trip plus that. Fragmenting shrinks only the part that was already free, and makes
+the cold path *worse*: seven fragments rendered separately cost 0.221 ms against 0.174 ms for one
+whole-page render, plus seven statements in the batch instead of two. A 30-row query is not
+proportionally cheaper than a 404-row one, because most of the 2.5 ms is round trip.
+
+**What it would buy is D1 rows, which stopped being scarce.** With version-keyed caching the
+daily cost is roughly `pageviews × 1 + writes × 404`. At the Workers cap of 100k requests/day
+with 1,000 writes, that is ~504k of 5M rows — 10%. Rows would only bind at ~12,000 writes/day,
+which is far more traffic than 100k requests/day can carry. The optimization targets a constraint
+that is not binding.
+
+**When to revisit:** thread *size*, not forum activity. At 5,000 posts in one thread a single
+rebake is 5,000 rows, and ~1,000 writes against it hits the daily cap. That is the trigger.
+
+Two things worth keeping from the attempt, both recorded in case it is rebuilt:
+
+- The range scan is sound because `.` (0x2E) sorts below the lowest alphabet byte `0` (0x30), so
+  a whole subtree falls between its root and the next root and can never straddle a boundary.
+- A JSON **array** version vector silently no-ops: `json_set('[1,2,3]', '$[7]', 99)` returns the
+  array unchanged, so any fragment past the current length would never bump its version and
+  would serve a stale entry forever. A sparse **object** keyed by index behaves correctly —
+  verified against D1's SQLite, along with increment-existing, NULL-for-missing, and a path
+  built by concatenation from a bind.
+
+---
+
+## `crates/core/src/reply.rs` and the reply form
+
+**The form cannot live in the baked thread page.** That page is shared byte-for-byte with every
+reader, so a per-visitor CSRF token in it would be handed to all of them — and would make the
+page uncacheable besides. The affordance in the baked page is therefore a plain *link* to
+`/t/{id}/reply`, which is uncached and carries the token.
+`the_reply_affordance_is_a_link_and_carries_no_token` pins it.
+
+**Ordering, for the same reason login has one.** Validate, then rate limit, then write. The body
+bound is checked before anything else so an oversized body never reaches the renderer or the
+counters; the limiter runs before the insert because the write is the expensive part.
+
+**A path collision is retried, not absorbed.** Two replies to the same parent in the same moment
+compute the same ordinal and `UNIQUE(thread_id, path)` rejects the loser. The adapter must not
+quietly pick another ordinal — a retry has to re-read the parent to get a correct one. The retry
+is bounded at `MAX_PATH_RETRIES`, because an unbounded loop under contention is a way to spend a
+10 ms budget. Each retry uses a *fresh* public id: reusing the one that just lost could not win
+the second time either.
+
+**Length is counted in characters, not bytes.** A byte limit rejects the same number of words
+differently depending on the language they are written in.
+
+`csrf`, `client_address` and `ids::generate_many` were moved out of the `password` feature gate:
+they are form protection and write-path plumbing, not password machinery, and an OIDC deployment
+needs all three.
+
+## Compression
+
+Available: `CompressionStream`/`DecompressionStream` in Workers (`gzip`, `deflate`,
+`deflate-raw`; `br` only behind the `brotli_content_encoding` flag). Responses to browsers are
+already compressed by Cloudflare for free — the 200-post page measures 154 KB of HTML for
+**8.7 KB** on the wire. D1 has no compression and no extensions. R2 has none at rest.
+
+So compression is worth adding **only for archived content**, where the object is read whole and
+passed straight to the client: store gzipped bytes with `content-encoding: gzip` and never
+decompress in the Worker, which costs zero CPU. It is the wrong move for anything the Worker has
+to read — fragments that get stitched server-side must be decompressed on every miss, so they
+stay uncompressed and the assembled page is what gets cached.
+
+---
+
 ## `crates/core/src/fragment.rs`
 
 Fixed-arithmetic boundaries, not size-packed ones. Fragment `k` covers top-level ordinals

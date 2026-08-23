@@ -98,9 +98,6 @@ fn parse_enum<T: Default + core::str::FromStr>(s: &str) -> T {
 }
 
 /// One row of the post read path.
-///
-/// Shared by the paged and fragment reads: two copies would be two chances to disagree about
-/// what a post is.
 fn post_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Post> {
     Ok(Post {
         id: r.get("id")?,
@@ -125,31 +122,6 @@ fn post_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Post> {
 
 #[async_trait(?Send)]
 impl Store for SqliteStore {
-    async fn thread_fragment(
-        &self,
-        thread: &PublicId,
-        fragment: notespace_core::fragment::Fragment,
-        limit: u32,
-    ) -> StoreResult<Vec<Post>> {
-        let (start, end) = fragment.bounds();
-        let end = end.unwrap_or_else(|| sql::PATH_END.to_string());
-        let mut stmt = self
-            .conn
-            .prepare_cached(sql::FRAGMENT_POSTS)
-            .map_err(backend)?;
-        let rows = stmt
-            .query_map(
-                rusqlite::params![thread.as_str(), start, end, limit],
-                post_from_row,
-            )
-            .map_err(backend)?;
-        let mut posts = Vec::new();
-        for row in rows {
-            posts.push(row.map_err(|e| corrupt("post row", e))?);
-        }
-        Ok(posts)
-    }
-
     async fn thread_version(&self, thread: &PublicId) -> StoreResult<Option<i64>> {
         self.conn
             .query_row(sql::THREAD_VERSION, [thread.as_str()], |r| r.get(0))

@@ -11,7 +11,6 @@
 //! - No connection pool on the wasm side: sqlx's pool needs a Tokio runtime that does not
 //!   exist there.
 
-use crate::fragment::Fragment;
 use crate::id::PublicId;
 use crate::model::{NewPost, Post, ThreadPage, Timestamp, User, UserId};
 use crate::path::Path;
@@ -101,22 +100,6 @@ pub trait Store {
     ///
     /// **Budget: 1 statement.**
     async fn locate_post(&self, post: &PublicId) -> StoreResult<PostLocation>;
-
-    /// One fragment of a thread: the posts under a contiguous run of top-level subtrees.
-    ///
-    /// Returns the same shape as [`Store::thread_page`] so the two render identically, but
-    /// bounded above as well as below. An out-of-range fragment is an empty `Vec`, not an
-    /// error: asking for the fragment after the last one is how a caller discovers there is
-    /// nothing more.
-    ///
-    /// **Budget: 1 statement.** The thread header is not re-read; a caller that needs it has
-    /// it already.
-    async fn thread_fragment(
-        &self,
-        thread: &PublicId,
-        fragment: Fragment,
-        limit: u32,
-    ) -> StoreResult<Vec<Post>>;
 
     /// The thread's bake version, for building a cache key.
     ///
