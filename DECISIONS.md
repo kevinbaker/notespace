@@ -431,81 +431,55 @@ Two things worth keeping from the attempt, both recorded in case it is rebuilt:
 
 ---
 
-## `crates/core/src/reply.rs` and the reply form
+## `crates/core/src/register.rs`
 
-**The form cannot live in the baked thread page.** That page is shared byte-for-byte with every
-reader, so a per-visitor CSRF token in it would be handed to all of them — and would make the
-page uncacheable besides. The affordance in the baked page is therefore a plain *link* to
-`/t/{id}/reply`, which is uncached and carries the token.
-`the_reply_affordance_is_a_link_and_carries_no_token` pins it.
+**Registration is an enumeration oracle and cannot not be.** `login.rs` works hard to make "no
+such account" and "wrong password" indistinguishable; this gives that away, because a signup
+form that will not say "that name is taken" is unusable. The cost is bounded rather than
+removed: the limit is per *client*, not per name, because an enumerator supplies a different
+name every time.
 
-**Ordering, for the same reason login has one.** Validate, then rate limit, then write. The body
-bound is checked before anything else so an oversized body never reaches the renderer or the
-counters; the limiter runs before the insert because the write is the expensive part.
+**The check and the insert are not atomic.** `user_by_name` then `create_user` is a TOCTOU
+window. The `UNIQUE` index on `user.name` is the real guard; the advisory check exists only to
+avoid spending an Argon2 hash on a doomed insert. Neither adapter mapped a duplicate name to
+`Conflict` before this — both fell through to `Backend`, so the race would have surfaced as a
+500 rather than "that name is taken". `a_duplicate_username_is_a_conflict` pins it.
 
-**A path collision is retried, not absorbed.** Two replies to the same parent in the same moment
-compute the same ordinal and `UNIQUE(thread_id, path)` rejects the loser. The adapter must not
-quietly pick another ordinal — a retry has to re-read the parent to get a correct one. The retry
-is bounded at `MAX_PATH_RETRIES`, because an unbounded loop under contention is a way to spend a
-10 ms budget. Each retry uses a *fresh* public id: reusing the one that just lost could not win
-the second time either.
+Signup logs you in. The rejected name is echoed back into the form; the password never is,
+because re-rendering it puts it in the page and from there into anything that caches it.
 
-**Length is counted in characters, not bytes.** A byte limit rejects the same number of words
-differently depending on the language they are written in.
+## Permalinks and the page cursor
 
-`csrf`, `client_address` and `ids::generate_many` were moved out of the `password` feature gate:
-they are form protection and write-path plumbing, not password machinery, and an OIDC deployment
-needs all three.
+`/p/{id}` used to redirect to `/t/{id}#p{post}`, which is page one. For any post past the page
+size the anchor is not in the document, so the reader lands at the top of the thread with no
+sign their post exists — indistinguishable from it having failed to save. Demonstrated with a
+reply at path `001R`, post 206 of 206.
 
-## Compression
+The handler's old comment said this needed real pagination and that deriving a cursor from the
+path was wrong. Half right: *truncating the path* is wrong, because an earlier sibling with a
+large subtree pushes the post off the page. The rank is exactly computable and cheap.
 
-Available: `CompressionStream`/`DecompressionStream` in Workers (`gzip`, `deflate`,
-`deflate-raw`; `br` only behind the `brotli_content_encoding` flag). Responses to browsers are
-already compressed by Cloudflare for free — the 200-post page measures 154 KB of HTML for
-**8.7 KB** on the wire. D1 has no compression and no extensions. R2 has none at rest.
+```sql
+SELECT COUNT(*) FROM post WHERE thread_id = ?1 AND path < ?2      -- rank
+SELECT path FROM post WHERE thread_id = ?1
+  ORDER BY path LIMIT 1 OFFSET (page * size - 1)                  -- the cursor
+```
 
-So compression is worth adding **only for archived content**, where the object is read whole and
-passed straight to the client: store gzipped bytes with `content-encoding: gzip` and never
-decompress in the Worker, which costs zero CPU. It is the wrong move for anything the Worker has
-to read — fragments that get stitched server-side must be decompressed on every miss, so they
-stay uncompressed and the assembled page is what gets cached.
+`EXPLAIN QUERY PLAN` reports `SEARCH ... USING COVERING INDEX idx_post_thread_path` for both, so
+no table row is touched. Measured: a deep post costs **3 statements, 408 rows**; a first-page
+post costs 2 and 7, because the cursor lookup is skipped. The redirect then lands on a page the
+cache already holds.
 
----
+Two couplings that would drift silently:
 
-## `crates/core/src/fragment.rs`
+- `page_size` given to `locate_post` must match what the read path paginates by. The arithmetic
+  is `store::page_cursor_offset`, in core with its own tests rather than copied into both
+  adapters — an off-by-one here is a wrong page, not a crash.
+- The rank count must see exactly the posts `thread_page` renders. Neither filters by state
+  today; if one starts, the other must too.
 
-Fixed-arithmetic boundaries, not size-packed ones. Fragment `k` covers top-level ordinals
-`[k·SPAN, (k+1)·SPAN)`, which needs no storage and no extra query because it is pure arithmetic
-over the path.
-
-Measured on a real 204-post thread, the packing question is worth revisiting later but not yet:
-
-| approach | fragments | mean | worst | rebake saving |
-|---|---|---|---|---|
-| per top-level subtree | 55 | 3.7 | 37 | 56× |
-| packed to ~10 posts | 17 | 12.0 | 37 | 17× |
-| packed to ~25 posts | 9 | 22.7 | 37 | 9× |
-
-That thread's subtree sizes were median 1, max 37, with 32 of 55 being singletons, so fixed
-spans give uneven fragments. Packing needs the boundaries stored somewhere — a schema change —
-which is why this version does not do it.
-
-**The range scan is sound because `.` sorts below the alphabet.** A descendant's path is
-`<root>.<...>`, and `.` is 0x2E while the lowest alphabet byte is `0` at 0x30, so a whole
-subtree falls between its root and the next root. That is what keeps a subtree from ever
-straddling a boundary, which is the property the entire scheme rests on: one reply dirties
-exactly one fragment.
-
-`PATH_END` is `~` (0x7E), above `Z` (0x5A), for the last fragment which has no next root to
-bound against. `the_end_sentinel_sorts_above_every_path` pins it against the real alphabet
-rather than against an assumption.
-
-**The shared conformance fixture cannot prove this.** Its top-level ordinals are 1–6, so every
-post lands in fragment 0 and the partition check passes without crossing a boundary. The
-multi-fragment tests in `crates/store-sqlite/tests/conformance.rs` build a wider thread on
-purpose.
-
----
+The conformance check runs at page sizes 1 and 3 as well as the real one, because a fixture
+smaller than a page never leaves page zero and would pass without exercising a cursor.
 
 ## `crates/render/src/page.rs`
 

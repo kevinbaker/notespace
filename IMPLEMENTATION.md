@@ -80,7 +80,9 @@ nothing routes to them.
 ## §4.7 Post public ids
 
 `Post.public_id` in `crates/core/src/model.rs`, `migrations/0004_post_public_id.sql`, and the
-`/p/{id}` route in `crates/worker/src/lib.rs`. Resolution is `Store::locate_post`.
+`/p/{id}` route in `crates/worker/src/lib.rs`. Resolution is `Store::locate_post`, which also
+returns the page cursor that makes the post's anchor reachable; the arithmetic is
+`store::page_cursor_offset`.
 
 ## §4.8 D1 working set, R2 corpus
 
