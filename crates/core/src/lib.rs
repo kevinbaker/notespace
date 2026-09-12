@@ -12,6 +12,7 @@ pub mod id;
 #[cfg(feature = "password")]
 pub mod login;
 pub mod model;
+pub mod moderation;
 pub(crate) mod naming;
 #[cfg(feature = "password")]
 pub mod password;
@@ -27,7 +28,7 @@ pub mod store;
 pub mod username;
 
 pub use id::{IdError, PublicId, ID_CHARS, MAX_TIMESTAMP_MS};
-pub use model::{Post, PostState, Space, Thread, ThreadKind, ThreadPage, ThreadState, User};
+pub use model::{Post, PostState, Role, Space, Thread, ThreadKind, ThreadPage, ThreadState, User};
 pub use naming::NameError;
 pub use path::{Path, PathError, MAX_DEPTH, MAX_ORDINAL, SEGMENT_WIDTH};
 pub use session::{Session, SessionPolicy, SessionToken, TokenHash};

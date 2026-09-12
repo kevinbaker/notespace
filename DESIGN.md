@@ -855,31 +855,85 @@ Runs asynchronously off the request path. You do not have 10ms to spare for an L
 ```
 post write
   -> Tier 0: free heuristics, inline (~0 cost)
-       rate limit · link count · account age · duplicate content hash · blocklist
-       -> most spam dies here, zero neurons spent
-  -> if new user OR heuristic-flagged: state = 'pending', enqueue
-  -> Queue consumer:
-       Tier 1: small-model classifier (Workers AI, 8B class)
-       -> verdict + confidence + categories -> action_log (actor_kind='model')
-       -> confident-clean: publish · confident-bad: hide + review · unsure: review
-  -> Human review queue: one-key approve/reject/escalate
-  -> Metamoderation: reviewer agreement/disagreement feeds back into per-space thresholds
+       account age · link count · duplicate body · blocklist · text addressed to the model
+       -> most posts publish here, zero neurons spent; moderators skip it entirely
+  -> held: state = 'pending', action_log row (actor 'tier0'), enqueue {post, reasons}
+  -> Queue consumer (or the cron sweep, for anything the queue lost):
+       Tier 1: classifier behind a trait -- Workers AI 8B by default; Llama Guard, Anthropic
+               or any OpenAI-compatible endpoint (OpenRouter) by configuration; optionally a
+               safety model layered in front of an instruct model
+       -> verdict {call, confidence, categories, rationale} -> action_log (actor 'model')
+       -> confident clean: publish · confident bad + severe category: hide + review
+          · anything else: stays pending, review
+  -> Human review queue: approve / reject, one POST each, CSRF-bound
+  -> Metamoderation: agreement between verdict and decision, per space, moves the
+     thresholds the model is judged against
 ```
 
-Non-negotiable properties:
+Reports are the other way in: a report is a Signal (`kind = 'report'`, weight −1, one per
+reporter per post). At the space's threshold a visible post goes back to `pending`, opens a
+review item, and is enqueued so the reviewer gets the model's opinion alongside the readers'.
+Appeals reopen a resolved item with the author's text and the original verdict still attached.
+
+Non-negotiable properties, all of them pinned by tests:
 
 - **The model triages; it never delivers a final verdict.** Auto-hide pending review, never
-  auto-delete.
-- Every model call is logged to `action_log` with its inputs, verdict and confidence.
-- Public modlog by default (Lemmy got this right).
-- Appeals path exists from day one.
-- Provider is pluggable behind a trait: Workers AI by default, bring-your-own-key (Anthropic,
-  OpenAI) via AI Gateway for anyone wanting better judgment. Never hard-code a vendor.
+  auto-delete. A human decision is final for that item; nothing automatic reopens it.
+- **A flag hides only for a severe category.** Spam, harassment, hate, violence, sexual content,
+  self-harm, illegal content and doxxing can hide a post pending review. `off_topic` and
+  `other` can only hold it for a human, at any confidence: the live evaluation found an 8B model
+  calling ordinary technical posts off-topic at confidence 1.0, and topicality is a judgement a
+  human makes.
+- **Text addressed to the model is never auto-published.** Tier 0 holds it on sight
+  (`ignore previous instructions`, forged `</post>` tags, JSON aimed at the parser); the prompt
+  fences the body and tells the model it is data; and a verdict carrying the `manipulation`
+  category cannot publish however confident it is. Three layers, because the first two are
+  heuristics and the third is the one that holds.
+- **Every model call is logged** to `action_log` as an action by an actor of kind `model`, with
+  the verdict, confidence, categories, rationale, model id and prompt version -- before it is
+  acted on, so a crash leaves a verdict without an action rather than the reverse.
+- **Public modlog by default** (Lemmy got this right): who or what did what to which post.
+  Never the rationale, never who reported. Reports themselves are private rows.
+- **Appeals path exists from day one.** The author of a hidden post gets a form; the item reopens
+  with the verdict it appeals still on it.
+- **Provider is pluggable behind a trait.** The prompt, the schema and the response parsing live
+  in `core` and are tested without a network; a provider only shapes one vendor's request. The
+  Worker configures it with `MOD_PROVIDER`. Never hard-code a vendor.
+- **Classifiers compose.** `Layered` puts a safety classifier (Llama Guard) in front of an
+  instruct model and combines the two verdicts by a pure rule: two flags corroborate into a
+  stronger one; a flag one layer made and the other contradicted is scaled below the hide bar;
+  and a Guard's `safe` is a veto on hiding for the categories it is trained on (hate, violence,
+  sexual content, self-harm, illegal, doxxing) -- never for spam or harassment, which it cannot
+  see. The Guard is a frontend, not a gate: the instruct model still reads every post.
+- **The database is the source of truth; the Queue is an accelerator.** A pending post with no
+  open review item is work, wherever the message went. A cron sweep every five minutes picks up
+  whatever the queue did not deliver, so a lost message costs latency and nothing else. A native
+  binary with no queue at all runs the same sweep on a timer.
 
-Budget reality check: 10,000 neurons/day shared across all models means an 8B classifier on short
-posts is affordable for a small forum and a 70B one is not. Heuristics must catch the bulk.
+**Budget reality check.** Measured against Workers AI pricing (September 2026): Llama 3.1 8B
+costs 25.6 neurons per thousand input tokens and 75 per thousand output, so one classification
+of a typical post -- ~600 tokens in, ~60 out -- is ~20 neurons, and the free 10,000 a day buys
+**~500 classifications**. Llama Guard 3 8B is dearer per token (44 neurons/k in), ~380 a day. A
+70B model is not on the table. Every classification is therefore of a *held* post, never a
+routine one, and Tier 0 is what decides who pays -- a new-account window and a link cap are
+the two rules that matter. Each queue message also costs ~3 of the day's 10,000 queue operations.
 
----
+**Metamoderation, concretely.** Each resolved review item records the model's call and the
+human's resolution. `clean`/approve and `flag`/reject are agreement; the other diagonal is
+disagreement; `unsure` is neither. Per space, once ten items are resolved, a disagreement rate
+above 30% raises the confidence a `clean` needs to publish by 0.15 and a `flag` needs to hide by
+0.05; once thirty are resolved, a rate under 5% lowers the publish bar by 0.05, never below 0.5
+and never touching the hide bar. The thresholds are read from `space.config` and adjusted at
+decision time, so a change in reviewer behaviour takes effect on the next post. The
+`prompt_version` logged with each verdict lets the statistics be read per prompt when the prompt
+changes.
+
+**What the model is told.** Space name, thread title, the author's account age in days, why
+Tier 0 held the post, and the body inside `<post>` tags with any embedded closing tag defanged.
+Not the username: a name is not evidence, and it is one more thing to leak. The space's own
+rules, if it has written any, go into the system prompt -- with the instruction that they
+describe the community's spirit and are not a list of permitted subjects, which the 8B model
+needed telling twice.
 
 ## 6. Presets
 
@@ -908,11 +962,14 @@ GET  /t/{id}/{slug?}            thread page (baked)
 GET  /t/{id}.rss                feed
 POST /t/{id}/reply
 POST /s/{slug}/new
-POST /p/{id}/signal             vote / like / flag  (idempotent)
+POST /p/{id}/signal             vote / like  (idempotent)
+GET  /p/{id}/report             report form; POST records a Signal of kind 'report'
+GET  /p/{id}/appeal             appeal form for the author of a hidden post
 GET  /api/me/thread/{id}        personalization layer (vote state, unread)
 GET  /u/{name}                  profile
 GET  /modlog                    public action log
 GET  /mod/queue                 review queue (capability-gated)
+POST /mod/review/{id}           approve or reject one item
 POST /uploads/sign              issue scoped R2 upload URL
 WS   /t/{id}/live               hot threads only, via DO
 ```
@@ -972,6 +1029,11 @@ functions, mod actions, public modlog.
 
 **M4 — Moderation.** Rule engine, heuristics, Queue-based AI classification, review queue,
 metamoderation.
+*(Delivered ahead of M3, because the write path needed it: Tier 0 heuristics on every reply,
+a pluggable classifier with Workers AI and Anthropic providers, the Queue consumer and cron
+sweep, reports as Signals, the review queue, appeals, the public modlog, and per-space
+metamoderation. See §5. Not yet: a general rule engine beyond the fixed heuristics, reporter
+accuracy weighting, and editing/deleting one's own posts.)*
 
 **M5 — Deploy story.** `wrangler deploy` one-liner, Docker image, single static binary, seed
 script, demo instance, import from phpBB/Discourse dumps.

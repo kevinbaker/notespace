@@ -4,7 +4,13 @@
 //! per invocation — each method states its budget), and no connection pool on wasm.
 
 use crate::id::PublicId;
-use crate::model::{NewPost, Post, ThreadPage, ThreadSummary, Timestamp, User, UserId};
+use crate::model::{
+    NewPost, Post, PostState, SpaceId, ThreadPage, ThreadSummary, Timestamp, User, UserId,
+};
+use crate::moderation::{
+    AgreementStats, LogEntry, NewAction, NewReview, NewSignal, ReportTally, Resolution,
+    ReviewItem, ReviewPost, WriteContext,
+};
 use crate::path::Path;
 use crate::ratelimit::{AttemptKeys, Attempts};
 use crate::session::{Session, TokenHash};
@@ -153,6 +159,71 @@ pub trait Store {
 
     /// **Budget: 1 statement.** Returns how many sessions ended.
     async fn delete_user_sessions(&self, user: UserId) -> StoreResult<u32>;
+
+    // -- Moderation ---------------------------------------------------------
+
+    /// What the write path needs before deciding whether to hold a post: the space's config,
+    /// the thread's state, and the author's age. `NotFound` if either the thread or the user
+    /// is absent. **Budget: 1 statement.**
+    async fn write_context(&self, thread: &PublicId, author: UserId) -> StoreResult<WriteContext>;
+
+    /// Whether `author` posted exactly `body_md` at or after `since`. Bounded by the author's
+    /// own recent posts through `idx_post_author`. **Budget: 1 statement.**
+    async fn author_posted_recently(
+        &self,
+        author: UserId,
+        body_md: &str,
+        since: Timestamp,
+    ) -> StoreResult<bool>;
+
+    /// A post with its markdown, its space's config and its author, for the classifier and the
+    /// reviewer. **Budget: 1 statement.**
+    async fn post_for_review(&self, post: &PublicId) -> StoreResult<ReviewPost>;
+
+    /// Change a post's state and bump its thread's `cache_version`, so the baked page turns
+    /// over. **Budget: 2 statements, one batch.**
+    async fn set_post_state(
+        &self,
+        post: &PublicId,
+        state: PostState,
+        now: Timestamp,
+    ) -> StoreResult<()>;
+
+    /// Append to the action log; returns the row id. **Budget: 1 statement.**
+    async fn log_action(&self, action: &NewAction) -> StoreResult<i64>;
+
+    /// Open a review item, or reopen and update the one already standing for the post.
+    /// **Budget: 1 statement.**
+    async fn open_review(&self, review: &NewReview) -> StoreResult<()>;
+
+    /// Resolve an open item and return it as it was, or `None` if it does not exist or is
+    /// already resolved -- so two moderators clicking at once produce one action.
+    /// **Budget: 2 statements.**
+    async fn resolve_review(
+        &self,
+        id: i64,
+        resolution: Resolution,
+        by: UserId,
+        now: Timestamp,
+    ) -> StoreResult<Option<ReviewItem>>;
+
+    /// Oldest first: the queue is worked in the order things arrived. **Budget: 1 statement.**
+    async fn open_reviews(&self, limit: u32) -> StoreResult<Vec<ReviewItem>>;
+
+    /// Record a report. `added` is false when this user already reported this post; `count` is
+    /// the number of distinct reporters now standing. **Budget: 2 statements.**
+    async fn add_report(&self, signal: &NewSignal) -> StoreResult<ReportTally>;
+
+    /// Posts still `pending` that were created before `older_than`, oldest first. The sweep's
+    /// worklist. **Budget: 1 statement.**
+    async fn pending_posts(&self, older_than: Timestamp, limit: u32) -> StoreResult<Vec<PublicId>>;
+
+    /// The public action log, newest first. **Budget: 1 statement.**
+    async fn public_log(&self, limit: u32) -> StoreResult<Vec<LogEntry>>;
+
+    /// How often reviewers in `space` have agreed with the model. Counts only resolved items
+    /// where the model made a call. **Budget: 1 statement.**
+    async fn agreement(&self, space: SpaceId) -> StoreResult<AgreementStats>;
 }
 
 /// `password_hash` is `None` for an account with no local credential. Reached after hashing, so

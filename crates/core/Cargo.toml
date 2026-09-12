@@ -9,6 +9,8 @@ repository.workspace = true
 
 [dependencies]
 serde = { workspace = true }
+# Space config and model verdicts cross as JSON; both are parsed here so the parsing is tested here.
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = "0.1"
 # Pure Rust, no_std-capable, compiles to wasm32-unknown-unknown without a backend feature.
@@ -20,7 +22,8 @@ password-hash = { version = "0.5", default-features = false, features = ["alloc"
 
 [dev-dependencies]
 proptest = "1"
-serde_json = "1"
+# Native only, for the opt-in live classifier eval in tests/live_classifier.rs.
+ureq = { version = "2", features = ["json"] }
 
 [features]
 default = ["password"]

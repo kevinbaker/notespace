@@ -10,7 +10,11 @@ use crate::id::PublicId;
 
 /// Page size the suite paginates by. Only has to be self-consistent.
 const PAGE_SIZE: u32 = 200;
-use crate::model::{NewPost, SanitizedHtml};
+use crate::model::{NewPost, PostState, SanitizedHtml};
+use crate::moderation::classify::{Call, Verdict};
+use crate::moderation::{
+    ActorKind, NewAction, NewReview, NewSignal, Resolution, ReviewReason, SIGNAL_REPORT,
+};
 use crate::path::Path;
 use crate::ratelimit::{AttemptKeys, Attempts, Limit};
 use crate::session::{Session, SessionPolicy, SessionToken, TOKEN_BYTES};
@@ -107,7 +111,366 @@ async fn write_checks<S: Store>(store: &S, fx: &Fixture) -> Vec<Check> {
         rate_limit_counters_round_trip(store, fx).await,
         a_successful_login_clears_its_bucket(store, fx).await,
         the_sweep_removes_only_old_windows(store, fx).await,
+        // Moderation. These act on writable[0], written above, and leave it visible.
+        write_context_describes_the_space_thread_and_author(store, fx).await,
+        duplicate_detection_is_bounded_by_the_window(store, fx).await,
+        a_state_change_bumps_the_thread_version(store, fx).await,
+        the_public_log_omits_private_rows_and_resolves_targets(store, fx).await,
+        a_review_opens_once_keeps_its_verdict_and_resolves_once(store, fx).await,
+        reports_count_distinct_reporters(store, fx).await,
+        the_sweep_lists_pending_posts_nobody_is_looking_at(store, fx).await,
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Moderation
+// ---------------------------------------------------------------------------
+
+
+
+async fn write_context_describes_the_space_thread_and_author<S: Store>(
+    store: &S,
+    fx: &Fixture,
+) -> Check {
+    const NAME: &str = "write_context returns the space, thread state and author, or NotFound";
+    let page = match store.thread_page(&fx.thread, &Page::first(1)).await {
+        Ok(p) => p,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    let ctx = match store.write_context(&fx.thread, fx.author_id).await {
+        Ok(c) => c,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    require!(NAME, ctx.space_id == page.space.id, "wrong space");
+    require!(NAME, ctx.thread_state == page.thread.state, "wrong thread state");
+    require!(
+        NAME,
+        ctx.author_created_at > 0,
+        "author created_at not read: {}",
+        ctx.author_created_at
+    );
+    require!(
+        NAME,
+        !ctx.space_config.is_empty(),
+        "space config came back empty rather than as JSON"
+    );
+    match store.write_context(&fx.absent, fx.author_id).await {
+        Err(StoreError::NotFound) => {}
+        other => return Check::fail(NAME, format!("absent thread: {other:?}")),
+    }
+    match store.write_context(&fx.thread, i64::MAX - 7).await {
+        Err(StoreError::NotFound) => {}
+        other => return Check::fail(NAME, format!("absent author: {other:?}")),
+    }
+    Check::pass(NAME)
+}
+
+async fn duplicate_detection_is_bounded_by_the_window<S: Store>(store: &S, fx: &Fixture) -> Check {
+    const NAME: &str = "author_posted_recently matches the exact body inside the window only";
+    // writable[0] was written by `appended_post_is_readable` with body "top level" at NOW.
+    let hit = store
+        .author_posted_recently(fx.author_id, "top level", NOW)
+        .await;
+    require!(NAME, hit == Ok(true), "did not find the post just written: {hit:?}");
+    let late = store
+        .author_posted_recently(fx.author_id, "top level", NOW + 1)
+        .await;
+    require!(NAME, late == Ok(false), "found a post from before the window: {late:?}");
+    let other = store
+        .author_posted_recently(fx.author_id, "top level ", NOW)
+        .await;
+    require!(NAME, other == Ok(false), "matched a body that differs by a space");
+    Check::pass(NAME)
+}
+
+async fn a_state_change_bumps_the_thread_version<S: Store>(store: &S, fx: &Fixture) -> Check {
+    const NAME: &str = "set_post_state changes the post and bumps the thread's cache_version";
+    let post = &fx.writable[0];
+    let before = match store.thread_version(&fx.thread).await {
+        Ok(Some(v)) => v,
+        other => return Check::fail(NAME, format!("version: {other:?}")),
+    };
+    if let Err(e) = store.set_post_state(post, PostState::Pending, NOW).await {
+        return Check::fail(NAME, format!("set pending: {e}"));
+    }
+    let rp = match store.post_for_review(post).await {
+        Ok(rp) => rp,
+        Err(e) => return Check::fail(NAME, format!("post_for_review: {e}")),
+    };
+    require!(NAME, rp.state == PostState::Pending, "state did not change");
+    require!(NAME, rp.body_md == "top level", "post_for_review must carry body_md");
+    require!(NAME, rp.thread_public_id == fx.thread, "wrong thread");
+    let after = match store.thread_version(&fx.thread).await {
+        Ok(Some(v)) => v,
+        other => return Check::fail(NAME, format!("version: {other:?}")),
+    };
+    require!(NAME, after > before, "cache_version went {before} -> {after}");
+    if let Err(e) = store.set_post_state(post, PostState::Visible, NOW).await {
+        return Check::fail(NAME, format!("set visible: {e}"));
+    }
+    match store.set_post_state(&fx.absent, PostState::Hidden, NOW).await {
+        Err(StoreError::NotFound) => {}
+        other => return Check::fail(NAME, format!("absent post: {other:?}")),
+    }
+    match store.post_for_review(&fx.absent).await {
+        Err(StoreError::NotFound) => Check::pass(NAME),
+        other => Check::fail(NAME, format!("absent post_for_review: {other:?}")),
+    }
+}
+
+fn action(post_id: i64, action: &'static str, public: bool) -> NewAction {
+    NewAction {
+        actor_kind: ActorKind::Rule,
+        actor_id: None,
+        actor_name: "conformance".into(),
+        target_kind: "post",
+        target_id: post_id,
+        action,
+        detail: serde_json::json!({ "suite": true }),
+        public,
+        created_at: NOW,
+    }
+}
+
+async fn the_public_log_omits_private_rows_and_resolves_targets<S: Store>(
+    store: &S,
+    fx: &Fixture,
+) -> Check {
+    const NAME: &str = "the public log shows public rows only, newest first, with public ids";
+    let post_id = match store.post_for_review(&fx.writable[0]).await {
+        Ok(rp) => rp.id,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    let public_id = match store.log_action(&action(post_id, "conf_public", true)).await {
+        Ok(id) => id,
+        Err(e) => return Check::fail(NAME, format!("log: {e}")),
+    };
+    let private_id = match store.log_action(&action(post_id, "conf_private", false)).await {
+        Ok(id) => id,
+        Err(e) => return Check::fail(NAME, format!("log: {e}")),
+    };
+    require!(NAME, private_id > public_id, "row ids did not advance");
+    let log = match store.public_log(50).await {
+        Ok(l) => l,
+        Err(e) => return Check::fail(NAME, format!("read: {e}")),
+    };
+    require!(
+        NAME,
+        log.iter().all(|e| e.action != "conf_private"),
+        "a private row appeared in the public log"
+    );
+    let Some(entry) = log.iter().find(|e| e.id == public_id) else {
+        return Check::fail(NAME, "the public row is missing");
+    };
+    require!(
+        NAME,
+        entry.target_public_id.as_ref() == Some(&fx.writable[0]),
+        "target public id not resolved: {:?}",
+        entry.target_public_id
+    );
+    require!(NAME, entry.actor_kind == ActorKind::Rule, "actor kind lost");
+    require!(
+        NAME,
+        log.windows(2).all(|w| (w[0].created_at, w[0].id) >= (w[1].created_at, w[1].id)),
+        "not newest first"
+    );
+    Check::pass(NAME)
+}
+
+async fn a_review_opens_once_keeps_its_verdict_and_resolves_once<S: Store>(
+    store: &S,
+    fx: &Fixture,
+) -> Check {
+    const NAME: &str = "a review item is one row per post, keeps its verdict, and resolves once";
+    let rp = match store.post_for_review(&fx.writable[0]).await {
+        Ok(rp) => rp,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    let verdict = Verdict {
+        call: Call::Clean,
+        confidence: 0.6,
+        categories: vec![crate::moderation::Category::OffTopic],
+        rationale: "suite".into(),
+        model: "suite-model".into(),
+    };
+    let open = |reason, verdict, appeal: Option<&str>| NewReview {
+        post_id: rp.id,
+        space_id: rp.space_id,
+        reason,
+        verdict,
+        appeal_text: appeal.map(str::to_string),
+        opened_at: NOW,
+    };
+    if let Err(e) = store
+        .open_review(&open(ReviewReason::Classifier, Some(verdict), None))
+        .await
+    {
+        return Check::fail(NAME, format!("open: {e}"));
+    }
+    // Reopened as an appeal: no verdict supplied, so the old one must survive.
+    if let Err(e) = store
+        .open_review(&open(ReviewReason::Appeal, None, Some("please")))
+        .await
+    {
+        return Check::fail(NAME, format!("reopen: {e}"));
+    }
+    let items = match store.open_reviews(100).await {
+        Ok(i) => i,
+        Err(e) => return Check::fail(NAME, format!("list: {e}")),
+    };
+    let mine: Vec<_> = items.iter().filter(|i| i.post_id == rp.id).collect();
+    require!(NAME, mine.len() == 1, "{} items for one post", mine.len());
+    let item = mine[0];
+    require!(NAME, item.reason == ReviewReason::Appeal, "reason not updated");
+    require!(NAME, item.model_verdict == Some(Call::Clean), "verdict was lost on reopen");
+    require!(NAME, item.model_confidence == Some(0.6), "confidence was lost on reopen");
+    require!(
+        NAME,
+        item.model_categories == vec![crate::moderation::Category::OffTopic],
+        "categories did not round trip: {:?}",
+        item.model_categories
+    );
+    require!(NAME, item.appeal_text.as_deref() == Some("please"), "appeal text missing");
+    require!(NAME, item.post_public_id == fx.writable[0], "wrong post");
+    require!(NAME, !item.body_html.is_empty(), "the reviewer needs the body");
+    require!(NAME, !item.resolved, "listed as open but marked resolved");
+
+    let before = match store.agreement(rp.space_id).await {
+        Ok(a) => a,
+        Err(e) => return Check::fail(NAME, format!("agreement: {e}")),
+    };
+    let resolved = store
+        .resolve_review(item.id, Resolution::Approve, fx.author_id, NOW)
+        .await;
+    let Ok(Some(was)) = resolved else {
+        return Check::fail(NAME, format!("resolve: {resolved:?}"));
+    };
+    require!(NAME, was.id == item.id, "resolved a different item");
+    match store
+        .resolve_review(item.id, Resolution::Reject, fx.author_id, NOW)
+        .await
+    {
+        Ok(None) => {}
+        other => return Check::fail(NAME, format!("second resolve: {other:?}")),
+    }
+    match store.open_reviews(100).await {
+        Ok(items) => require!(
+            NAME,
+            items.iter().all(|i| i.post_id != rp.id),
+            "still listed after resolving"
+        ),
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    }
+    // clean + approve is agreement.
+    let after = match store.agreement(rp.space_id).await {
+        Ok(a) => a,
+        Err(e) => return Check::fail(NAME, format!("agreement: {e}")),
+    };
+    require!(
+        NAME,
+        after.agreed == before.agreed + 1 && after.disagreed == before.disagreed,
+        "agreement {before:?} -> {after:?}"
+    );
+    Check::pass(NAME)
+}
+
+async fn reports_count_distinct_reporters<S: Store>(store: &S, fx: &Fixture) -> Check {
+    const NAME: &str = "a report counts once per reporter, and the tally is distinct reporters";
+    let post_id = match store.post_for_review(&fx.writable[0]).await {
+        Ok(rp) => rp.id,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    // A second account, created here or found from an earlier run.
+    let reporter = match store.create_user("conformance-reporter", NOW, None).await {
+        Ok(id) => id,
+        Err(StoreError::Conflict) => match store.user_by_name("conformance-reporter").await {
+            Ok(Some(c)) => c.user.id,
+            other => return Check::fail(NAME, format!("lookup: {other:?}")),
+        },
+        Err(e) => return Check::fail(NAME, format!("create: {e}")),
+    };
+    let sig = |user: i64| NewSignal {
+        post_id,
+        user_id: user,
+        kind: SIGNAL_REPORT,
+        weight: -1.0,
+        reason: Some("suite".into()),
+        created_at: NOW,
+    };
+    let first = match store.add_report(&sig(fx.author_id)).await {
+        Ok(t) => t,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    require!(NAME, first.added && first.count == 1, "first report: {first:?}");
+    let repeat = match store.add_report(&sig(fx.author_id)).await {
+        Ok(t) => t,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    require!(NAME, !repeat.added && repeat.count == 1, "repeat report: {repeat:?}");
+    let second = match store.add_report(&sig(reporter)).await {
+        Ok(t) => t,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    require!(NAME, second.added && second.count == 2, "second reporter: {second:?}");
+    Check::pass(NAME)
+}
+
+async fn the_sweep_lists_pending_posts_nobody_is_looking_at<S: Store>(
+    store: &S,
+    fx: &Fixture,
+) -> Check {
+    const NAME: &str = "pending_posts lists pending posts without an open review, oldest first";
+    let post = &fx.writable[0];
+    let rp = match store.post_for_review(post).await {
+        Ok(rp) => rp,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    if let Err(e) = store.set_post_state(post, PostState::Pending, NOW).await {
+        return Check::fail(NAME, format!("{e}"));
+    }
+    let listed = store.pending_posts(NOW + 1, 1000).await;
+    require!(
+        NAME,
+        matches!(&listed, Ok(ids) if ids.contains(post)),
+        "pending post not listed: {listed:?}"
+    );
+    let too_early = store.pending_posts(NOW, 1000).await;
+    require!(
+        NAME,
+        matches!(&too_early, Ok(ids) if !ids.contains(post)),
+        "listed a post newer than the cutoff"
+    );
+    // Now someone is looking at it.
+    if let Err(e) = store
+        .open_review(&NewReview {
+            post_id: rp.id,
+            space_id: rp.space_id,
+            reason: ReviewReason::Error,
+            verdict: None,
+            appeal_text: None,
+            opened_at: NOW,
+        })
+        .await
+    {
+        return Check::fail(NAME, format!("{e}"));
+    }
+    let queued = store.pending_posts(NOW + 1, 1000).await;
+    require!(
+        NAME,
+        matches!(&queued, Ok(ids) if !ids.contains(post)),
+        "a post with an open review was listed for the sweep"
+    );
+    // Tidy: resolve and restore.
+    let items = store.open_reviews(1000).await.unwrap_or_default();
+    if let Some(item) = items.iter().find(|i| i.post_id == rp.id) {
+        let _ = store
+            .resolve_review(item.id, Resolution::Approve, fx.author_id, NOW)
+            .await;
+    }
+    if let Err(e) = store.set_post_state(post, PostState::Visible, NOW).await {
+        return Check::fail(NAME, format!("{e}"));
+    }
+    Check::pass(NAME)
 }
 
 fn keys(fx: &Fixture, tag: &str) -> AttemptKeys {
@@ -408,6 +771,7 @@ fn draft(fx: &Fixture, id: &PublicId, parent: Option<&PublicId>, body: &str) -> 
         body_md: body.to_string(),
         body_html: SanitizedHtml::assert_sanitized(format!("<p>{body}</p>")),
         created_at: 1_800_000_000_000,
+        state: crate::model::PostState::Visible,
     }
 }
 

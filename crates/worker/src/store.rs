@@ -4,6 +4,10 @@
 use core::cell::Cell;
 use notespace_core::id::PublicId;
 use notespace_core::model::*;
+use notespace_core::moderation::{
+    classify::Call, ActorKind, AgreementStats, Category, LogEntry, NewAction, NewReview,
+    NewSignal, ReportTally, Resolution, ReviewItem, ReviewPost, ReviewReason, WriteContext,
+};
 use notespace_core::path::Path;
 use notespace_core::ratelimit::{AttemptKeys, Attempts};
 use notespace_core::session::{Session, TokenHash};
@@ -83,7 +87,124 @@ struct CredentialRow {
     id: i64,
     name: String,
     state: String,
+    role: String,
     password_hash: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WriteContextRow {
+    space_id: i64,
+    space_config: String,
+    thread_state: String,
+    author_created_at: i64,
+    author_role: String,
+}
+
+#[derive(Deserialize)]
+struct ReviewPostRow {
+    id: i64,
+    public_id: String,
+    thread_public_id: String,
+    thread_title: String,
+    space_id: i64,
+    space_name: String,
+    space_config: String,
+    author_id: i64,
+    author_name: String,
+    author_created_at: i64,
+    body_md: String,
+    created_at: i64,
+    state: String,
+}
+
+#[derive(Deserialize)]
+struct ReviewRow {
+    id: i64,
+    post_id: i64,
+    post_public_id: String,
+    thread_public_id: String,
+    thread_title: String,
+    space_id: i64,
+    space_name: String,
+    author_id: i64,
+    author_name: String,
+    body_html: String,
+    post_state: String,
+    reason: String,
+    model_verdict: Option<String>,
+    model_confidence: Option<f64>,
+    model_categories: Option<String>,
+    appeal_text: Option<String>,
+    opened_at: i64,
+    state: String,
+}
+
+#[derive(Deserialize)]
+struct CountRow {
+    n: i64,
+}
+
+#[derive(Deserialize)]
+struct PublicIdRow {
+    public_id: String,
+}
+
+#[derive(Deserialize)]
+struct LogRow {
+    id: i64,
+    actor_kind: String,
+    actor_name: String,
+    target_kind: String,
+    target_public_id: Option<String>,
+    action: String,
+    created_at: i64,
+}
+
+#[derive(Deserialize)]
+struct AgreementRow {
+    agreed: Option<f64>,
+    disagreed: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct FoundRow {
+    #[allow(dead_code)]
+    found: i64,
+}
+
+fn parse_id(raw: &str, what: &str) -> StoreResult<PublicId> {
+    PublicId::parse(raw).map_err(|e| StoreError::Corrupt(format!("{what} {raw:?}: {e}")))
+}
+
+fn review_from_row(r: ReviewRow) -> StoreResult<ReviewItem> {
+    let categories = r
+        .model_categories
+        .as_deref()
+        .and_then(|c| serde_json::from_str::<Vec<String>>(c).ok())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|c| Category::parse(c))
+        .collect();
+    Ok(ReviewItem {
+        id: r.id,
+        post_id: r.post_id,
+        post_public_id: parse_id(&r.post_public_id, "post public_id")?,
+        thread_public_id: parse_id(&r.thread_public_id, "thread public_id")?,
+        thread_title: r.thread_title,
+        space_id: r.space_id,
+        space_name: r.space_name,
+        author_id: r.author_id,
+        author_name: r.author_name,
+        body_html: r.body_html,
+        post_state: post_state(&r.post_state),
+        reason: ReviewReason::parse(&r.reason),
+        model_verdict: r.model_verdict.as_deref().and_then(Call::parse),
+        model_confidence: r.model_confidence,
+        model_categories: categories,
+        appeal_text: r.appeal_text,
+        opened_at: r.opened_at,
+        resolved: r.state == "resolved",
+    })
 }
 
 #[derive(Deserialize)]
@@ -101,6 +222,7 @@ struct SessionRow {
     expires_at: i64,
     user_name: String,
     user_state: String,
+    user_role: String,
 }
 
 #[derive(Deserialize)]
@@ -410,6 +532,7 @@ impl D1Store {
                 new.body_md.as_str().into(),
                 new.body_html.as_str().into(),
                 num(new.created_at),
+                new.state.as_str().into(),
             ])
             .map_err(backend)?;
         let bump = self
@@ -452,8 +575,26 @@ impl D1Store {
             created_at: new.created_at,
             edited_at: None,
             score: 0.0,
-            state: PostState::Visible,
+            state: new.state,
         })
+    }
+
+    /// One statement returning rows, with stats recorded.
+    async fn query<T: serde::de::DeserializeOwned>(
+        &self,
+        stmt: &str,
+        binds: Vec<worker::wasm_bindgen::JsValue>,
+    ) -> StoreResult<Vec<T>> {
+        let res = self
+            .db
+            .prepare(stmt)
+            .bind(&binds)
+            .map_err(backend)?
+            .all()
+            .await
+            .map_err(backend)?;
+        self.last_stats.set(collect_stats(&[&res]));
+        res.results().map_err(backend)
     }
 
     /// Run a statement that returns no rows, reporting how many it changed.
@@ -656,6 +797,7 @@ impl Store for D1Store {
                 id: r.id,
                 name: r.name,
                 state: r.state.parse().unwrap_or_default(),
+                role: r.role.parse().unwrap_or_default(),
             },
             password_hash: r.password_hash,
         }))
@@ -801,6 +943,7 @@ impl Store for D1Store {
                 id: r.user_id,
                 name: r.user_name,
                 state: r.user_state.parse().unwrap_or_default(),
+                role: r.user_role.parse().unwrap_or_default(),
             },
         }))
     }
@@ -828,5 +971,253 @@ impl Store for D1Store {
     async fn delete_user_sessions(&self, user: UserId) -> StoreResult<u32> {
         let meta = self.run(sql::DELETE_USER_SESSIONS, vec![num(user)]).await?;
         Ok(meta.unwrap_or(0))
+    }
+
+    // -- Moderation ---------------------------------------------------------
+
+    async fn write_context(&self, thread: &PublicId, author: UserId) -> StoreResult<WriteContext> {
+        let rows: Vec<WriteContextRow> = self
+            .query(sql::WRITE_CONTEXT, vec![thread.as_str().into(), num(author)])
+            .await?;
+        let r = rows.into_iter().next().ok_or(StoreError::NotFound)?;
+        Ok(WriteContext {
+            space_id: r.space_id,
+            space_config: r.space_config,
+            thread_state: thread_state(&r.thread_state),
+            author_created_at: r.author_created_at,
+            author_role: r.author_role.parse().unwrap_or_default(),
+        })
+    }
+
+    async fn author_posted_recently(
+        &self,
+        author: UserId,
+        body_md: &str,
+        since: Timestamp,
+    ) -> StoreResult<bool> {
+        let rows: Vec<FoundRow> = self
+            .query(
+                sql::AUTHOR_POSTED_RECENTLY,
+                vec![num(author), body_md.into(), num(since)],
+            )
+            .await?;
+        Ok(!rows.is_empty())
+    }
+
+    async fn post_for_review(&self, post: &PublicId) -> StoreResult<ReviewPost> {
+        let rows: Vec<ReviewPostRow> = self
+            .query(sql::POST_FOR_REVIEW, vec![post.as_str().into()])
+            .await?;
+        let r = rows.into_iter().next().ok_or(StoreError::NotFound)?;
+        Ok(ReviewPost {
+            id: r.id,
+            public_id: parse_id(&r.public_id, "post public_id")?,
+            thread_public_id: parse_id(&r.thread_public_id, "thread public_id")?,
+            thread_title: r.thread_title,
+            space_id: r.space_id,
+            space_name: r.space_name,
+            space_config: r.space_config,
+            author_id: r.author_id,
+            author_name: r.author_name,
+            author_created_at: r.author_created_at,
+            body_md: r.body_md,
+            created_at: r.created_at,
+            state: post_state(&r.state),
+        })
+    }
+
+    async fn set_post_state(
+        &self,
+        post: &PublicId,
+        state: PostState,
+        _now: Timestamp,
+    ) -> StoreResult<()> {
+        let set = self
+            .db
+            .prepare(sql::SET_POST_STATE)
+            .bind(&[post.as_str().into(), state.as_str().into()])
+            .map_err(backend)?;
+        let bump = self
+            .db
+            .prepare(sql::BUMP_THREAD_FOR_POST)
+            .bind(&[post.as_str().into()])
+            .map_err(backend)?;
+        // One batch: the state and the page version move together or not at all.
+        let results = self.db.batch(vec![set, bump]).await.map_err(backend)?;
+        let refs: Vec<&D1Result> = results.iter().collect();
+        self.last_stats.set(collect_stats(&refs));
+        let changed = results
+            .first()
+            .and_then(|r| r.meta().ok().flatten())
+            .and_then(|m| m.changes)
+            .unwrap_or(0);
+        if changed == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn log_action(&self, a: &NewAction) -> StoreResult<i64> {
+        let res = self
+            .db
+            .prepare(sql::INSERT_ACTION)
+            .bind(&[
+                a.actor_kind.as_str().into(),
+                match a.actor_id {
+                    Some(id) => num(id),
+                    None => worker::wasm_bindgen::JsValue::NULL,
+                },
+                a.actor_name.as_str().into(),
+                a.target_kind.into(),
+                num(a.target_id),
+                a.action.into(),
+                a.detail.to_string().into(),
+                num(a.public as i64),
+                num(a.created_at),
+            ])
+            .map_err(backend)?
+            .run()
+            .await
+            .map_err(backend)?;
+        self.last_stats.set(collect_stats(&[&res]));
+        res.meta()
+            .ok()
+            .flatten()
+            .and_then(|m| m.last_row_id)
+            .ok_or_else(|| StoreError::Backend("log insert reported no row id".into()))
+    }
+
+    async fn open_review(&self, review: &NewReview) -> StoreResult<()> {
+        let null = worker::wasm_bindgen::JsValue::NULL;
+        let (verdict, confidence, categories) = match &review.verdict {
+            Some(v) => (
+                v.call.as_str().into(),
+                worker::wasm_bindgen::JsValue::from_f64(v.confidence),
+                serde_json::to_string(&v.categories)
+                    .map_err(backend)?
+                    .into(),
+            ),
+            None => (null.clone(), null.clone(), null.clone()),
+        };
+        self.run(
+            sql::UPSERT_REVIEW,
+            vec![
+                num(review.post_id),
+                num(review.space_id),
+                review.reason.as_str().into(),
+                verdict,
+                confidence,
+                categories,
+                match &review.appeal_text {
+                    Some(t) => t.as_str().into(),
+                    None => null,
+                },
+                num(review.opened_at),
+            ],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn resolve_review(
+        &self,
+        id: i64,
+        resolution: Resolution,
+        by: UserId,
+        now: Timestamp,
+    ) -> StoreResult<Option<ReviewItem>> {
+        let rows: Vec<ReviewRow> = self.query(sql::REVIEW_BY_ID, vec![num(id)]).await?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let item = review_from_row(row)?;
+        if item.resolved {
+            return Ok(None);
+        }
+        // No interactive transaction on D1; the `state = 'open'` guard in the UPDATE is what
+        // makes two simultaneous resolutions produce one.
+        let changed = self
+            .run(
+                sql::RESOLVE_REVIEW,
+                vec![num(id), resolution.as_str().into(), num(by), num(now)],
+            )
+            .await?
+            .unwrap_or(0);
+        Ok((changed > 0).then_some(item))
+    }
+
+    async fn open_reviews(&self, limit: u32) -> StoreResult<Vec<ReviewItem>> {
+        let rows: Vec<ReviewRow> = self
+            .query(sql::OPEN_REVIEWS, vec![num(limit as i64)])
+            .await?;
+        rows.into_iter().map(review_from_row).collect()
+    }
+
+    async fn add_report(&self, sig: &NewSignal) -> StoreResult<ReportTally> {
+        let added = self
+            .run(
+                sql::INSERT_SIGNAL,
+                vec![
+                    num(sig.post_id),
+                    num(sig.user_id),
+                    sig.kind.into(),
+                    worker::wasm_bindgen::JsValue::from_f64(sig.weight),
+                    match &sig.reason {
+                        Some(r) => r.as_str().into(),
+                        None => worker::wasm_bindgen::JsValue::NULL,
+                    },
+                    num(sig.created_at),
+                ],
+            )
+            .await?
+            .unwrap_or(0)
+            > 0;
+        let rows: Vec<CountRow> = self
+            .query(sql::COUNT_SIGNALS, vec![num(sig.post_id), sig.kind.into()])
+            .await?;
+        let count = rows.first().map(|r| r.n).unwrap_or(0);
+        Ok(ReportTally {
+            added,
+            count: count.max(0) as u32,
+        })
+    }
+
+    async fn pending_posts(&self, older_than: Timestamp, limit: u32) -> StoreResult<Vec<PublicId>> {
+        let rows: Vec<PublicIdRow> = self
+            .query(sql::PENDING_POSTS, vec![num(older_than), num(limit as i64)])
+            .await?;
+        rows.iter()
+            .map(|r| parse_id(&r.public_id, "pending post"))
+            .collect()
+    }
+
+    async fn public_log(&self, limit: u32) -> StoreResult<Vec<LogEntry>> {
+        let rows: Vec<LogRow> = self
+            .query(sql::PUBLIC_LOG, vec![num(limit as i64)])
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| LogEntry {
+                id: r.id,
+                actor_kind: ActorKind::parse(&r.actor_kind),
+                actor_name: r.actor_name,
+                target_kind: r.target_kind,
+                target_public_id: r
+                    .target_public_id
+                    .as_deref()
+                    .and_then(|t| PublicId::parse(t).ok()),
+                action: r.action,
+                created_at: r.created_at,
+            })
+            .collect())
+    }
+
+    async fn agreement(&self, space: SpaceId) -> StoreResult<AgreementStats> {
+        let rows: Vec<AgreementRow> = self.query(sql::AGREEMENT, vec![num(space)]).await?;
+        let r = rows.into_iter().next();
+        Ok(AgreementStats {
+            agreed: r.as_ref().and_then(|r| r.agreed).unwrap_or(0.0).max(0.0) as u32,
+            disagreed: r.as_ref().and_then(|r| r.disagreed).unwrap_or(0.0).max(0.0) as u32,
+        })
     }
 }

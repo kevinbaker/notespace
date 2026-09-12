@@ -45,6 +45,48 @@ database_name = "notespace-dev"
 database_id = "b8eef966-34ce-43e3-abd2-739e56d622d5"
 migrations_dir = "migrations"
 
+# Workers AI, for the moderation classifier. `binding` must match AI_BINDING in
+# crates/worker/src/moderation.rs. Absent, moderation falls back to holding posts for a human
+# with no model in the loop. Under `wrangler dev` this binding always calls the real service and
+# spends real neurons, local or not.
+[ai]
+binding = "AI"
+
+# The moderation queue: the reply handler produces, this Worker consumes. `binding` must match
+# QUEUE_BINDING in crates/worker/src/moderation.rs. Create it once with
+# `wrangler queues create notespace-moderation`. On the free plan each message costs about three
+# of the day's 10,000 operations (write, read, ack); the cron sweep below is what makes losing
+# the queue harmless.
+[[queues.producers]]
+binding = "MODERATION"
+queue = "notespace-moderation"
+
+[[queues.consumers]]
+queue = "notespace-moderation"
+max_batch_size = 10
+max_batch_timeout = 5
+max_retries = 3
+
+# The sweep: classifies anything still pending that the queue did not deliver. Every five
+# minutes, SWEEP_LIMIT posts per run. It only ever spends on posts the queue missed, so its
+# cost is bounded by held-post volume, not by the cadence; the cadence bounds how long a held
+# post can wait if the queue is dead.
+[triggers]
+crons = ["*/5 * * * *"]
+
+[vars]
+# workers_ai (default when the AI binding exists) | llama_guard | anthropic | openrouter |
+# openrouter_guard | off, or a safety model in front of an instruct model joined with `+`:
+# "llama_guard+workers_ai", "openrouter_guard+openrouter". `anthropic` needs
+# `wrangler secret put ANTHROPIC_API_KEY`; the openrouter ones need OPENROUTER_API_KEY.
+# MOD_MODEL overrides the instruct model, MOD_GUARD_MODEL the guard. Measured on real Hacker
+# News comments (DECISIONS.md), the 8B default over-flags; "openrouter_guard+openrouter" with
+# MOD_MODEL = "openai/gpt-4o-mini" is the cheap stack that behaved.
+MOD_PROVIDER = "workers_ai"
+# Comma-separated usernames who may work /mod/queue in addition to anyone with the moderator
+# role in the database. The bootstrap path for the first admin.
+MODERATORS = ""
+
 [observability]
 enabled = true
 

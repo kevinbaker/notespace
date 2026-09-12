@@ -4,6 +4,7 @@
 mod auth_config;
 mod cache;
 mod ids;
+mod moderation;
 mod startup;
 mod store;
 #[cfg(feature = "kdf-subtle")]
@@ -26,7 +27,7 @@ use notespace_core::store::{Page, Store, StoreError, StoreResult};
 use serde::Deserialize;
 use store::D1Store;
 use tower_service::Service;
-use worker::{event, Context, Env, HttpRequest, Result as WorkerResult};
+use worker::{event, Context, Env, HttpRequest, MessageBatch, MessageExt, Result as WorkerResult};
 
 /// Kept in step with wrangler.toml by `the_d1_binding_name_matches_wrangler_toml`.
 const DB_BINDING: &str = "DATABASE";
@@ -84,6 +85,13 @@ fn router(env: Env) -> Router {
         .route("/logout", post(logout))
         .route("/register", get(register_form).post(register_submit))
         .route("/t/{id}/reply", get(reply_form).post(reply_submit))
+        .route("/t/{id}/held/{post}", get(held_notice))
+        // Moderation. Forms are separate uncached pages for the same reason the reply form is.
+        .route("/p/{id}/report", get(report_form).post(report_submit))
+        .route("/p/{id}/appeal", get(appeal_form).post(appeal_submit))
+        .route("/mod/queue", get(mod_queue))
+        .route("/mod/review/{id}", post(mod_review))
+        .route("/modlog", get(modlog))
         // GET runs the read-only checks; POST adds the write checks, which mutate the thread.
         .route(
             "/__conformance",
@@ -764,6 +772,8 @@ fn parse_reply_error(code: String) -> Option<notespace_render::auth::ReplyError>
         "empty" => Some(ReplyError::Empty),
         "expired" => Some(ReplyError::Expired),
         "contended" => Some(ReplyError::Contended),
+        "locked" => Some(ReplyError::Locked),
+        "duplicate" => Some(ReplyError::Duplicate),
         other => {
             if let Some(n) = other.strip_prefix("long-") {
                 return n.parse().ok().map(|max| ReplyError::TooLong { max });
@@ -875,10 +885,20 @@ async fn reply_submit(
         now,
     };
 
-    match reply::post(&store, &cfg, attempt).await {
+    let queue = moderation::MaybeQueue::from_env(&env);
+    match reply::post(&store, &queue, &cfg, attempt).await {
         Ok(Outcome::Posted(post)) => (
             StatusCode::SEE_OTHER,
             [(header::LOCATION, format!("/p/{}", post.public_id))],
+        )
+            .into_response(),
+        // The permalink would show "[awaiting review]" with no explanation.
+        Ok(Outcome::Held(post)) => (
+            StatusCode::SEE_OTHER,
+            [(
+                header::LOCATION,
+                format!("/t/{canonical}/held/{}", post.public_id),
+            )],
         )
             .into_response(),
         Ok(Outcome::RateLimited { retry_after_secs }) => back(&format!("wait-{retry_after_secs}")),
@@ -886,9 +906,20 @@ async fn reply_submit(
         Ok(Outcome::Rejected(Rejected::TooLong { max, .. })) => back(&format!("long-{max}")),
         Ok(Outcome::Rejected(Rejected::TooDeep { cap })) => back(&format!("deep-{cap}")),
         Ok(Outcome::Rejected(Rejected::Contended)) => back("contended"),
+        Ok(Outcome::Rejected(Rejected::Locked)) => back("locked"),
+        Ok(Outcome::Rejected(Rejected::Duplicate)) => back("duplicate"),
         Ok(Outcome::Rejected(Rejected::NotFound)) => error(StatusCode::NOT_FOUND, "no such thread"),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+/// Told rather than shown: the thread page renders the held post as a tombstone.
+#[worker::send]
+async fn held_notice(UrlPath((thread, post)): UrlPath<(String, String)>) -> Response {
+    let (Ok(thread), Ok(post)) = (PublicId::parse(&thread), PublicId::parse(&post)) else {
+        return error(StatusCode::BAD_REQUEST, "bad id");
+    };
+    uncached_html(notespace_render::auth::held_page(&thread.encode(), &post.encode()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1143,5 +1174,417 @@ async fn index(State(env): State<Env>) -> Response {
             resp
         }
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Moderation
+// ---------------------------------------------------------------------------
+
+/// Queue items shown per page.
+const QUEUE_LIMIT: u32 = 50;
+/// Log rows shown.
+const MODLOG_LIMIT: u32 = 100;
+/// Posts the cron sweep classifies per run. Bounded by the model budget, not by D1.
+const SWEEP_LIMIT: u32 = 10;
+
+fn now_ms() -> i64 {
+    worker::Date::now().as_millis() as i64
+}
+
+fn uncached_html(body: maud::Markup) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        Html(body.into_string()),
+    )
+        .into_response()
+}
+
+fn see_other(target: String) -> Response {
+    (StatusCode::SEE_OTHER, [(header::LOCATION, target)]).into_response()
+}
+
+/// A moderator by role, or listed in the `MODERATORS` variable -- the bootstrap path for the
+/// first admin, who has nobody to grant them the role.
+fn can_moderate(env: &Env, user: &notespace_core::model::User) -> bool {
+    if user.role.can_moderate() {
+        return true;
+    }
+    env.var("MODERATORS")
+        .map(|v| v.to_string())
+        .unwrap_or_default()
+        .split(',')
+        .map(|n| n.trim().to_lowercase())
+        .any(|n| !n.is_empty() && n == user.name)
+}
+
+/// The signed-in user, the store, and a CSRF token bound to their session -- what every
+/// moderation form needs. `Err` is the response to send instead.
+struct Signed {
+    store: D1Store,
+    user: notespace_core::model::User,
+    session: String,
+    key: csrf::CsrfKey,
+}
+
+async fn signed_in(env: &Env, headers: &axum::http::HeaderMap, next: &str) -> Result<Signed, Response> {
+    let Ok(db) = env.d1(DB_BINDING) else {
+        return Err(error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding"));
+    };
+    let store = D1Store::new(db);
+    let Some(user) = current_user(&store, headers).await else {
+        return Err(needs_sign_in(next));
+    };
+    let Some(key) = csrf_key(env) else {
+        return Err(error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CSRF_KEY is not configured",
+        ));
+    };
+    let Some(session) = cookie::get(cookie_header(headers), cookie::SESSION) else {
+        return Err(needs_sign_in(next));
+    };
+    Ok(Signed {
+        store,
+        user,
+        session,
+        key,
+    })
+}
+
+impl Signed {
+    fn mint(&self) -> String {
+        self.key
+            .mint(&self.session, now_ms(), csrf::DEFAULT_LIFETIME_MS)
+            .as_str()
+            .to_string()
+    }
+    fn verify(&self, token: &str) -> bool {
+        self.key.verify(token, &self.session, now_ms()).is_ok()
+    }
+}
+
+fn form_fields(body: &str) -> std::collections::HashMap<String, String> {
+    form_urlencoded::parse(body.as_bytes())
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect()
+}
+
+#[derive(Deserialize, Default)]
+struct ReportQuery {
+    error: Option<String>,
+    done: Option<String>,
+}
+
+#[worker::send]
+async fn report_form(
+    State(env): State<Env>,
+    headers: axum::http::HeaderMap,
+    UrlPath(id): UrlPath<String>,
+    Query(q): Query<ReportQuery>,
+) -> Response {
+    use notespace_render::moderation::{report_page, ReportDone, ReportError};
+    let Ok(post) = PublicId::parse(&id) else {
+        return error(StatusCode::BAD_REQUEST, "bad post id");
+    };
+    let canonical = post.encode();
+    let signed = match signed_in(&env, &headers, &format!("/p/{canonical}/report")).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let error = q.error.as_deref().and_then(|e| match e {
+        "expired" => Some(ReportError::Expired),
+        "own" => Some(ReportError::OwnPost),
+        "gone" => Some(ReportError::Gone),
+        _ => None,
+    });
+    let done = q.done.as_deref().and_then(|d| match d {
+        "recorded" => Some(ReportDone::Recorded),
+        "already" => Some(ReportDone::AlreadyReported),
+        "held" => Some(ReportDone::Held),
+        _ => None,
+    });
+    uncached_html(report_page(&signed.mint(), &canonical, error, done))
+}
+
+#[worker::send]
+async fn report_submit(
+    State(env): State<Env>,
+    headers: axum::http::HeaderMap,
+    UrlPath(id): UrlPath<String>,
+    body: String,
+) -> Response {
+    use notespace_core::moderation::pipeline::{self, ReportOutcome};
+    let Ok(post) = PublicId::parse(&id) else {
+        return error(StatusCode::BAD_REQUEST, "bad post id");
+    };
+    let canonical = post.encode();
+    let back = |q: &str| see_other(format!("/p/{canonical}/report?{q}"));
+    let signed = match signed_in(&env, &headers, &format!("/p/{canonical}/report")).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let fields = form_fields(&body);
+    if !signed.verify(fields.get("csrf").map(String::as_str).unwrap_or("")) {
+        return back("error=expired");
+    }
+    let queue = moderation::MaybeQueue::from_env(&env);
+    let reason = fields.get("reason").map(String::as_str);
+    match pipeline::report(&signed.store, &queue, &post, &signed.user, reason, now_ms()).await {
+        Ok(ReportOutcome::Recorded { .. }) => back("done=recorded"),
+        Ok(ReportOutcome::AlreadyReported { .. }) => back("done=already"),
+        Ok(ReportOutcome::Held { .. }) => back("done=held"),
+        Ok(ReportOutcome::OwnPost) => back("error=own"),
+        Ok(ReportOutcome::Gone) => back("error=gone"),
+        Err(StoreError::NotFound) => error(StatusCode::NOT_FOUND, "no such post"),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct AppealQuery {
+    error: Option<String>,
+    filed: Option<String>,
+}
+
+#[worker::send]
+async fn appeal_form(
+    State(env): State<Env>,
+    headers: axum::http::HeaderMap,
+    UrlPath(id): UrlPath<String>,
+    Query(q): Query<AppealQuery>,
+) -> Response {
+    use notespace_render::moderation::{appeal_page, AppealError};
+    let Ok(post) = PublicId::parse(&id) else {
+        return error(StatusCode::BAD_REQUEST, "bad post id");
+    };
+    let canonical = post.encode();
+    let signed = match signed_in(&env, &headers, &format!("/p/{canonical}/appeal")).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let error = q.error.as_deref().and_then(|e| match e {
+        "expired" => Some(AppealError::Expired),
+        "empty" => Some(AppealError::Empty),
+        "notyours" => Some(AppealError::NotYours),
+        "nothidden" => Some(AppealError::NotHidden),
+        other => other
+            .strip_prefix("long-")
+            .and_then(|n| n.parse().ok())
+            .map(|max| AppealError::TooLong { max }),
+    });
+    uncached_html(appeal_page(
+        &signed.mint(),
+        &canonical,
+        error,
+        q.filed.is_some(),
+    ))
+}
+
+#[worker::send]
+async fn appeal_submit(
+    State(env): State<Env>,
+    headers: axum::http::HeaderMap,
+    UrlPath(id): UrlPath<String>,
+    body: String,
+) -> Response {
+    use notespace_core::moderation::pipeline::{self, AppealOutcome};
+    let Ok(post) = PublicId::parse(&id) else {
+        return error(StatusCode::BAD_REQUEST, "bad post id");
+    };
+    let canonical = post.encode();
+    let back = |q: &str| see_other(format!("/p/{canonical}/appeal?{q}"));
+    let signed = match signed_in(&env, &headers, &format!("/p/{canonical}/appeal")).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let fields = form_fields(&body);
+    if !signed.verify(fields.get("csrf").map(String::as_str).unwrap_or("")) {
+        return back("error=expired");
+    }
+    let text = fields.get("text").map(String::as_str).unwrap_or("");
+    match pipeline::appeal(&signed.store, &post, &signed.user, text, now_ms()).await {
+        Ok(AppealOutcome::Filed) => back("filed=1"),
+        Ok(AppealOutcome::Empty) => back("error=empty"),
+        Ok(AppealOutcome::TooLong { max }) => back(&format!("error=long-{max}")),
+        Ok(AppealOutcome::NotYours) => back("error=notyours"),
+        Ok(AppealOutcome::NotHidden) => back("error=nothidden"),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct QueueQuery {
+    did: Option<String>,
+}
+
+/// Capability-gated. A 404 rather than a 403 for non-moderators: the page's existence is not
+/// their business.
+#[worker::send]
+async fn mod_queue(
+    State(env): State<Env>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<QueueQuery>,
+) -> Response {
+    use notespace_render::moderation::{queue_page, QueueNotice};
+    let signed = match signed_in(&env, &headers, "/mod/queue").await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if !can_moderate(&env, &signed.user) {
+        return error(StatusCode::NOT_FOUND, "not found");
+    }
+    let items = match signed.store.open_reviews(QUEUE_LIMIT).await {
+        Ok(items) => items,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let notice = q.did.as_deref().and_then(|d| match d {
+        "approve" => Some(QueueNotice::Approved),
+        "reject" => Some(QueueNotice::Rejected),
+        "gone" => Some(QueueNotice::Gone),
+        _ => None,
+    });
+    uncached_html(queue_page(&items, &signed.mint(), notice))
+}
+
+#[worker::send]
+async fn mod_review(
+    State(env): State<Env>,
+    headers: axum::http::HeaderMap,
+    UrlPath(id): UrlPath<i64>,
+    body: String,
+) -> Response {
+    use notespace_core::moderation::pipeline::{self, ReviewOutcome};
+    use notespace_core::moderation::Resolution;
+    let signed = match signed_in(&env, &headers, "/mod/queue").await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if !can_moderate(&env, &signed.user) {
+        return error(StatusCode::NOT_FOUND, "not found");
+    }
+    let fields = form_fields(&body);
+    if !signed.verify(fields.get("csrf").map(String::as_str).unwrap_or("")) {
+        return see_other("/mod/queue".into());
+    }
+    let Some(resolution) = fields.get("resolution").and_then(|r| Resolution::parse(r)) else {
+        return error(StatusCode::BAD_REQUEST, "resolution must be approve or reject");
+    };
+    // The role check above covers the `MODERATORS` bootstrap list; the pipeline checks the
+    // role on the user record, so lift a listed user to moderator for this call.
+    let mut reviewer = signed.user.clone();
+    if !reviewer.role.can_moderate() {
+        reviewer.role = notespace_core::model::Role::Moderator;
+    }
+    match pipeline::review(&signed.store, id, &reviewer, resolution, now_ms()).await {
+        Ok(ReviewOutcome::Resolved { .. }) => {
+            see_other(format!("/mod/queue?did={}", resolution.as_str()))
+        }
+        Ok(ReviewOutcome::Gone) => see_other("/mod/queue?did=gone".into()),
+        Ok(ReviewOutcome::Forbidden) => error(StatusCode::NOT_FOUND, "not found"),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// Public. Briefly cacheable: it only changes when someone acts.
+#[worker::send]
+async fn modlog(State(env): State<Env>) -> Response {
+    let Ok(db) = env.d1(DB_BINDING) else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding");
+    };
+    let store = D1Store::new(db);
+    match store.public_log(MODLOG_LIMIT).await {
+        Ok(entries) => {
+            let html = notespace_render::moderation::modlog_page(&entries).into_string();
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                    (header::CACHE_CONTROL, "public, max-age=0, s-maxage=30"),
+                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                ],
+                Html(html),
+            )
+                .into_response()
+        }
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// The queue consumer. A store failure retries the message; a classifier failure does not,
+/// because the pipeline has already handed the post to a human.
+#[event(queue)]
+async fn queue(batch: MessageBatch<moderation::Job>, env: Env, _ctx: Context) -> WorkerResult<()> {
+    use notespace_core::moderation::pipeline;
+    console_error_panic_hook::set_once();
+    let db = env.d1(DB_BINDING)?;
+    let store = D1Store::new(db);
+    let classifier = match moderation::resolve(&env) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            // Nothing to classify with. Leave the posts pending for a human; ack so the
+            // messages do not churn.
+            worker::console_log!("moderation: no classifier configured; {} held posts await a human", batch.messages()?.len());
+            batch.ack_all();
+            return Ok(());
+        }
+        Err(why) => {
+            worker::console_log!("moderation: classifier misconfigured: {why}");
+            batch.retry_all();
+            return Ok(());
+        }
+    };
+    for msg in batch.messages()? {
+        let job = msg.body();
+        let Ok(post) = PublicId::parse(&job.post) else {
+            worker::console_log!("moderation: dropping message with bad id {:?}", job.post);
+            msg.ack();
+            continue;
+        };
+        match pipeline::process_post(&store, &classifier, &post, &job.reasons, now_ms()).await {
+            Ok(outcome) => {
+                worker::console_log!("moderation: {post} -> {outcome:?}");
+                msg.ack();
+            }
+            Err(e) => {
+                worker::console_log!("moderation: {post} store error, will retry: {e}");
+                msg.retry();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The safety net. Anything still pending past the grace period, that no human has yet, is
+/// classified here -- whether the queue is misconfigured, absent, or simply lost a message.
+#[event(scheduled)]
+async fn scheduled(_event: worker::ScheduledEvent, env: Env, _ctx: worker::ScheduleContext) {
+    use notespace_core::moderation::pipeline;
+    console_error_panic_hook::set_once();
+    let Ok(db) = env.d1(DB_BINDING) else {
+        worker::console_log!("sweep: no D1 binding");
+        return;
+    };
+    let store = D1Store::new(db);
+    let classifier = match moderation::resolve(&env) {
+        Ok(Some(c)) => c,
+        Ok(None) => return,
+        Err(why) => {
+            worker::console_log!("sweep: classifier misconfigured: {why}");
+            return;
+        }
+    };
+    match pipeline::drain(&store, &classifier, now_ms(), SWEEP_LIMIT).await {
+        Ok(results) => {
+            for (post, r) in results {
+                worker::console_log!("sweep: {post} -> {r:?}");
+            }
+        }
+        Err(e) => worker::console_log!("sweep: {e}"),
     }
 }

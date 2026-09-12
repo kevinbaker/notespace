@@ -66,7 +66,7 @@ pub fn login_page(csrf: &str, next: Option<&str>, error: Option<LoginError>) -> 
 }
 
 /// Inlined, to avoid a second request on the one page a visitor sees before caching anything.
-struct PreEscapedStyle;
+pub(crate) struct PreEscapedStyle;
 
 impl maud::Render for PreEscapedStyle {
     fn render_to(&self, out: &mut String) {
@@ -107,11 +107,16 @@ pub enum ReplyError {
     Expired,
     /// Lost the ordinal race repeatedly. Transient.
     Contended,
+    Locked,
+    /// The same body was posted moments ago by the same author.
+    Duplicate,
 }
 
 impl ReplyError {
     fn message(&self) -> String {
         match self {
+            ReplyError::Locked => "This thread is locked.".into(),
+            ReplyError::Duplicate => "You posted exactly this a moment ago.".into(),
             ReplyError::Empty => "Write something first.".into(),
             ReplyError::TooLong { max } => {
                 format!("That reply is too long. The limit is {max} characters.")
@@ -241,6 +246,36 @@ pub fn register_page(csrf: &str, name: &str, error: Option<RegisterError>) -> Ma
                     }
                     p class="muted" {
                         "Already have one? " a href="/login" { "Sign in" } "."
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Shown after a reply was held for moderation. The post exists and has a permalink, but the
+/// thread page shows it as awaiting review, which would read as a failure without this.
+pub fn held_page(thread: &str, post: &str) -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { "Reply received" }
+                style { (PreEscapedStyle) }
+            }
+            body {
+                main class="auth wide" {
+                    h1 { "Reply received" }
+                    p {
+                        "Your reply is waiting for a quick check before it appears. New accounts and \
+                         posts with several links go through this; it usually takes a minute, and \
+                         sometimes a moderator has to look."
+                    }
+                    p class="muted" {
+                        a href={ "/p/" (post) } { "Your reply" } " · "
+                        a href={ "/t/" (thread) } { "Back to the thread" }
                     }
                 }
             }

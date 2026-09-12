@@ -133,6 +133,7 @@ pub async fn signup<S: Store>(
             id: user_id,
             name: name.as_str().to_string(),
             state: UserState::Active,
+            role: crate::model::Role::Member,
         },
     })
 }

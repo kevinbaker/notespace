@@ -7,7 +7,7 @@ use notespace_core::path::Path;
 use notespace_store_sqlite::SqliteStore;
 
 /// `include_str!` needs literal paths; `migration_list_is_complete` guards the hand maintenance.
-const MIGRATIONS: [&str; 7] = [
+const MIGRATIONS: [&str; 8] = [
     include_str!("../../../migrations/0001_init.sql"),
     include_str!("../../../migrations/0002_thread_public_id.sql"),
     include_str!("../../../migrations/0003_space_paths_and_names.sql"),
@@ -15,6 +15,7 @@ const MIGRATIONS: [&str; 7] = [
     include_str!("../../../migrations/0005_session.sql"),
     include_str!("../../../migrations/0006_login_attempt.sql"),
     include_str!("../../../migrations/0007_user_password.sql"),
+    include_str!("../../../migrations/0008_moderation.sql"),
 ];
 
 const MIGRATIONS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations");
@@ -400,6 +401,7 @@ async fn login_rehashes_a_stale_credential() {
 // ---------------------------------------------------------------------------
 
 use notespace_core::model::SanitizedHtml;
+use notespace_core::moderation::NoQueue;
 use notespace_core::reply::{self, Outcome as ReplyOutcome, Rejected, Reply, ReplyConfig};
 
 fn reply_config(per_author: u32) -> ReplyConfig {
@@ -443,6 +445,7 @@ async fn a_reply_is_posted_and_lands_at_the_end_of_the_thread() {
 
     match reply::post(
         &store,
+        &NoQueue,
         &reply_config(10),
         a_reply("hello there", &ids, "1.2.3.4"),
     )
@@ -470,7 +473,7 @@ async fn an_oversized_body_never_reaches_the_database() {
     let huge = "a".repeat(reply::MAX_BODY_CHARS + 1);
     let before = store.thread_version(&thread_id()).await.unwrap().unwrap();
 
-    match reply::post(&store, &reply_config(10), a_reply(&huge, &ids, "1.2.3.4")).await {
+    match reply::post(&store, &NoQueue, &reply_config(10), a_reply(&huge, &ids, "1.2.3.4")).await {
         Ok(ReplyOutcome::Rejected(Rejected::TooLong { .. })) => {}
         _ => panic!("expected TooLong"),
     }
@@ -487,14 +490,16 @@ async fn the_limiter_bites_before_the_write() {
     let cfg = reply_config(2);
     for i in 0..2u64 {
         let ids = reply_ids(10 + i);
-        match reply::post(&store, &cfg, a_reply("a real reply", &ids, "9.9.9.9")).await {
+        // Distinct bodies: a repeat is refused as a duplicate before the limiter is consulted.
+        let body = format!("a real reply {i}");
+        match reply::post(&store, &NoQueue, &cfg, a_reply(&body, &ids, "9.9.9.9")).await {
             Ok(ReplyOutcome::Posted(_)) => {}
             _ => panic!("attempt {i} should have posted"),
         }
     }
     let before = store.thread_version(&thread_id()).await.unwrap().unwrap();
     let ids = reply_ids(99);
-    match reply::post(&store, &cfg, a_reply("one too many", &ids, "9.9.9.9")).await {
+    match reply::post(&store, &NoQueue, &cfg, a_reply("one too many", &ids, "9.9.9.9")).await {
         Ok(ReplyOutcome::RateLimited { retry_after_secs }) => {
             assert!(retry_after_secs > 0, "no retry hint");
         }
@@ -513,7 +518,7 @@ async fn a_reply_to_an_unknown_thread_is_rejected_not_an_error() {
     let ids = reply_ids(3);
     let mut r = a_reply("hello there", &ids, "1.2.3.4");
     r.thread = PublicId::new(1_735_689_600_000, 0xDEAD).unwrap();
-    match reply::post(&store, &reply_config(10), r).await {
+    match reply::post(&store, &NoQueue, &reply_config(10), r).await {
         Ok(ReplyOutcome::Rejected(Rejected::NotFound)) => {}
         _ => panic!("expected NotFound"),
     }
@@ -825,6 +830,44 @@ async fn locate_post_stays_inside_its_budget() {
         "post 11 at page size 3 needs a cursor"
     );
     assert_eq!(n, 3, "paged locate_post ran {n} statements, budget is 3");
+}
+
+/// The AI and queue bindings, same failure mode. Read from the moderation module rather than
+/// lib.rs, which is where they are declared.
+#[test]
+fn the_moderation_binding_names_match_wrangler_toml() {
+    let src = include_str!("../../worker/src/moderation.rs");
+    let toml = include_str!("../../../wrangler.toml");
+    let constant = |name: &str| -> String {
+        src.lines()
+            .find_map(|l| l.trim().strip_prefix(&format!("pub const {name}: &str = \"")))
+            .and_then(|l| l.split('"').next())
+            .unwrap_or_else(|| panic!("{name} not found in moderation.rs"))
+            .to_string()
+    };
+    let bindings: Vec<&str> = toml
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("binding = \""))
+        .filter_map(|l| l.split('"').next())
+        .collect();
+    assert!(
+        bindings.contains(&constant("AI_BINDING").as_str()),
+        "AI binding {:?} not declared in wrangler.toml ({bindings:?})",
+        constant("AI_BINDING")
+    );
+    assert!(
+        bindings.contains(&constant("QUEUE_BINDING").as_str()),
+        "queue binding {:?} not declared in wrangler.toml ({bindings:?})",
+        constant("QUEUE_BINDING")
+    );
+    // The producer and consumer must name the same queue, or messages go nowhere.
+    let queues: Vec<&str> = toml
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("queue = \""))
+        .filter_map(|l| l.split('"').next())
+        .collect();
+    assert_eq!(queues.len(), 2, "expected one producer and one consumer: {queues:?}");
+    assert_eq!(queues[0], queues[1], "producer and consumer name different queues");
 }
 
 /// A mismatch here is a runtime "no D1 binding", never a build failure.

@@ -30,6 +30,8 @@ pub fn thread_page(page: &ThreadPage) -> Markup {
                     a href={ "/s/" (space.path.trim_end_matches('/')) } { (space.name) }
                     // Which of these applies to the reader is not knowable in a baked page.
                     span class="site-auth" {
+                        a href="/modlog" { "modlog" }
+                        " · "
                         a href="/login" { "sign in" }
                         " · "
                         a href="/register" { "register" }
@@ -86,6 +88,9 @@ pub fn thread_page(page: &ThreadPage) -> Markup {
                                 }
                                 div class="post-actions" {
                                     a href={ "/p/" (post.public_id) "/reply" } { "reply" }
+                                    " · "
+                                    // A link for the same reason reply is: the form needs a token.
+                                    a href={ "/p/" (post.public_id) "/report" } rel="nofollow" { "report" }
                                 }
                             }
                         }

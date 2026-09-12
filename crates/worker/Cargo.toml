@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 [dependencies]
 notespace-core = { workspace = true, default-features = false }
 notespace-render = { workspace = true }
-worker = { version = "0.8", features = ["d1", "http", "axum"] }
+worker = { version = "0.8", features = ["d1", "http", "axum", "queue"] }
 worker-macros = { version = "0.8", features = ["http"] }
 axum = { version = "0.8", default-features = false, features = ["query"] }
 tower-service = "0.3"
@@ -22,6 +22,8 @@ console_error_panic_hook = "0.1"
 # wasm" constraint tractable. v0.2's feature works without RUSTFLAGS, unlike v0.3's backend cfg.
 getrandom = { version = "0.2", features = ["js"] }
 form_urlencoded = "1"
+async-trait = "0.1"
+maud = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

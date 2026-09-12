@@ -157,7 +157,41 @@ both 404, because neither route exists.
 
 ## §5 Moderation pipeline
 
-Not implemented. `PostState::Pending` in `crates/core/src/model.rs` is the only part present.
+| what | where |
+|---|---|
+| Tier 0 heuristics | `crates/core/src/moderation/heuristics.rs` — `triage`, `MANIPULATION_MARKERS` |
+| Where Tier 0 runs on the write path | `crates/core/src/reply.rs` — `post`, between the limiter and the insert |
+| Per-space policy, thresholds, metamoderation | `crates/core/src/moderation/policy.rs` — `ModerationPolicy::from_config`, `effective`, `decide` |
+| The classifier trait, prompt and parser | `crates/core/src/moderation/classify.rs` — `Classifier`, `system_prompt`, `user_message`, `parse_verdict`, `PROMPT_VERSION` |
+| Provider request/response shapes | `crates/core/src/moderation/providers.rs` — `workers_ai_*`, `llama_guard_*`, `anthropic_*`, `openai_compatible_*` |
+| Layering a safety model in front | `crates/core/src/moderation/layers.rs` — `Layered`, `combine`, `guard_visible` |
+| The steps: hold, classify, sweep, report, review, appeal | `crates/core/src/moderation/pipeline.rs` |
+| Categories, actors, log and queue row types | `crates/core/src/moderation/mod.rs` |
+| Store methods | `Store::write_context` through `Store::agreement` in `crates/core/src/store.rs`; SQL under "Moderation" in `sql.rs` |
+| Schema | `migrations/0008_moderation.sql` — `signal`, `action_log`, `review_item`, `user.role` |
+| Transport on the Worker | `crates/worker/src/moderation.rs` — `resolve` (reads `MOD_PROVIDER`, `a+b` for layers), `WorkersAi`, `Anthropic`, `OpenAiCompatible`, `QueueProducer` |
+| Queue consumer and cron sweep | `queue` and `scheduled` events in `crates/worker/src/lib.rs` |
+| Handlers | `report_form`/`report_submit`, `appeal_form`/`appeal_submit`, `mod_queue`, `mod_review`, `modlog`, `held_notice` in `crates/worker/src/lib.rs` |
+| Pages | `crates/render/src/moderation.rs`; `held_page` in `crates/render/src/auth.rs` |
+| Bindings and vars | `[ai]`, `[[queues.*]]`, `[triggers]`, `[vars]` in `wrangler.toml`; guarded by `the_moderation_binding_names_match_wrangler_toml` |
+
+Tests, by layer:
+
+| what | where |
+|---|---|
+| Heuristics, policy, prompt, parser, providers | unit tests in each `moderation/*.rs` |
+| Pipeline end to end against SQLite with a scripted model | `crates/store-sqlite/tests/moderation.rs` |
+| Store methods on both adapters | the moderation checks in `core::conformance::write_checks` |
+| Live evaluation against real models | `crates/core/tests/live_classifier.rs` over `tests/fixtures/moderation_corpus.json`; `#[ignore]`, needs credentials |
+| Sampling real Hacker News comments through both tiers | `crates/core/examples/hn_moderate.rs` — `--guard`, `--grep`, `--seed` |
+
+Capability is `user.role` plus the `MODERATORS` variable (`can_moderate` in the worker), which
+is how the first moderator comes to exist. There is no UI for granting the role; it is a SQL
+update for now.
+
+Not built: a general rule engine (the heuristics are fixed code with policy-supplied numbers),
+reporter accuracy weighting, per-user notification that a post was held or hidden, and the
+author's view of their own pending post -- the baked page shows everyone the same tombstone.
 
 ## §6 Presets
 
@@ -167,16 +201,19 @@ There is no preset table or selector yet.
 ## §7 Routes
 
 `router()` in `crates/worker/src/lib.rs` is the live list. Currently: `/`, `/healthz`, `/t/{id}`,
-`/t/{id}/{slug}`, `/p/{id}`, `/t/{id}/reply`, `/login`, `/logout`, `/register`, `/__conformance`.
+`/t/{id}/{slug}`, `/p/{id}`, `/t/{id}/reply`, `/t/{id}/held/{post}`, `/p/{id}/report`,
+`/p/{id}/appeal`, `/mod/queue`, `/mod/review/{id}`, `/modlog`, `/login`, `/logout`, `/register`,
+`/__conformance`.
 
 `SpaceKey::RESERVED` and `Username::RESERVED` are hand-maintained and should be derived from this
 router instead.
 
 ## §8 Milestones
 
-M0 and the read path are done and measured. M1's `Store` seam is done. M2 is partial: login and
-logout exist; registration, the reply form, edit/delete and RSS do not. `crates/server` (M5) does
-not exist.
+M0 and the read path are done and measured. M1's `Store` seam is done. M2 is partial: login,
+logout, registration and the reply form exist; edit/delete and RSS do not. M4's moderation
+pipeline is in, ahead of M3, because the write path needed it. `crates/server` (M5) does not
+exist.
 
 ---
 

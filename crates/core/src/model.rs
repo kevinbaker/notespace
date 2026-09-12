@@ -47,6 +47,8 @@ pub struct NewPost {
     /// Rendered at write time so the read path never renders markdown.
     pub body_html: SanitizedHtml,
     pub created_at: Timestamp,
+    /// `Visible`, or `Pending` when the write path held it for moderation.
+    pub state: PostState,
 }
 
 /// A container of threads, and the unit configuration attaches to: it owns the permissions
@@ -114,6 +116,24 @@ pub struct User {
     pub id: UserId,
     pub name: String,
     pub state: UserState,
+    pub role: Role,
+}
+
+/// Granted, not earned: the smallest capability system that gates a review queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    #[default]
+    Member,
+    Moderator,
+    Admin,
+}
+
+impl Role {
+    /// Whether this role may work the review queue and act on posts.
+    pub fn can_moderate(&self) -> bool {
+        matches!(self, Role::Moderator | Role::Admin)
+    }
 }
 
 /// Why a username stays taken forever: `Deleted` is a tombstone, not a removal.
@@ -302,6 +322,12 @@ string_enum!(PostState {
     Deleted => "deleted",
 });
 
+string_enum!(Role {
+    Member => "member",
+    Moderator => "moderator",
+    Admin => "admin",
+});
+
 #[cfg(test)]
 mod string_form_tests {
     use super::*;
@@ -348,6 +374,7 @@ mod string_form_tests {
                 PostState::Deleted
             ]
         );
+        check!(Role, [Role::Member, Role::Moderator, Role::Admin]);
     }
 
     #[test]

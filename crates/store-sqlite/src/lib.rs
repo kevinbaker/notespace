@@ -8,6 +8,10 @@
 
 use notespace_core::id::PublicId;
 use notespace_core::model::*;
+use notespace_core::moderation::{
+    classify::Call, ActorKind, AgreementStats, Category, LogEntry, NewAction, NewReview,
+    NewSignal, ReportTally, Resolution, ReviewItem, ReviewPost, ReviewReason, WriteContext,
+};
 use notespace_core::path::Path;
 use notespace_core::ratelimit::{AttemptKeys, Attempts};
 use notespace_core::session::{Session, TokenHash};
@@ -245,6 +249,7 @@ impl Store for SqliteStore {
                 new.body_md,
                 new.body_html.as_str(),
                 new.created_at,
+                new.state.as_str(),
             ],
         );
         match inserted {
@@ -281,7 +286,7 @@ impl Store for SqliteStore {
             created_at: new.created_at,
             edited_at: None,
             score: 0.0,
-            state: PostState::Visible,
+            state: new.state,
         })
     }
 
@@ -323,6 +328,7 @@ impl Store for SqliteStore {
                             id: r.get("user_id")?,
                             name: r.get("user_name")?,
                             state: parse_enum(&r.get::<_, String>("user_state")?),
+                            role: parse_enum(&r.get::<_, String>("user_role")?),
                         },
                     })
                 },
@@ -369,6 +375,7 @@ impl Store for SqliteStore {
                         id: r.get("id")?,
                         name: r.get("name")?,
                         state: parse_enum(&r.get::<_, String>("state")?),
+                        role: parse_enum(&r.get::<_, String>("role")?),
                     },
                     password_hash: r.get("password_hash")?,
                 })
@@ -509,4 +516,291 @@ impl Store for SqliteStore {
             cursor,
         })
     }
+
+    // -- Moderation ---------------------------------------------------------
+
+    async fn write_context(&self, thread: &PublicId, author: UserId) -> StoreResult<WriteContext> {
+        self.conn
+            .query_row(
+                sql::WRITE_CONTEXT,
+                rusqlite::params![thread.as_str(), author],
+                |r| {
+                    Ok(WriteContext {
+                        space_id: r.get("space_id")?,
+                        space_config: r.get("space_config")?,
+                        thread_state: parse_enum(&r.get::<_, String>("thread_state")?),
+                        author_created_at: r.get("author_created_at")?,
+                        author_role: parse_enum(&r.get::<_, String>("author_role")?),
+                    })
+                },
+            )
+            .optional()
+            .map_err(backend)?
+            .ok_or(StoreError::NotFound)
+    }
+
+    async fn author_posted_recently(
+        &self,
+        author: UserId,
+        body_md: &str,
+        since: Timestamp,
+    ) -> StoreResult<bool> {
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                sql::AUTHOR_POSTED_RECENTLY,
+                rusqlite::params![author, body_md, since],
+                |r| r.get("found"),
+            )
+            .optional()
+            .map_err(backend)?;
+        Ok(found.is_some())
+    }
+
+    async fn post_for_review(&self, post: &PublicId) -> StoreResult<ReviewPost> {
+        self.conn
+            .query_row(sql::POST_FOR_REVIEW, [post.as_str()], |r| {
+                Ok(ReviewPost {
+                    id: r.get("id")?,
+                    public_id: parse_id(r, "public_id")?,
+                    thread_public_id: parse_id(r, "thread_public_id")?,
+                    thread_title: r.get("thread_title")?,
+                    space_id: r.get("space_id")?,
+                    space_name: r.get("space_name")?,
+                    space_config: r.get("space_config")?,
+                    author_id: r.get("author_id")?,
+                    author_name: r.get("author_name")?,
+                    author_created_at: r.get("author_created_at")?,
+                    body_md: r.get("body_md")?,
+                    created_at: r.get("created_at")?,
+                    state: parse_enum(&r.get::<_, String>("state")?),
+                })
+            })
+            .optional()
+            .map_err(backend)?
+            .ok_or(StoreError::NotFound)
+    }
+
+    async fn set_post_state(
+        &self,
+        post: &PublicId,
+        state: PostState,
+        _now: Timestamp,
+    ) -> StoreResult<()> {
+        let tx = self.conn.unchecked_transaction().map_err(backend)?;
+        let changed = tx
+            .execute(
+                sql::SET_POST_STATE,
+                rusqlite::params![post.as_str(), state.as_str()],
+            )
+            .map_err(backend)?;
+        if changed == 0 {
+            return Err(StoreError::NotFound);
+        }
+        tx.execute(sql::BUMP_THREAD_FOR_POST, [post.as_str()])
+            .map_err(backend)?;
+        tx.commit().map_err(backend)
+    }
+
+    async fn log_action(&self, a: &NewAction) -> StoreResult<i64> {
+        self.conn
+            .execute(
+                sql::INSERT_ACTION,
+                rusqlite::params![
+                    a.actor_kind.as_str(),
+                    a.actor_id,
+                    a.actor_name,
+                    a.target_kind,
+                    a.target_id,
+                    a.action,
+                    a.detail.to_string(),
+                    a.public as i64,
+                    a.created_at,
+                ],
+            )
+            .map_err(backend)?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    async fn open_review(&self, review: &NewReview) -> StoreResult<()> {
+        let (verdict, confidence, categories) = match &review.verdict {
+            Some(v) => (
+                Some(v.call.as_str()),
+                Some(v.confidence),
+                Some(serde_json::to_string(&v.categories).map_err(backend)?),
+            ),
+            None => (None, None, None),
+        };
+        self.conn
+            .execute(
+                sql::UPSERT_REVIEW,
+                rusqlite::params![
+                    review.post_id,
+                    review.space_id,
+                    review.reason.as_str(),
+                    verdict,
+                    confidence,
+                    categories,
+                    review.appeal_text,
+                    review.opened_at,
+                ],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn resolve_review(
+        &self,
+        id: i64,
+        resolution: Resolution,
+        by: UserId,
+        now: Timestamp,
+    ) -> StoreResult<Option<ReviewItem>> {
+        let tx = self.conn.unchecked_transaction().map_err(backend)?;
+        let item = tx
+            .query_row(sql::REVIEW_BY_ID, [id], review_from_row)
+            .optional()
+            .map_err(backend)?;
+        let Some(item) = item.filter(|i| !i.resolved) else {
+            return Ok(None);
+        };
+        let changed = tx
+            .execute(
+                sql::RESOLVE_REVIEW,
+                rusqlite::params![id, resolution.as_str(), by, now],
+            )
+            .map_err(backend)?;
+        tx.commit().map_err(backend)?;
+        Ok((changed > 0).then_some(item))
+    }
+
+    async fn open_reviews(&self, limit: u32) -> StoreResult<Vec<ReviewItem>> {
+        let mut stmt = self.conn.prepare_cached(sql::OPEN_REVIEWS).map_err(backend)?;
+        let rows = stmt
+            .query_map([limit], review_from_row)
+            .map_err(backend)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| corrupt("review row", e))?);
+        }
+        Ok(out)
+    }
+
+    async fn add_report(&self, sig: &NewSignal) -> StoreResult<ReportTally> {
+        let tx = self.conn.unchecked_transaction().map_err(backend)?;
+        let added = tx
+            .execute(
+                sql::INSERT_SIGNAL,
+                rusqlite::params![
+                    sig.post_id,
+                    sig.user_id,
+                    sig.kind,
+                    sig.weight,
+                    sig.reason,
+                    sig.created_at
+                ],
+            )
+            .map_err(backend)?
+            > 0;
+        let count: i64 = tx
+            .query_row(
+                sql::COUNT_SIGNALS,
+                rusqlite::params![sig.post_id, sig.kind],
+                |r| r.get("n"),
+            )
+            .map_err(backend)?;
+        tx.commit().map_err(backend)?;
+        Ok(ReportTally {
+            added,
+            count: count.max(0) as u32,
+        })
+    }
+
+    async fn pending_posts(&self, older_than: Timestamp, limit: u32) -> StoreResult<Vec<PublicId>> {
+        let mut stmt = self.conn.prepare_cached(sql::PENDING_POSTS).map_err(backend)?;
+        let rows = stmt
+            .query_map(rusqlite::params![older_than, limit], |r| {
+                parse_id(r, "public_id")
+            })
+            .map_err(backend)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| corrupt("pending post", e))?);
+        }
+        Ok(out)
+    }
+
+    async fn public_log(&self, limit: u32) -> StoreResult<Vec<LogEntry>> {
+        let mut stmt = self.conn.prepare_cached(sql::PUBLIC_LOG).map_err(backend)?;
+        let rows = stmt
+            .query_map([limit], |r| {
+                let target: Option<String> = r.get("target_public_id")?;
+                Ok(LogEntry {
+                    id: r.get("id")?,
+                    actor_kind: ActorKind::parse(&r.get::<_, String>("actor_kind")?),
+                    actor_name: r.get("actor_name")?,
+                    target_kind: r.get("target_kind")?,
+                    target_public_id: target.and_then(|t| PublicId::parse(&t).ok()),
+                    action: r.get("action")?,
+                    created_at: r.get("created_at")?,
+                })
+            })
+            .map_err(backend)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| corrupt("log row", e))?);
+        }
+        Ok(out)
+    }
+
+    async fn agreement(&self, space: SpaceId) -> StoreResult<AgreementStats> {
+        self.conn
+            .query_row(sql::AGREEMENT, [space], |r| {
+                // SUM over no rows is NULL.
+                let agreed: Option<i64> = r.get("agreed")?;
+                let disagreed: Option<i64> = r.get("disagreed")?;
+                Ok(AgreementStats {
+                    agreed: agreed.unwrap_or(0).max(0) as u32,
+                    disagreed: disagreed.unwrap_or(0).max(0) as u32,
+                })
+            })
+            .map_err(backend)
+    }
+}
+
+fn parse_id(r: &Row<'_>, col: &str) -> rusqlite::Result<PublicId> {
+    PublicId::parse(&r.get::<_, String>(col)?)
+        .map_err(|e| rusqlite::Error::InvalidColumnName(format!("{col}: {e}")))
+}
+
+/// One row of `sql::OPEN_REVIEWS` / `sql::REVIEW_BY_ID`.
+fn review_from_row(r: &Row<'_>) -> rusqlite::Result<ReviewItem> {
+    let categories: Option<String> = r.get("model_categories")?;
+    let categories = categories
+        .and_then(|c| serde_json::from_str::<Vec<String>>(&c).ok())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|c| Category::parse(c))
+        .collect();
+    let verdict: Option<String> = r.get("model_verdict")?;
+    Ok(ReviewItem {
+        id: r.get("id")?,
+        post_id: r.get("post_id")?,
+        post_public_id: parse_id(r, "post_public_id")?,
+        thread_public_id: parse_id(r, "thread_public_id")?,
+        thread_title: r.get("thread_title")?,
+        space_id: r.get("space_id")?,
+        space_name: r.get("space_name")?,
+        author_id: r.get("author_id")?,
+        author_name: r.get("author_name")?,
+        body_html: r.get("body_html")?,
+        post_state: parse_enum(&r.get::<_, String>("post_state")?),
+        reason: ReviewReason::parse(&r.get::<_, String>("reason")?),
+        model_verdict: verdict.as_deref().and_then(Call::parse),
+        model_confidence: r.get("model_confidence")?,
+        model_categories: categories,
+        appeal_text: r.get("appeal_text")?,
+        opened_at: r.get("opened_at")?,
+        resolved: r.get::<_, String>("state")? == "resolved",
+    })
 }

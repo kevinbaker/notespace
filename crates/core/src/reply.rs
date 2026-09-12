@@ -1,8 +1,11 @@
 //! Posting a reply. Ordering is the security property, so it lives here rather than a handler:
-//! validate, then rate limit, then insert — each step before the one it protects.
+//! validate, then rate limit, then triage, then insert — each step before the one it protects.
 
 use crate::id::PublicId;
-use crate::model::{NewPost, Post, SanitizedHtml, Timestamp, UserId};
+use crate::model::{NewPost, Post, PostState, SanitizedHtml, ThreadState, Timestamp, UserId};
+use crate::moderation::heuristics::{self, Refusal, Signals, Triage};
+use crate::moderation::pipeline::{self, ModerationQueue};
+use crate::moderation::policy::ModerationPolicy;
 use crate::ratelimit::{AttemptKeys, Limit};
 use crate::store::{Store, StoreError, StoreResult};
 
@@ -49,10 +52,17 @@ pub enum Rejected {
     NotFound,
     /// Lost the ordinal race [`MAX_PATH_RETRIES`] times running.
     Contended,
+    /// The thread is locked.
+    Locked,
+    /// The author posted this exact body a moment ago.
+    Duplicate,
 }
 
 pub enum Outcome {
     Posted(Box<Post>),
+    /// Written as `pending` and handed to the moderation pipeline. The post exists and has a
+    /// permalink; it renders as awaiting review until the pipeline decides.
+    Held(Box<Post>),
     Rejected(Rejected),
     RateLimited { retry_after_secs: i64 },
 }
@@ -72,10 +82,16 @@ pub fn check_body(body_md: &str) -> Result<(), Rejected> {
     Ok(())
 }
 
-/// **Budget: 2-6 statements.** A rate-limited attempt costs one and no write.
+/// **Budget: 4-9 statements.** A rate-limited attempt costs one and no write; a held post costs
+/// one more than a published one, for the log row.
 ///
 /// Supply [`MAX_PATH_RETRIES`] + 1 ids: a retry needs a fresh one.
-pub async fn post<S: Store>(store: &S, cfg: &ReplyConfig, r: Reply<'_>) -> StoreResult<Outcome> {
+pub async fn post<S: Store, Q: ModerationQueue>(
+    store: &S,
+    queue: &Q,
+    cfg: &ReplyConfig,
+    r: Reply<'_>,
+) -> StoreResult<Outcome> {
     if let Err(why) = check_body(r.body_md) {
         return Ok(Outcome::Rejected(why));
     }
@@ -97,6 +113,42 @@ pub async fn post<S: Store>(store: &S, cfg: &ReplyConfig, r: Reply<'_>) -> Store
         });
     }
 
+    // Tier 0. Cheap, and before the write so a refused post is never written.
+    let ctx = match store.write_context(&r.thread, r.author).await {
+        Ok(ctx) => ctx,
+        Err(StoreError::NotFound) => return Ok(Outcome::Rejected(Rejected::NotFound)),
+        Err(e) => return Err(e),
+    };
+    if ctx.thread_state == ThreadState::Locked {
+        return Ok(Outcome::Rejected(Rejected::Locked));
+    }
+    let policy = ModerationPolicy::from_config(&ctx.space_config);
+    let is_duplicate = policy.duplicate_window_ms() > 0
+        && store
+            .author_posted_recently(r.author, r.body_md, r.now - policy.duplicate_window_ms())
+            .await?;
+    let reasons = match heuristics::triage(
+        &policy,
+        &Signals {
+            body_md: r.body_md,
+            author_created_at: ctx.author_created_at,
+            author_role: ctx.author_role,
+            is_duplicate,
+            now: r.now,
+        },
+    ) {
+        Triage::Refuse(Refusal::Duplicate) => {
+            return Ok(Outcome::Rejected(Rejected::Duplicate));
+        }
+        Triage::Publish => Vec::new(),
+        Triage::Hold(reasons) => reasons,
+    };
+    let state = if reasons.is_empty() {
+        PostState::Visible
+    } else {
+        PostState::Pending
+    };
+
     // Only a collision is retried; every other error is returned as itself.
     let mut last = Rejected::Contended;
     for public_id in r.ids.iter().take(MAX_PATH_RETRIES as usize + 1) {
@@ -108,6 +160,7 @@ pub async fn post<S: Store>(store: &S, cfg: &ReplyConfig, r: Reply<'_>) -> Store
             body_md: r.body_md.to_string(),
             body_html: r.body_html.clone(),
             created_at: r.now,
+            state,
         };
         match store.insert_post(&new).await {
             Ok(post) => {
@@ -117,6 +170,11 @@ pub async fn post<S: Store>(store: &S, cfg: &ReplyConfig, r: Reply<'_>) -> Store
                 }
                 if let Some(next) = client.next() {
                     store.record_login_attempt(&keys.client, next).await?;
+                }
+                if state == PostState::Pending {
+                    // The enqueue result is not this function's to report; the sweep covers it.
+                    let _ = pipeline::hold(store, queue, &post, &reasons, r.now).await?;
+                    return Ok(Outcome::Held(Box::new(post)));
                 }
                 return Ok(Outcome::Posted(Box::new(post)));
             }

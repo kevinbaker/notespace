@@ -8,6 +8,7 @@ license.workspace = true
 notespace-core = { path = "../core", features = ["password"] }
 async-trait = "0.1"
 rusqlite = { version = "0.37", features = ["bundled"] }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 notespace-render = { path = "../render" }

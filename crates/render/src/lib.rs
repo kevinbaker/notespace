@@ -4,6 +4,7 @@
 pub mod auth;
 pub mod index;
 pub mod markdown;
+pub mod moderation;
 pub mod page;
 
 pub use markdown::{markdown_to_html, sanitize};

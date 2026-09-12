@@ -512,3 +512,256 @@ Wrangler runs `[build]` through `/bin/sh`, which does not source a shell profile
 Cloudflare's own build environment (Workers Builds, the dashboard's Git integration) ships Node
 but not rustup, cargo or worker-build, so a dashboard-driven build fails and the Worker keeps
 serving whatever it had. Deploy from a developer machine or from CI that installs Rust.
+
+---
+
+## `crates/core/src/moderation/`
+
+**Why the pipeline came before ranking and search (M3).** The write path existed and every
+reply was publishing unconditionally, which for a project whose pitch is moderation meant the
+first spammer would have had the run of the place. Ranking can wait; an unmoderated write path
+cannot.
+
+**The neuron budget decided the shape.** Workers AI pricing (September 2026): Llama 3.1 8B is
+25.6 neurons per thousand input tokens, Llama Guard 3 8B is 44. A classification of a typical
+post is ~600 tokens in and ~60 out -- ~20 neurons -- so the free 10,000 a day is **about 500
+classifications**, and a 70B model is out of the question. That makes Tier 0 the design rather
+than a preamble to it: the model is consulted only about posts the heuristics held, and the
+heuristics have to hold few enough that the budget lasts a day. New-account age and a link cap
+are the two that matter; blocklist and manipulation markers are cheap extras.
+
+**Reports are a Signal, the queue is a table, the log is append-only.** Three of the eight
+primitives, straight from DESIGN.md §2. `signal` has a `UNIQUE(post_id, user_id, kind)` index,
+which is what makes reporting idempotent -- the second click is a no-op rather than a second
+report. `review_item` is one row per post with an upsert on `post_id`, so a post held, hidden,
+appealed and reported is one item with several reasons rather than four items to de-duplicate.
+`action_log` is never updated; a reversal is a new row, and the public view is a query.
+
+**Per-space policy is JSON in `space.config`, not columns.** A preset is a config bundle; a
+preset that needed a column would be a hole in the primitive model. `ModerationPolicy` is
+`#[serde(default)]` so every field is optional, unknown fields are ignored, and a broken config
+falls back to the defaults rather than taking the space offline.
+
+**The database is the source of truth; the Queue is an accelerator.** A pending post with no
+open review item is work wherever the message went, and a cron sweep every five minutes picks
+up whatever the queue did not deliver. This is what lets the same `core` code run on a native
+binary that has no queue at all, and it is why the Queue binding is optional in the Worker. The
+sweep excludes posts with an open review item so a post is classified at most once by
+automation: a classifier failure hands the post to a human rather than retrying on every pass
+and burning the budget on a model that is down.
+
+**A verdict is logged before it is acted on.** A crash between the two leaves a verdict without
+an action, which a human can see and finish; the other order leaves an action nobody can
+explain.
+
+### The live evaluation, and the two rules it forced
+
+`crates/core/tests/live_classifier.rs` runs the prompt over a labelled corpus against a real
+model. It is `#[ignore]` because it costs money, but it was run against Llama 3.1 8B while the
+prompt was written, three times, and it changed the design twice:
+
+- **Run 1** (prompt `2026-09-01`): every bad post caught at confidence 1.0, both prompt-injection
+  cases flagged, every answer parsed. And five of six *clean* posts flagged as `off_topic`, two of
+  them at confidence 1.0 -- which the policy as then written would have **hidden**. The model had
+  read the space rules ("Technical discussion about forum software") as an allowlist and found a
+  post about D1 bindings off topic for it.
+- **Rule 1, structural:** a flag hides only for a *severe* category. `off_topic` and `other` can
+  hold a post for a human at any confidence; they cannot remove it. This is `Category::is_severe`
+  and `ModerationPolicy::decide`, pinned by `a_flag_with_only_mild_categories_holds_but_never_hides`.
+  It does not depend on the model behaving.
+- **Run 2** (prompt `2026-09-02`, off-topic softened to "a weak signal"): zero harmful
+  dispositions, but the model still flagged all six clean posts off-topic. Softening was not
+  enough; the model needed the rule stated as a rule.
+- **Run 3** (prompt `2026-09-03`, "topicality is NOT a violation and never makes the decision
+  flag"): 13 of 14 obvious cases right, zero harmful dispositions. The one miss is a clean post
+  flagged off-topic at 1.0, which under Rule 1 is a hold for a human, not a removal.
+
+The eval scores two things separately and asserts on them separately. *Harmful dispositions* --
+a clean post the policy would hide, a bad post it would publish -- must be zero. *Call accuracy*
+has a floor of seven in ten, because the model is a triage step and a miss there costs a
+moderator a look, not a user a post. Scoring on the model's word alone would have hidden the
+difference between "wrong but safe" and "wrong and damaging", and that difference is the whole
+design.
+
+Llama Guard is offered but not the default: its taxonomy is LLM safety (specialised advice,
+intellectual property, code interpreter abuse) and it cannot see spam or harassment, which is
+most of a forum's work. It also gives no confidence, so it is assigned one below the hide
+threshold and can only ever hold.
+
+### Three layers against text addressed to the model
+
+The classifier reads user-generated text, so the text can try to talk to it. Tier 0 holds
+anything matching `MANIPULATION_MARKERS` on sight (`ignore previous instructions`, forged
+`</post>` tags, JSON aimed at the parser). The prompt fences the body in `<post>` tags with any
+embedded closing tag defanged, and tells the model the content is data. And a verdict carrying
+`manipulation` can never publish, however confident. The first two are heuristics and a model
+following instructions; the third is the one that holds when they do not. Run 1 showed the model
+does not always name `manipulation` even when it catches the injection (the fake-close case came
+back as `spam` only) -- which is why Tier 0 has to catch it too, and does, pinned by
+`tier_zero_holds_every_injection_case_in_the_corpus`.
+
+### Metamoderation as threshold adjustment, not a separate system
+
+Slashdot's insight, applied to the model: humans rate its calls, the ratings tune how far it is
+trusted. Here that is one aggregate query over resolved review items (`clean`/approve and
+`flag`/reject agree; the other diagonal disagrees; `unsure` is neither) and a pure function that
+moves the thresholds. Disagreement tightens after ten items; agreement loosens after thirty, and
+loosens less, because loosening is the direction that publishes bad posts. The hide threshold
+never loosens. The adjustment happens at decision time from the current statistics, so there is
+no tuning job to run or forget. `prompt_version` travels with every verdict so the statistics
+can be read per prompt when the prompt changes.
+
+### Real Hacker News comments, and what they did to the prompt
+
+The labelled corpus is sixteen sentences somebody wrote to be classified. `examples/hn_moderate.rs`
+runs the same two tiers over a seeded sample of the 51,000 HN comments the importer fetched --
+prose nobody wrote as a test case -- through OpenRouter, where the same 8B model costs $0.05 per
+million tokens and a 30-comment run is a fraction of a cent. Same 30 comments, seed 3, throughout:
+
+| prompt | stack | publish | hold | hide |
+|---|---|---|---|---|
+| `2026-09-03` | Llama 3.1 8B | 20 | 10 | 0 |
+| `2026-09-03` | gpt-4o-mini | 22 | 8 | 0 |
+| `2026-09-04` | Llama 3.1 8B | 15 | 15 | 0 |
+| `2026-09-05` | Llama 3.1 8B | 21 | 8 | **1** |
+| `2026-09-05` | Guard 4 + Llama 3.1 8B | 19 | 10 | **1** |
+| `2026-09-05` | gpt-4o-mini | 28 | 2 | 0 |
+| `2026-09-05` | Guard 4 + gpt-4o-mini | 27 | 3 | 0 |
+
+All thirty are fine comments; the right column is the one that matters, and the middle one is
+moderator time.
+
+**Prompt `2026-09-04` made things worse, instructively.** The 8B model was labelling comments
+that *discussed* prompts, or quoted another comment with `>`, as `manipulation`. The fix seemed
+obvious: tell it that discussing AI, quoting and sarcasm are not manipulation. The hold rate
+went from 10 to 15, because the model now labelled every quoting or sarcastic comment
+`manipulation` and explained, in its rationale, that "the mention of 'manipulation' is because
+the post quotes another comment". A negated instruction is an instruction to a small model.
+`2026-09-05` replaced the list of non-examples with one positive definition -- an instruction
+aimed at the moderation system itself -- and the clean side cleared. The same revision told the
+model that most posts are fine and `unsure` is for a listed violation it cannot decide, which is
+what moved gpt-4o-mini from 8 holds to 2: it had been taking "prefer unsure" literally.
+
+**The one false hide** is the 8B model reading a quoted personal attack, posted by the person
+complaining about it, as the poster's own words, and flagging `harassment` at 0.9. `harassment`
+is not in Llama Guard's taxonomy, so the layer below cannot veto it; only a better back model
+does. gpt-4o-mini flagged the same comment at 0.8, a hold. This is the reason the README
+recommends the Guard + gpt-4o-mini stack over the free default when a key is available.
+
+### Layers: what a Guard in front is for, and what it is not
+
+`layers::Layered` runs a safety classifier and an instruct model on every post and combines the
+verdicts by a pure rule (`combine`), which is where the trust arithmetic lives and is tested:
+
+- Two flags corroborate: confidence is the noisy-or, categories the union. This is what lets a
+  flag reach the hide bar -- neither an 8B instruct model at 0.8 nor Guard at its fixed 0.85
+  gets there alone, both together do (0.97).
+- A flag one layer made and the other contradicted is scaled by 0.8, below the hide bar. On the
+  HN sample this turned the 8B model's `hate`/`violence` flags on political comments from 0.8
+  to 0.64 -- holds either way, but a Guard that disagrees now shows in the rationale.
+- A Guard's `safe` is a veto on hiding for the categories it is trained on, and for nothing
+  else. Spam and harassment are not in its taxonomy; its `safe` says nothing about them.
+- A Guard that flags on its own also scales down: Guard 4 called a comment *about* a data
+  breach `doxxing` (S7) and a political comment `harassment` (S5, defamation). Both held for a
+  human at 0.68 rather than hiding.
+
+The Guard is a frontend, not a gate. Skipping the instruct model when the Guard says safe would
+save a call and let every spammer through, since spam is the thing a safety model cannot see.
+
+### What the Anthropic provider defaults to
+
+`claude-opus-5`, configurable with `MOD_MODEL`. A cheaper model is the operator's call; the
+default should be the one that does not need apologising for. The request uses structured
+output (`output_config.format`) rather than asking nicely for JSON, and a `refusal` stop reason
+is read as `unsure`, not as an error -- the model declined to look, so a human should.
+
+### Bundle size
+
+The moderation slice adds ~150 KB gzipped to the Worker (598 KB → ~750 KB on this machine). The
+README's 149 KB figure was the M0 read-path-only measurement and has been stale since the auth
+work; both numbers are now recorded where they are measured. 746 KB is a quarter of the 3 MB
+limit; the growth is worth watching but not yet worth acting on.
+
+---
+
+## `crates/hn-import` and `scripts/hn-fetch.mjs`
+
+Two stages with a file between them, rather than one program that downloads and inserts. The
+NDJSON mirrors HN's own shape and holds no notespace decisions at all, so re-deciding one — how
+deep to nest, which space a Show HN lands in, whether `*` is escaped — costs a re-import and not
+a re-download. At 2.5 requests/second that difference is fifteen minutes each time.
+
+BigQuery was the obvious source and turned out to be the wrong default. `bigquery-public-data.
+hacker_news.full` needs the `bq` CLI, a Google account and a billing-enabled project — queries
+against public datasets bill the *querying* project — and the public copy stopped updating in
+2022, so a window ending "now" returns nothing at all. It also lacks the `top_level_parent`
+column the older `comments` table had, so comment trees have to be rebuilt from `parent` locally
+and replies whose parent falls outside the window are lost. Algolia's HN API needs no
+credentials, is current, and returns a whole comment tree in one request. Both are implemented;
+Algolia is the default.
+
+Algolia answers **403** when you exceed its rate limit, not 429. The first attempt at this
+treated anything under 500 as permanent and burned through 1,900 stories in a few seconds
+without fetching one of them. The retry set now includes 403, and pacing is enforced up front
+rather than discovered by being cut off.
+
+Its search endpoint caps any one query at 1,000 hits, so the window is walked backwards by
+timestamp rather than paged. The cursor has to be *inclusive* of the oldest hit seen — two
+stories can share a second, and an exclusive cursor silently drops the second one.
+
+### Fidelity, and where it stops
+
+Comment bodies go through `notespace_render::markdown_to_html`, for the reason the seed crate
+does: `body_html` measured against hand-written HTML measures nothing.
+
+Getting there means HN's HTML becomes markdown first, and that conversion has one real decision
+in it. HN renders `*` and `[` literally; CommonMark does not. Escaping them keeps a comment
+looking like the comment. `_` is deliberately *not* escaped — CommonMark already ignores
+intraword underscores, and escaping it puts a backslash in the middle of every `snake_case`
+identifier in a corpus full of them. A leading `>` is deliberately not escaped either, which is
+the one place fidelity is knowingly traded: HN shows the character, we render a blockquote,
+because that is what the author meant and what a notespace user would have typed.
+
+### Identity
+
+Imported threads and posts take explicit ids from 1,000,000 up. That is what makes `--reset` a
+range delete scoped to this import, which is what makes a re-import idempotent without touching
+the spike seed or a real account.
+
+Users cannot work that way: `user.name` is UNIQUE, so an id chosen here collides with whatever
+already holds the name. They are inserted `ON CONFLICT(name) DO NOTHING` and referenced through
+a subquery on the name index instead — one extra indexed lookup per row, on a one-off import,
+in exchange for composing with any existing database.
+
+HN's name rules are looser than notespace's, so some names must be rewritten, and a rewrite can
+collide. Two distinct HN accounts folding into one notespace user would misattribute posts, so
+collisions get a numeric suffix rather than being allowed to merge. `hn-anon` is claimed up
+front for `[dead]` and `[deleted]` comments, which HN returns with no author — a real account of
+that name gets the suffix instead.
+
+Dead and deleted comments are kept as tombstones rather than skipped. Skipping them would
+orphan every reply beneath them.
+
+### Nesting
+
+`post.path` allows 32 levels and HN allows fewer, so the clamp never fires on real data. It is
+there anyway because `--max-depth 4` is how you generate a shallow corpus to measure render cost
+against nesting, and because "deeper than allowed" must not mean "dropped": a dropped comment
+takes its whole subtree with it. It attaches to the deepest ancestor that fits.
+
+### Two things real data had that invented data did not
+
+A comment can arrive twice. HN merges threads, and the merged comments come back under both
+stories — once in 51,439 across a 7-day window, which is exactly often enough to abort an import
+on `post.public_id` and exactly rare enough that no fixture would have contained it. Items are
+therefore deduplicated by HN id across the whole import rather than per story. The second copy is
+dropped with its subtree, which is the same subtree.
+
+For the same reason a post can be older than the thread it sits in: the merged comment above was
+from eight months before the story that now holds it. That is not corruption and is not
+corrected — the comment really does live there now.
+
+The `&`-lookahead in `decode_entities` scanned a fixed *byte* window for the closing `;` and
+sliced it, which panics the first time a smart quote or an em dash falls inside it. Every slice
+there now lands on `&` or `;`, both ASCII, however many multi-byte characters lie between. The
+regression test is a sentence with curly quotes in it.

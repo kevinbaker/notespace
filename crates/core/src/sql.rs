@@ -88,11 +88,11 @@ SELECT id, path, depth FROM post WHERE public_id = ?1 AND thread_id = ?2";
 /// A `UNIQUE(thread_id, path)` violation here means the caller lost a path race.
 ///
 /// Binds: `?1` public_id, `?2` thread_id, `?3` parent_id, `?4` path, `?5` depth, `?6` author_id,
-/// `?7` body_md, `?8` body_html, `?9` created_at.
+/// `?7` body_md, `?8` body_html, `?9` created_at, `?10` state.
 pub const INSERT_POST: &str = "\
 INSERT INTO post (public_id, thread_id, parent_id, path, depth, author_id, body_md, body_html, \
 created_at, score, state) \
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, 'visible')";
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)";
 
 /// Runs in the same batch as the insert.
 ///
@@ -115,7 +115,7 @@ VALUES (?1, ?2, ?3, ?4, ?5)";
 /// Binds: `?1` token_hash, `?2` now (unix ms).
 pub const LOOKUP_SESSION: &str = "\
 SELECT s.token_hash, s.user_id, s.created_at, s.refreshed_at, s.expires_at, \
-u.name AS user_name, u.state AS user_state \
+u.name AS user_name, u.state AS user_state, u.role AS user_role \
 FROM session s JOIN user u ON u.id = s.user_id \
 WHERE s.token_hash = ?1 AND s.expires_at > ?2";
 
@@ -158,7 +158,7 @@ pub const SWEEP_LOGIN_ATTEMPTS: &str = "DELETE FROM login_attempt WHERE window_s
 ///
 /// Binds: `?1` username.
 pub const USER_BY_NAME: &str = "\
-SELECT id, name, state, password_hash FROM user WHERE name = ?1";
+SELECT id, name, state, role, password_hash FROM user WHERE name = ?1";
 
 /// Binds: `?1` name, `?2` created_at, `?3` password_hash (NULL for external auth).
 pub const INSERT_USER: &str = "\
@@ -166,3 +166,153 @@ INSERT INTO user (name, created_at, password_hash, state) VALUES (?1, ?2, ?3, 'a
 
 /// Binds: `?1` user id, `?2` password_hash.
 pub const SET_PASSWORD_HASH: &str = "UPDATE user SET password_hash = ?2 WHERE id = ?1";
+
+// ---------------------------------------------------------------------------
+// Moderation
+// ---------------------------------------------------------------------------
+
+/// The thread's space and the author, in one statement; the two are unrelated, so it is a cross
+/// join of two single rows.
+///
+/// Binds: `?1` = thread public id, `?2` = author user id.
+pub const WRITE_CONTEXT: &str = "\
+SELECT s.id AS space_id, s.config AS space_config, t.state AS thread_state, \
+u.created_at AS author_created_at, u.role AS author_role \
+FROM thread t JOIN space s ON s.id = t.space_id, user u \
+WHERE t.public_id = ?1 AND u.id = ?2";
+
+/// Served by `idx_post_author`, so it reads the author's recent posts and nothing else.
+///
+/// Binds: `?1` = author id, `?2` = body_md, `?3` = since (unix ms).
+pub const AUTHOR_POSTED_RECENTLY: &str = "\
+SELECT 1 AS found FROM post \
+WHERE author_id = ?1 AND created_at >= ?3 AND body_md = ?2 \
+LIMIT 1";
+
+/// Binds: `?1` = post public id.
+pub const POST_FOR_REVIEW: &str = "\
+SELECT p.id, p.public_id, t.public_id AS thread_public_id, t.title AS thread_title, \
+s.id AS space_id, s.name AS space_name, s.config AS space_config, \
+p.author_id, u.name AS author_name, u.created_at AS author_created_at, \
+p.body_md, p.created_at, p.state \
+FROM post p \
+JOIN thread t ON t.id = p.thread_id \
+JOIN space s ON s.id = t.space_id \
+JOIN user u ON u.id = p.author_id \
+WHERE p.public_id = ?1";
+
+/// Binds: `?1` = post public id, `?2` = new state.
+pub const SET_POST_STATE: &str = "UPDATE post SET state = ?2 WHERE public_id = ?1";
+
+/// Runs in the same batch as `SET_POST_STATE`, so the baked page turns over with the state.
+///
+/// Binds: `?1` = post public id.
+pub const BUMP_THREAD_FOR_POST: &str = "\
+UPDATE thread SET cache_version = cache_version + 1 \
+WHERE id = (SELECT thread_id FROM post WHERE public_id = ?1)";
+
+/// Binds: `?1` actor_kind, `?2` actor_id, `?3` actor_name, `?4` target_kind, `?5` target_id,
+/// `?6` action, `?7` detail (JSON), `?8` public (0/1), `?9` created_at.
+pub const INSERT_ACTION: &str = "\
+INSERT INTO action_log (actor_kind, actor_id, actor_name, target_kind, target_id, action, \
+detail, public, created_at) \
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
+
+/// One row per post: a second opening reopens and updates. Model fields keep their old value
+/// when the new opening has none (an appeal does not erase the verdict it appeals).
+///
+/// Binds: `?1` post_id, `?2` space_id, `?3` reason, `?4` model_verdict, `?5` model_confidence,
+/// `?6` model_categories (JSON), `?7` appeal_text, `?8` opened_at.
+pub const UPSERT_REVIEW: &str = "\
+INSERT INTO review_item (post_id, space_id, reason, model_verdict, model_confidence, \
+model_categories, appeal_text, opened_at, state, resolution, resolved_by, resolved_at) \
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open', NULL, NULL, NULL) \
+ON CONFLICT(post_id) DO UPDATE SET \
+reason = excluded.reason, \
+model_verdict = COALESCE(excluded.model_verdict, review_item.model_verdict), \
+model_confidence = COALESCE(excluded.model_confidence, review_item.model_confidence), \
+model_categories = COALESCE(excluded.model_categories, review_item.model_categories), \
+appeal_text = COALESCE(excluded.appeal_text, review_item.appeal_text), \
+opened_at = excluded.opened_at, state = 'open', resolution = NULL, resolved_by = NULL, \
+resolved_at = NULL";
+
+/// The select list shared by the queue listing and the single-item lookup, written once so the
+/// two cannot drift and both adapters decode one row shape.
+macro_rules! review_select {
+    ($tail:literal) => {
+        concat!(
+            "SELECT r.id, r.post_id, p.public_id AS post_public_id, ",
+            "t.public_id AS thread_public_id, t.title AS thread_title, r.space_id, ",
+            "s.name AS space_name, p.author_id, u.name AS author_name, p.body_html, ",
+            "p.state AS post_state, r.reason, r.model_verdict, r.model_confidence, ",
+            "r.model_categories, r.appeal_text, r.opened_at, r.state ",
+            "FROM review_item r ",
+            "JOIN post p ON p.id = r.post_id ",
+            "JOIN thread t ON t.id = p.thread_id ",
+            "JOIN space s ON s.id = r.space_id ",
+            "JOIN user u ON u.id = p.author_id ",
+            $tail
+        )
+    };
+}
+
+/// Oldest first. Binds: `?1` = limit.
+pub const OPEN_REVIEWS: &str =
+    review_select!("WHERE r.state = 'open' ORDER BY r.opened_at, r.id LIMIT ?1");
+
+/// Binds: `?1` = review id.
+pub const REVIEW_BY_ID: &str = review_select!("WHERE r.id = ?1");
+
+/// Conditional on `open`, so the second of two simultaneous resolutions changes nothing.
+///
+/// Binds: `?1` id, `?2` resolution, `?3` resolved_by, `?4` resolved_at.
+pub const RESOLVE_REVIEW: &str = "\
+UPDATE review_item SET state = 'resolved', resolution = ?2, resolved_by = ?3, resolved_at = ?4 \
+WHERE id = ?1 AND state = 'open'";
+
+/// `OR IGNORE` against `idx_signal_once`: a repeat report is a no-op, and `changes` says which.
+///
+/// Binds: `?1` post_id, `?2` user_id, `?3` kind, `?4` weight, `?5` reason, `?6` created_at.
+pub const INSERT_SIGNAL: &str = "\
+INSERT OR IGNORE INTO signal (post_id, user_id, kind, weight, reason, created_at) \
+VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
+
+/// Binds: `?1` post_id, `?2` kind.
+pub const COUNT_SIGNALS: &str = "\
+SELECT COUNT(*) AS n FROM signal WHERE post_id = ?1 AND kind = ?2";
+
+/// Range scan over `idx_post_state_time`. A post already waiting on a human is excluded, so the
+/// sweep classifies each post at most once rather than paying for a model call on every pass.
+///
+/// Binds: `?1` = older than (unix ms), `?2` = limit.
+pub const PENDING_POSTS: &str = "\
+SELECT p.public_id FROM post p \
+WHERE p.state = 'pending' AND p.created_at < ?1 \
+AND NOT EXISTS (SELECT 1 FROM review_item r WHERE r.post_id = p.id AND r.state = 'open') \
+ORDER BY p.created_at LIMIT ?2";
+
+/// Newest first, with the target's public id resolved so the page can link to it. `detail` is
+/// deliberately not selected.
+///
+/// Binds: `?1` = limit.
+pub const PUBLIC_LOG: &str = "\
+SELECT a.id, a.actor_kind, a.actor_name, a.target_kind, a.target_id, a.action, a.created_at, \
+CASE a.target_kind \
+WHEN 'post' THEN (SELECT public_id FROM post WHERE id = a.target_id) \
+WHEN 'thread' THEN (SELECT public_id FROM thread WHERE id = a.target_id) \
+END AS target_public_id \
+FROM action_log a WHERE a.public = 1 \
+ORDER BY a.created_at DESC, a.id DESC LIMIT ?1";
+
+/// Agreement is `clean`/`approve` or `flag`/`reject`; disagreement is the other diagonal.
+/// `unsure` is neither. `SUM` over no rows is NULL, which adapters read as zero.
+///
+/// Binds: `?1` = space id.
+pub const AGREEMENT: &str = "\
+SELECT \
+SUM(CASE WHEN (model_verdict = 'clean' AND resolution = 'approve') \
+OR (model_verdict = 'flag' AND resolution = 'reject') THEN 1 ELSE 0 END) AS agreed, \
+SUM(CASE WHEN (model_verdict = 'clean' AND resolution = 'reject') \
+OR (model_verdict = 'flag' AND resolution = 'approve') THEN 1 ELSE 0 END) AS disagreed \
+FROM review_item \
+WHERE space_id = ?1 AND state = 'resolved' AND model_verdict IS NOT NULL";
