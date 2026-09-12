@@ -71,6 +71,15 @@ max_batch_size = 10
 max_batch_timeout = 5
 max_retries = 3
 
+# Cloudflare Email Service, for verification and password-reset mail. `name` must match
+# EMAIL_BINDING in crates/worker/src/mail.rs. No key: the binding carries the authority. The
+# sending domain in EMAIL_FROM has to be onboarded once, `wrangler email sending enable <domain>`
+# (or Compute & AI > Email Service in the dashboard), which adds its SPF and DKIM records. Until
+# then every send is refused with E_SENDER_NOT_VERIFIED, logged, and the flow carries on.
+# Under `wrangler dev` add `remote = true` here to send real mail; otherwise sends are no-ops.
+[[send_email]]
+name = "EMAIL"
+
 # The sweep: classifies anything still pending that the queue did not deliver. Every five
 # minutes, SWEEP_LIMIT posts per run. It only ever spends on posts the queue missed, so its
 # cost is bounded by held-post volume, not by the cadence; the cadence bounds how long a held
@@ -91,12 +100,35 @@ MOD_PROVIDER = "workers_ai"
 # role in the database. The bootstrap path for the first admin.
 MODERATORS = ""
 
-# Outbound mail, through Resend (https://resend.com): address verification, password reset,
-# and the "your password changed" notice. Needs `wrangler secret put RESEND_API_KEY` AND a sender
-# on a domain verified in the Resend dashboard; with either missing, mail is off -- accounts
-# still work, addresses stay unconfirmed, and /forgot accepts requests it cannot fulfil (logged).
-# The free plan allows 100 mails a day and 3,000 a month, which a small forum stays under.
+# Outbound mail: address verification, password reset, and the "your password changed" notice.
+# MAIL_PROVIDER picks the transport; every one needs EMAIL_FROM on a domain that provider has
+# verified. With anything missing, mail is off -- accounts still work, addresses stay
+# unconfirmed, and /forgot accepts requests it cannot fulfil (logged).
+#
+#   cloudflare      the [[send_email]] binding above. No key. The default when the binding
+#                   exists. Email Service is in open beta; check the account's quota with
+#                   `wrangler email sending list`.
+#   cloudflare_api  the same service over REST, for an account other than this Worker's:
+#                   `wrangler secret put MAIL_API_KEY` (a token with Email Sending permission)
+#                   and CF_ACCOUNT_ID below.
+#   resend          https://resend.com -- free 100/day, 3,000/month. MAIL_API_KEY (or the older
+#                   RESEND_API_KEY).
+#   postmark        https://postmarkapp.com -- free 100/month. MAIL_API_KEY is the server token;
+#                   POSTMARK_STREAM optionally names a stream.
+#   sendgrid        https://sendgrid.com -- MAIL_API_KEY.
+#   mailgun         https://mailgun.com -- MAIL_API_KEY; MAILGUN_DOMAIN defaults to EMAIL_FROM's
+#                   domain; MAILGUN_REGION = "eu" for an EU account.
+#   brevo           https://brevo.com -- free 300/day. MAIL_API_KEY.
+#   off             nothing, whatever else is configured.
+#
+# Empty falls back to `cloudflare` when the binding exists, then `resend` when RESEND_API_KEY
+# is set, then off. Provider-specific vars are only read by their provider.
+MAIL_PROVIDER = ""
 EMAIL_FROM = ""
+CF_ACCOUNT_ID = ""
+MAILGUN_DOMAIN = ""
+MAILGUN_REGION = ""
+POSTMARK_STREAM = ""
 # Names the site in mail subjects and bodies.
 SITE_NAME = "notespace"
 # "true" makes an address mandatory at signup. Only sensible once mail is configured.

@@ -448,15 +448,29 @@ avoid spending an Argon2 hash on a doomed insert. Neither adapter mapped a dupli
 Signup logs you in. The rejected name is echoed back into the form; the password never is,
 because re-rendering it puts it in the page and from there into anything that caches it.
 
-## `crates/core/src/email.rs`, `account.rs`, and Resend
+## `crates/core/src/email/`, `account.rs`, and the mail providers
 
-**Resend, because a Worker has no SMTP.** Outbound mail from a Worker is an HTTP call to
-somebody's API, so the choice is which API. Resend's is one JSON POST with a bearer token, its
-free tier (100 mails a day, 3,000 a month) covers a small forum's verification and reset traffic
-with room to spare, and its failure modes are legible: a 4xx with a `message`. It is still a
-dependency on someone else's free tier, which is why the whole thing is a `Mailer` trait with a
-`NoMailer` and every flow is written to work without it. The self-hosted binary can put SMTP
-behind the same trait.
+**A Worker has no SMTP, so mail is an API call, and which API is configuration.** The first
+cut was Resend only. It is now a `Provider` table in `email/providers.rs` -- Cloudflare's Email
+Service over REST, Resend, Postmark, SendGrid, Mailgun, Brevo -- plus Cloudflare's
+`[[send_email]]` binding, which is not an HTTP call at all. Each provider is *data*: the URL,
+where the key goes, the field names it insists on (`address` for Cloudflare, `From`/`TextBody`
+for Postmark, `personalizations` for SendGrid, a form body for Mailgun), and what success looks
+like. The transport in `crates/worker/src/mail.rs` POSTs whatever it is handed and passes the
+status and body back, so every provider's shape is pinned by a unit test rather than found out
+in production. The self-hosted binary can put SMTP behind the same `Mailer` trait.
+
+**The Cloudflare binding is the default when it exists.** No key to rotate, no third party's
+free tier, and the sending domain is onboarded with one wrangler command. It is in open beta,
+which is the reason the others are there: if it changes or the quota does not suit, switching
+is one variable. Absent a `MAIL_PROVIDER`, the binding wins, then a `RESEND_API_KEY` (the
+original configuration keeps working), then nothing.
+
+**Success is what the provider says, not the status.** SendGrid answers 202 with an empty
+body; Cloudflare's REST API can answer 200 with `success: false`; Postmark puts its verdict in
+`ErrorCode`. A 2xx alone is therefore not a send, and each provider's parser checks for the
+thing that means one. The free tiers are noted in `wrangler.toml` where they are chosen, so
+the numbers sit next to the decision they inform.
 
 **Nothing fails because mail did.** Signup creates the account and signs in before it tries to
 send; `Delivery` reports how the send went and the page says so. A provider outage, a missing

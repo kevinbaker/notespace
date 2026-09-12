@@ -3,8 +3,8 @@
 A configurable, AI-moderated, threaded forum in Rust that deploys to a free Cloudflare account
 *or* runs as a single self-hosted binary.
 
-> **Status: reading, accounts, posting, editing and moderation work; email goes through Resend;
-> no one-line deployment story yet.** The free-tier premise is measured and confirmed. See [DESIGN.md](DESIGN.md) for where this is
+> **Status: reading, accounts, posting, editing and moderation work; email goes through
+> Cloudflare's Email Service or any of five providers; no one-line deployment story yet.** The free-tier premise is measured and confirmed. See [DESIGN.md](DESIGN.md) for where this is
 > going, [IMPLEMENTATION.md](IMPLEMENTATION.md) for what exists, and
 > [docs/M0-findings.md](docs/M0-findings.md) for what has been proven by measurement.
 
@@ -59,19 +59,24 @@ posts, and delete them, which leaves a `[deleted]` marker so replies keep their 
 text goes back through the same Tier 0 heuristics as a new post. Every thread has a feed at
 `/t/{id}.rss`, and `/u/{name}` lists a member's recent posts.
 
-Mail goes through [Resend](https://resend.com), the one external service:
+Mail goes through whichever provider `MAIL_PROVIDER` names. The default is Cloudflare's own
+Email Service through the `[[send_email]]` binding -- no key, one command to onboard the domain:
 
 ```sh
-wrangler secret put RESEND_API_KEY          # from the Resend dashboard
+npx wrangler email sending enable your.domain      # adds SPF and DKIM; once
 # and in wrangler.toml [vars]:
-#   EMAIL_FROM = "notespace <no-reply@your.domain>"   # a domain verified with Resend
+#   EMAIL_FROM = "notespace <no-reply@your.domain>"
 #   SITE_NAME  = "notespace"
-#   REQUIRE_EMAIL = "false"                            # "true" to make it mandatory
+#   REQUIRE_EMAIL = "false"                          # "true" to make it mandatory
 ```
 
-With either the key or the sender missing, mail is simply off: accounts still work, addresses
-stay unconfirmed, and `/forgot` accepts requests it cannot fulfil (and logs that it could not).
-The Resend free plan is 100 mails a day and 3,000 a month.
+Or any of `resend`, `postmark`, `sendgrid`, `mailgun`, `brevo`, or `cloudflare_api` (the same
+service over REST), each with `wrangler secret put MAIL_API_KEY` and a sender on a domain that
+provider has verified. Each provider's request and response shape is a unit-tested table in
+`crates/core/src/email/providers.rs`, so adding one is a few lines and no network.
+
+With anything missing, mail is simply off: accounts still work, addresses stay unconfirmed, and
+`/forgot` accepts requests it cannot fulfil (and logs that it could not).
 
 ## Moderation
 

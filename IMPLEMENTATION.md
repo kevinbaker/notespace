@@ -97,18 +97,23 @@ need.
 
 | what | where |
 |---|---|
-| Addresses, tokens, messages, the `Mailer` seam, Resend's request shape | `crates/core/src/email.rs` |
+| Addresses, tokens, messages, the `Mailer` seam | `crates/core/src/email/mod.rs` |
+| Every provider's request and response shape, as data | `crates/core/src/email/providers.rs` — `Provider`, `Sender` |
 | Verification, address change, reset request/completion, password change | `crates/core/src/account.rs` — `send_verification`, `change_email`, `confirm_email`, `request_reset`, `complete_reset`, `change_password` |
 | Signup's email field and verification mail | `crates/core/src/register.rs` — `Signup.email`, `RegisterConfig.require_email` |
-| Resend transport, link base URL, the vars | `crates/worker/src/mail.rs` — `Resend`, `MaybeMailer`, `LinkConfig` |
+| The HTTP transport, the Cloudflare binding, provider resolution, link base URL | `crates/worker/src/mail.rs` — `Http`, `CloudflareBinding`, `MaybeMailer::from_env`, `LinkConfig` |
 | Handlers | `crates/worker/src/account.rs` — `/settings`, `/settings/{email,password,sessions}`, `/verify`, `/forgot`, `/reset` |
 | Pages | `crates/render/src/account.rs` |
 | Store methods | `Store::account` through `Store::retire_email_tokens` |
 | Schema | `migrations/0009_email_and_spaces.sql` — `user.email`, `user.email_verified_at`, `email_token` |
 | Flows end to end with a recording mailer | `crates/store-sqlite/tests/account.rs` |
 
-Mail is off unless `RESEND_API_KEY` and `EMAIL_FROM` are both set; every flow works without it
-and says so. Password recovery needs the `password` feature; verification does not.
+`MAIL_PROVIDER` selects `cloudflare` (the `[[send_email]]` binding, the default when it
+exists), `cloudflare_api`, `resend`, `postmark`, `sendgrid`, `mailgun` or `brevo`; every one
+needs `EMAIL_FROM`, the HTTP ones need the `MAIL_API_KEY` secret. Mail is off, and every flow
+says so, whenever that is incomplete. Password recovery needs the `password` feature;
+verification does not. The names are checked against `wrangler.toml` by
+`the_mail_names_match_wrangler_toml`.
 
 ## §4.9 Sessions
 

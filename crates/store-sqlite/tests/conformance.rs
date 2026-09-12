@@ -970,7 +970,10 @@ fn the_d1_binding_name_matches_wrangler_toml() {
 
     let in_code = src
         .lines()
-        .find_map(|l| l.trim().strip_prefix("pub(crate) const DB_BINDING: &str = \""))
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("pub(crate) const DB_BINDING: &str = \"")
+        })
         .and_then(|l| l.split('"').next())
         .expect("DB_BINDING not found in the worker source");
     let in_toml = toml
@@ -985,31 +988,74 @@ fn the_d1_binding_name_matches_wrangler_toml() {
     );
 }
 
-/// Mail is configured by variables rather than bindings, and a misspelt one is silently "no
-/// mail" rather than an error, so the names in the code and the names documented in
-/// wrangler.toml are checked against each other here.
+/// Mail is configured mostly by variables, and a misspelt one is silently "no mail" rather
+/// than an error, so the names in the code and the names in wrangler.toml are checked against
+/// each other here; likewise the binding name and the provider list.
 #[test]
-fn the_mail_variable_names_match_wrangler_toml() {
+fn the_mail_names_match_wrangler_toml() {
     let src = include_str!("../../worker/src/mail.rs");
     let toml = include_str!("../../../wrangler.toml");
     let constant = |name: &str| -> String {
         src.lines()
-            .find_map(|l| l.trim().strip_prefix(&format!("pub const {name}: &str = \"")))
+            .find_map(|l| {
+                l.trim()
+                    .strip_prefix(&format!("pub const {name}: &str = \""))
+            })
             .and_then(|l| l.split('"').next())
             .unwrap_or_else(|| panic!("{name} not found in mail.rs"))
             .to_string()
     };
-    for var in ["FROM_VAR", "SITE_NAME_VAR", "REQUIRE_EMAIL_VAR"] {
+    for var in [
+        "PROVIDER_VAR",
+        "FROM_VAR",
+        "SITE_NAME_VAR",
+        "REQUIRE_EMAIL_VAR",
+        "CF_ACCOUNT_VAR",
+        "MAILGUN_DOMAIN_VAR",
+        "MAILGUN_REGION_VAR",
+        "POSTMARK_STREAM_VAR",
+    ] {
         let name = constant(var);
         assert!(
-            toml.lines().any(|l| l.trim().starts_with(&format!("{name} ="))),
+            toml.lines()
+                .any(|l| l.trim().starts_with(&format!("{name} ="))),
             "{name} is not declared under [vars] in wrangler.toml"
         );
     }
+    let bindings: Vec<&str> = toml
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("name = \""))
+        .filter_map(|l| l.split('"').next())
+        .collect();
+    assert!(
+        bindings.contains(&constant("EMAIL_BINDING").as_str()),
+        "the send_email binding {:?} is not declared in wrangler.toml",
+        constant("EMAIL_BINDING")
+    );
     // The secret is not in the file, but the instructions for setting it must name it right.
     let secret = constant("API_KEY_SECRET");
     assert!(
         toml.contains(&format!("wrangler secret put {secret}")),
         "wrangler.toml does not say how to set {secret}"
     );
+    // Every provider the code resolves is documented, by its configured name.
+    for name in [
+        "cloudflare",
+        "cloudflare_api",
+        "resend",
+        "postmark",
+        "sendgrid",
+        "mailgun",
+        "brevo",
+    ] {
+        assert!(
+            src.contains(&format!("\"{name}\"")),
+            "mail.rs does not resolve {name}"
+        );
+        assert!(
+            toml.lines()
+                .any(|l| l.trim_start_matches('#').trim().starts_with(name)),
+            "wrangler.toml does not document MAIL_PROVIDER = {name}"
+        );
+    }
 }

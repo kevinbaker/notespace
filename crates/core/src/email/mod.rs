@@ -1,8 +1,9 @@
 //! Email: addresses, the messages this system sends, and the seam they leave through.
 //!
-//! Nothing here sends. [`Mailer`] is implemented by the target -- a Worker over Resend's HTTP
-//! API, a native binary over whatever it likes -- and the rest of `core` builds [`Message`]s
-//! and hands them over. Templates are plain text: they are read on phones, in terminals, and by
+//! Nothing here sends. [`Mailer`] is implemented by the target -- a Worker over a provider's
+//! HTTP API or Cloudflare's own binding, a native binary over whatever it likes -- and the rest
+//! of `core` builds [`Message`]s and hands them over. The providers' request and response
+//! shapes are in [`providers`], so they are tested here rather than in a Worker. Templates are plain text: they are read on phones, in terminals, and by
 //! people who have just lost a password, and none of those wants a layout.
 
 use core::fmt;
@@ -12,6 +13,8 @@ use sha2::{Digest, Sha256};
 
 use crate::model::{Timestamp, UserId};
 use crate::session::{hex_decode, hex_encode};
+
+pub mod providers;
 
 /// Longest address accepted, per RFC 5321's path limit.
 pub const MAX_ADDRESS_CHARS: usize = 254;
@@ -283,44 +286,6 @@ pub fn password_changed(links: &Links<'_>, to: &EmailAddress, username: &str) ->
     }
 }
 
-// ---------------------------------------------------------------------------
-// Resend
-// ---------------------------------------------------------------------------
-
-/// Resend's send endpoint. One JSON POST per message.
-pub const RESEND_URL: &str = "https://api.resend.com/emails";
-
-/// The request body Resend expects. `from` is the deployment's sender, `"Name <addr>"` or a
-/// bare address; the domain has to be one verified in the Resend dashboard or the API refuses.
-pub fn resend_request(from: &str, message: &Message) -> serde_json::Value {
-    serde_json::json!({
-        "from": from,
-        "to": [message.to.as_str()],
-        "subject": message.subject,
-        "text": message.text,
-    })
-}
-
-pub fn resend_headers(api_key: &str) -> Vec<(&'static str, String)> {
-    vec![
-        ("Authorization", format!("Bearer {api_key}")),
-        ("Content-Type", "application/json".to_string()),
-    ]
-}
-
-/// A 2xx with an `id` is success; anything else is refused with what Resend said, for the log.
-pub fn resend_parse(status: u16, body: &serde_json::Value) -> Result<(), MailError> {
-    if (200..300).contains(&status) && body.get("id").and_then(|v| v.as_str()).is_some() {
-        return Ok(());
-    }
-    let why = body
-        .get("message")
-        .and_then(|m| m.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| body.to_string());
-    Err(MailError::Rejected(format!("{status}: {why}")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,42 +385,5 @@ mod tests {
         let m = password_changed(&links(), &to, "alice");
         assert!(!m.text.contains("token="));
         assert!(m.text.contains("/forgot"));
-    }
-
-    #[test]
-    fn the_resend_request_has_the_fields_the_api_documents() {
-        let to = EmailAddress::parse("alice@example.com").unwrap();
-        let m = Message {
-            to,
-            subject: "hi".into(),
-            text: "body".into(),
-        };
-        let req = resend_request("forum <no-reply@forum.example>", &m);
-        assert_eq!(req["from"], "forum <no-reply@forum.example>");
-        assert_eq!(req["to"], serde_json::json!(["alice@example.com"]));
-        assert_eq!(req["subject"], "hi");
-        assert_eq!(req["text"], "body");
-        assert!(req.get("html").is_none(), "plain text only");
-        let h = resend_headers("re_123");
-        assert!(h
-            .iter()
-            .any(|(k, v)| *k == "Authorization" && v == "Bearer re_123"));
-    }
-
-    #[test]
-    fn resend_responses_are_sorted_by_status_and_id() {
-        assert_eq!(resend_parse(200, &serde_json::json!({"id": "abc"})), Ok(()));
-        // A 2xx without an id is not a send.
-        assert!(resend_parse(200, &serde_json::json!({})).is_err());
-        match resend_parse(
-            422,
-            &serde_json::json!({"statusCode": 422, "message": "The from domain is not verified"}),
-        ) {
-            Err(MailError::Rejected(why)) => {
-                assert!(why.contains("422"));
-                assert!(why.contains("not verified"));
-            }
-            other => panic!("{other:?}"),
-        }
     }
 }

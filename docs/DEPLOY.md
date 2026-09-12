@@ -153,29 +153,49 @@ the id that made it, so nothing already stored changes meaning. Logins under an 
 rewritten under the current one as accounts come back. Nothing has to be retired on a deadline:
 holding every pepper is free, because verification looks up exactly one.
 
-## Enabling mail (optional, needs password login for reset)
+## Enabling mail (optional; password reset needs it, and needs password login)
 
-Address verification, password reset and the "your password changed" notice go through Resend.
-Nothing is sent unless both halves are configured:
+Address verification, password reset and the "your password changed" notice go out through
+whatever `MAIL_PROVIDER` names in `wrangler.toml`. Nothing is sent until a provider and
+`EMAIL_FROM` are both configured; until then signup says the address is saved but unconfirmed,
+and `/forgot` still answers "if that address belongs to a confirmed account, a link is on its
+way" -- the log says it was not.
+
+**Cloudflare Email Service** (the default when the `[[send_email]]` binding is declared, which
+it is): no key. Onboard the sending domain once, which adds its SPF and DKIM records:
 
 ```bash
-wrangler secret put RESEND_API_KEY        # re_... from https://resend.com/api-keys
+npx wrangler email sending enable notespace.org
+npx wrangler email sending dns get notespace.org      # check the records landed
 ```
 
-and in `wrangler.toml` under `[vars]`, a sender on a domain you have verified in the Resend
-dashboard (an unverified domain is a 4xx from the API, logged, and the flow carries on without
-the mail):
+If that answers `Unauthorized`, the OAuth token predates the email scope: `wrangler logout`
+and `wrangler login` again, or onboard from the dashboard (Compute & AI > Email Service).
+Then set the sender:
 
 ```toml
-EMAIL_FROM = "notespace <no-reply@your.domain>"
-SITE_NAME = "notespace"
-REQUIRE_EMAIL = "false"   # "true" once mail works, if accounts must have an address
-BASE_URL = ""             # links use the request's host unless set
+EMAIL_FROM = "notespace <no-reply@notespace.org>"
 ```
 
-For local `wrangler dev`, `RESEND_API_KEY` goes in `.dev.vars` like the pepper. Without it,
-signup says the address is saved but unconfirmed, and `/forgot` still answers "if that address
-belongs to a confirmed account, a link is on its way" -- the log says it was not.
+Under `wrangler dev` the binding writes each message to `.wrangler/tmp/email/` instead of
+sending, which is a convenient way to read a verification link; `remote = true` on the binding
+sends for real.
+
+**Anyone else**: set `MAIL_PROVIDER` to `resend`, `postmark`, `sendgrid`, `mailgun`, `brevo` or
+`cloudflare_api`, put the key in
+
+```bash
+wrangler secret put MAIL_API_KEY
+```
+
+and use a sender on a domain *that provider* has verified (an unverified domain is a 4xx from
+every one of them, logged, and the flow carries on). Mailgun reads `MAILGUN_DOMAIN` (default:
+the sender's domain) and `MAILGUN_REGION = "eu"`; Postmark reads `POSTMARK_STREAM`;
+`cloudflare_api` reads `CF_ACCOUNT_ID` and wants a token with the Email Sending permission.
+For local `wrangler dev`, the key goes in `.dev.vars` like the pepper.
+
+`SITE_NAME` names the site in the mail; `BASE_URL` overrides the request's host in links;
+`REQUIRE_EMAIL = "true"` makes an address mandatory at signup.
 
 ## Gotchas
 
