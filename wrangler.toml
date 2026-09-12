@@ -124,7 +124,7 @@ MODERATORS = ""
 # Empty falls back to `cloudflare` when the binding exists, then `resend` when RESEND_API_KEY
 # is set, then off. Provider-specific vars are only read by their provider.
 MAIL_PROVIDER = ""
-EMAIL_FROM = ""
+EMAIL_FROM = "notespace <no-reply@notespace.org>"
 CF_ACCOUNT_ID = ""
 MAILGUN_DOMAIN = ""
 MAILGUN_REGION = ""
