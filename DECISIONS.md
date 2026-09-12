@@ -548,6 +548,34 @@ choice is a link everyone sees or no link at all. It is a link; a non-author who
 told, without a form. When the personalisation layer (§7.1) exists it can hide the link for
 everyone else, and until then the reply and report links are already in the same position.
 
+## Closing the site for a test: `SIGNUP_CODE`, and what was cut for the request budget
+
+**Registration is the gate, so the invite code sits there and nowhere else.** Reading is free
+and must stay so; every write needs an account. A `SIGNUP_CODE` secret makes `/register` ask
+for it and refuse without it, checked before the limiter and before the hash so a wrong guess
+costs nothing. A secret rather than a var only so it stays out of version control; it is a
+shared word, not a credential. Heavier gates -- Cloudflare Access in front of the hostname, WAF
+rate-limiting rules -- live outside the code and are documented in `docs/DEPLOY.md`.
+
+**Two dead requests per pageview were cut.** The baked page carried a `<script>` tag for the
+personalisation layer that was never built, and every browser asks for `/favicon.ico`. Both
+404ed, and on a budget of 100k requests a day that tripled the cost of a pageview. The script
+tag is gone (§7.1 says the enhancement degrades by removal; nothing was there to remove yet),
+and every page carries `<link rel="icon" href="data:,">`, which browsers honour as "there is
+no icon" and ask no further -- `/favicon.ico` answers 204 with a week's cache for the ones that
+ask anyway.
+
+**Timestamps render in UTC**, because a baked page is the same bytes for every reader and
+cannot know a zone. The `datetime` attribute carries the ISO form for a script to localise.
+
+**A rejected reply re-renders with the draft**, as compose already did. The redirect-with
+`?error=` pattern lost the text, which for a reply written on a phone is a real loss; the
+form comes back as a 200 under a fresh token, and a reload resubmits a form that was already
+refused, which is harmless.
+
+**`/login` while signed in goes to `/settings`.** The nav cannot say who you are (baked
+pages), so "sign in" is the link people press to find out; the account page is the answer.
+
 ## `crates/core/src/sql.rs` -- space listings
 
 `SPACE_THREADS` is the subtree range scan the 0003 migration was designed for, and that

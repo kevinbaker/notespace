@@ -65,6 +65,7 @@ pub fn new_thread_page(
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                link rel="icon" href="data:,";
                 title { "New thread in " (space_name) }
                 style { (PreEscapedStyle) }
             }
@@ -135,6 +136,7 @@ pub fn edit_page(
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                link rel="icon" href="data:,";
                 title { "Edit post" }
                 style { (PreEscapedStyle) }
             }

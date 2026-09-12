@@ -65,6 +65,19 @@ pub enum Outcome {
     },
 }
 
+/// Whether `given` is the invite code the deployment requires. `None` means none is required.
+/// Constant-time, so a wrong code costs the same whatever prefix it shares with the right one.
+pub fn invite_ok(required: Option<&str>, given: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    match required.map(str::trim).filter(|r| !r.is_empty()) {
+        None => true,
+        Some(r) => {
+            let g = given.trim();
+            r.len() == g.len() && bool::from(r.as_bytes().ct_eq(g.as_bytes()))
+        }
+    }
+}
+
 /// Validate without touching storage. An empty address is `None` unless one is required.
 pub fn check(
     username: &str,
@@ -187,6 +200,16 @@ mod tests {
     use super::*;
 
     const GOOD_PW: &str = "correct horse battery staple";
+
+    #[test]
+    fn an_invite_code_is_required_only_when_configured() {
+        assert!(invite_ok(None, ""));
+        assert!(invite_ok(Some(""), "anything"));
+        assert!(invite_ok(Some(" hunter2 "), "hunter2"));
+        assert!(!invite_ok(Some("hunter2"), ""));
+        assert!(!invite_ok(Some("hunter2"), "hunter"));
+        assert!(!invite_ok(Some("hunter2"), "HUNTER2"));
+    }
 
     #[test]
     fn a_valid_signup_passes_the_free_checks() {

@@ -73,6 +73,7 @@ pub fn settings_page(
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                link rel="icon" href="data:,";
                 title { "Account" }
                 style { (PreEscapedStyle) }
             }
@@ -171,6 +172,7 @@ pub fn forgot_page(csrf: &str, error: Option<ForgotError>, sent: bool) -> Markup
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                link rel="icon" href="data:,";
                 title { "Reset your password" }
                 style { (PreEscapedStyle) }
             }
@@ -238,6 +240,7 @@ pub fn reset_page(csrf: &str, token: &str, error: Option<ResetError>) -> Markup 
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                link rel="icon" href="data:,";
                 title { "Choose a new password" }
                 style { (PreEscapedStyle) }
             }
@@ -282,6 +285,7 @@ pub fn verify_page(csrf: &str, token: &str, outcome: Option<VerifyOutcome>) -> M
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                link rel="icon" href="data:,";
                 title { "Confirm your email" }
                 style { (PreEscapedStyle) }
             }

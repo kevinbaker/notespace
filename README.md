@@ -78,6 +78,10 @@ provider has verified. Each provider's request and response shape is a unit-test
 With anything missing, mail is simply off: accounts still work, addresses stay unconfirmed, and
 `/forgot` accepts requests it cannot fulfil (and logs that it could not).
 
+To close registration for a test, `wrangler secret put SIGNUP_CODE`; `/register` then asks for
+the code. See [docs/DEPLOY.md](docs/DEPLOY.md#running-a-closed-test) for the heavier gates
+(Cloudflare Access, WAF rate limits).
+
 ## Moderation
 
 Every reply goes through free heuristics inline (account age, link count, duplicate body,

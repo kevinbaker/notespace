@@ -41,6 +41,11 @@ The migration list has a completeness guard in `crates/store-sqlite/tests/confor
 | The user-agnostic invariant | `baked_page_contains_no_viewer_identity` in `page.rs` |
 | Cache headers and edge caching | `crates/worker/src/cache.rs`; key logic in `crates/core/src/cache_key.rs` |
 
+Timestamps are rendered by `crates/render/src/time.rs` — `stamp`, UTC, either unit. Error
+responses other than 400 are `notespace_render::error_page`; unknown routes hit the router's
+fallback; `/favicon.ico` is a 204 and every page declares `href="data:,"` so browsers do not
+ask.
+
 ## §3.5 What the client may and may not do
 
 `SanitizedHtml` in `crates/core/src/model.rs` is the type that enforces it — the only
@@ -110,7 +115,8 @@ need.
 
 `MAIL_PROVIDER` selects `cloudflare` (the `[[send_email]]` binding, the default when it
 exists), `cloudflare_api`, `resend`, `postmark`, `sendgrid`, `mailgun` or `brevo`; every one
-needs `EMAIL_FROM`, the HTTP ones need the `MAIL_API_KEY` secret. Mail is off, and every flow
+needs `EMAIL_FROM`, the HTTP ones need the `MAIL_API_KEY` secret. `SIGNUP_CODE`, a secret, closes registration: `register::invite_ok` is the constant-time
+check, called before the limiter. Mail is off, and every flow
 says so, whenever that is incomplete. Password recovery needs the `password` feature;
 verification does not. The names are checked against `wrangler.toml` by
 `the_mail_names_match_wrangler_toml`.

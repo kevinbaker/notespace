@@ -197,6 +197,36 @@ For local `wrangler dev`, the key goes in `.dev.vars` like the pepper.
 `SITE_NAME` names the site in the mail; `BASE_URL` overrides the request's host in links;
 `REQUIRE_EMAIL = "true"` makes an address mandatory at signup.
 
+## Running a closed test
+
+Three layers, heaviest first; they stack.
+
+1. **Cloudflare Access on the hostname.** Zero Trust > Access > Applications > add
+   `dev.notespace.org`, policy "Emails: the testers" (or an email domain), login by one-time
+   PIN. Nothing outside the list reaches the Worker at all. Free for up to 50 users, and
+   removed in one click when the site goes public.
+2. **WAF rate-limiting rules** (Security > WAF > Rate limiting rules), keyed on IP:
+
+   | rule | expression | limit |
+   |---|---|---|
+   | auth forms | `http.request.method eq "POST" and http.request.uri.path in {"/register" "/login" "/forgot" "/reset"}` | 10 / 10 min, block 1 h |
+   | writes | `http.request.method eq "POST" and (http.request.uri.path matches "^/t/.*/reply$" or http.request.uri.path matches "^/s/.*/new$" or http.request.uri.path matches "^/p/.*/(edit\|delete\|report\|appeal)$")` | 20 / 10 min |
+   | everything | `http.host eq "dev.notespace.org"` | 300 / min |
+
+   Plus Bot Fight Mode under Security > Bots.
+3. **An invite code in the app.** `wrangler secret put SIGNUP_CODE` makes `/register` ask for
+   it; the site stays readable by anyone and writable only by people who were told the word.
+   `wrangler secret delete SIGNUP_CODE` opens registration again.
+
+The first moderator is `MODERATORS = "kbaker"` in `wrangler.toml`, which is what lets held
+posts be released before anyone has the role in the database. For a test where every account
+is new, also lower the hold window on the space, or every first post waits on the classifier:
+
+```bash
+wrangler d1 execute notespace-dev --remote \
+  --command "UPDATE space SET config = '{\"moderation\":{\"new_account_hours\":2}}' WHERE path = 'general/'"
+```
+
 ## Gotchas
 
 - **`name` must match the Worker that owns the route.** `wrangler.toml` says `notespace-dev`

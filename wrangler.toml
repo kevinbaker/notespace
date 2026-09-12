@@ -98,7 +98,7 @@ crons = ["*/5 * * * *"]
 MOD_PROVIDER = "workers_ai"
 # Comma-separated usernames who may work /mod/queue in addition to anyone with the moderator
 # role in the database. The bootstrap path for the first admin.
-MODERATORS = ""
+MODERATORS = "kbaker"
 
 # Outbound mail: address verification, password reset, and the "your password changed" notice.
 # MAIL_PROVIDER picks the transport; every one needs EMAIL_FROM on a domain that provider has
@@ -133,6 +133,8 @@ POSTMARK_STREAM = ""
 SITE_NAME = "notespace"
 # "true" makes an address mandatory at signup. Only sensible once mail is configured.
 REQUIRE_EMAIL = "false"
+# Closed registration: `wrangler secret put SIGNUP_CODE` makes /register ask for the code (a
+# secret, so it stays out of version control); unset or empty means anyone may register.
 # Where links in mail point. Empty means the request's own host, which is right when there is
 # one hostname; set it when the Worker is reached through several.
 BASE_URL = ""

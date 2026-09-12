@@ -81,6 +81,7 @@ fn router(env: Env) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))
+        .route("/favicon.ico", get(favicon))
         .route("/t/{id}", get(thread_page))
         .route("/t/{id}/{slug}", get(thread_page_slug))
         .route("/p/{id}", get(post_permalink))
@@ -125,6 +126,7 @@ fn router(env: Env) -> Router {
             "/__conformance",
             get(conformance).post(conformance_with_writes),
         )
+        .fallback(not_found)
         .with_state(env)
 }
 
@@ -166,6 +168,12 @@ async fn login_form(
     let cfg = auth_config::AuthConfig::resolve(&env);
     if let auth_config::AuthConfig::Refused(why) = &cfg {
         return (StatusCode::SERVICE_UNAVAILABLE, format!("{why}\n")).into_response();
+    }
+    // Already signed in: the account page answers "who am I" better than a form would.
+    if let Ok(db) = env.d1(DB_BINDING) {
+        if current_user(&D1Store::new(db), &headers).await.is_some() {
+            return see_other("/settings".into());
+        }
     }
     let Some(key) = csrf_key(&env) else {
         return error(
@@ -695,16 +703,41 @@ async fn render_thread(
 
 pub(crate) fn error(code: StatusCode, msg: &str) -> Response {
     worker::console_log!("notespace error {}: {}", code.as_u16(), msg);
-    // The message goes to the log, not the body, so errors cannot leak schema details.
-    let public = if code == StatusCode::BAD_REQUEST {
-        msg
-    } else {
-        code.canonical_reason().unwrap_or("error")
-    };
+    // A 400 says what was wrong with the request, as text. Anything else says only its
+    // status -- the message goes to the log, so errors cannot leak schema details -- on a
+    // page with a way home.
+    if code == StatusCode::BAD_REQUEST {
+        return (
+            code,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            msg.to_owned(),
+        )
+            .into_response();
+    }
+    let reason = code.canonical_reason().unwrap_or("error");
     (
         code,
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        public.to_owned(),
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        Html(notespace_render::error_page(code.as_u16(), reason).into_string()),
+    )
+        .into_response()
+}
+
+/// Unknown routes. Usernames and space keys reserve the words that are routes, so nothing
+/// here can shadow a page that should exist.
+async fn not_found() -> Response {
+    error(StatusCode::NOT_FOUND, "no such route")
+}
+
+/// Every page suppresses the favicon request with `<link rel="icon" href="data:,">`; this
+/// covers clients that ask anyway, without spending a request on it every time.
+async fn favicon() -> Response {
+    (
+        StatusCode::NO_CONTENT,
+        [(header::CACHE_CONTROL, "public, max-age=604800")],
     )
         .into_response()
 }
@@ -854,13 +887,6 @@ async fn reply_submit(
         Err(e) => return error(StatusCode::BAD_REQUEST, &format!("bad thread id: {e}")),
     };
     let canonical = thread_id.encode();
-    let back = |e: &str| -> Response {
-        (
-            StatusCode::SEE_OTHER,
-            [(header::LOCATION, format!("/t/{canonical}/reply?error={e}"))],
-        )
-            .into_response()
-    };
 
     let Ok(db) = env.d1(DB_BINDING) else {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding");
@@ -892,6 +918,18 @@ async fn reply_submit(
     };
     let session = cookie::get(cookie_header(&headers), cookie::SESSION).unwrap_or_default();
     let now = worker::Date::now().as_millis() as i64;
+    // A rejection re-renders the form with the draft in it, under a fresh token, rather than
+    // redirecting and losing what was typed.
+    let back = |e: &str| -> Response {
+        let fresh = key.mint(&session, now, csrf::DEFAULT_LIFETIME_MS);
+        uncached_html(notespace_render::auth::reply_page(
+            fresh.as_str(),
+            &canonical,
+            (!form_parent.is_empty()).then_some(form_parent.as_str()),
+            &form_body,
+            parse_reply_error(e.to_string()),
+        ))
+    };
     if key.verify(&form_csrf, &session, now).is_err() {
         return back("expired");
     }
@@ -1013,10 +1051,24 @@ async fn register_form(
         q.name.as_deref().unwrap_or(""),
         q.email.as_deref().unwrap_or(""),
         mail::require_email(&env),
+        signup_code(&env).is_some(),
         q.error.and_then(parse_register_error),
     );
     anon_page(body, set_anon)
 }
+
+/// The invite code registration requires, if the deployment set one. A secret rather than a
+/// var so it is not in version control; `SIGNUP_CODE` unset means open registration.
+#[cfg(feature = "password")]
+fn signup_code(env: &Env) -> Option<String> {
+    env.secret(SIGNUP_CODE_SECRET)
+        .ok()
+        .map(|s| s.to_string())
+        .filter(|s| !s.trim().is_empty())
+}
+
+#[cfg(feature = "password")]
+pub(crate) const SIGNUP_CODE_SECRET: &str = "SIGNUP_CODE";
 
 /// Turn `?error=` back into something to show. Only values this handler itself emits.
 #[cfg(feature = "password")]
@@ -1025,6 +1077,7 @@ fn parse_register_error(code: String) -> Option<notespace_render::auth::Register
     match code.as_str() {
         "taken" => Some(RegisterError::Taken),
         "expired" => Some(RegisterError::Expired),
+        "invite" => Some(RegisterError::BadInvite),
         other => {
             if let Some(n) = other.strip_prefix("short-") {
                 return n
@@ -1070,12 +1123,14 @@ async fn register_submit(
     let mut form_pw = String::new();
     let mut form_email = String::new();
     let mut form_csrf = String::new();
+    let mut form_invite = String::new();
     for (k, v) in form_urlencoded::parse(body.as_bytes()) {
         match k.as_ref() {
             "username" => form_name = v.into_owned(),
             "password" => form_pw = v.into_owned(),
             "email" => form_email = v.into_owned(),
             "csrf" => form_csrf = v.into_owned(),
+            "invite" => form_invite = v.into_owned(),
             _ => {}
         }
     }
@@ -1110,6 +1165,10 @@ async fn register_submit(
     {
         return back("expired");
     }
+    // Before the limiter and the hash: a wrong code should cost nothing.
+    if !register::invite_ok(signup_code(&env).as_deref(), &form_invite) {
+        return back("invite");
+    }
 
     let Ok(db) = env.d1(DB_BINDING) else {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding");
@@ -1137,8 +1196,9 @@ async fn register_submit(
         scheme,
         peppers,
         sessions: notespace_core::session::SessionPolicy::default(),
+        // Ten an hour: a shared office address should be able to sign up a team.
         per_client: notespace_core::ratelimit::Limit {
-            max: 3,
+            max: 10,
             window_ms: 60 * 60_000,
         },
         require_email: mail::require_email(&env),

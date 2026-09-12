@@ -12,6 +12,7 @@ pub fn profile_page(profile: &Profile) -> Markup {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                link rel="icon" href="data:,";
                 title { (u.name) " — notespace" }
                 style { (IndexStyle) }
             }
@@ -26,7 +27,7 @@ pub fn profile_page(profile: &Profile) -> Markup {
                         UserState::Active => {
                             p class="meta" {
                                 "member since "
-                                time datetime=(profile.created_at) { (profile.created_at) }
+                                (crate::time::stamp(profile.created_at))
                             }
                             @if profile.posts.is_empty() {
                                 p class="empty" { "No posts yet." }
@@ -36,7 +37,7 @@ pub fn profile_page(profile: &Profile) -> Markup {
                                         li {
                                             a class="title" href={ "/p/" (p.public_id) } { (p.thread_title) }
                                             div class="meta" {
-                                                time datetime=(p.created_at) { (p.created_at) }
+                                                (crate::time::stamp(p.created_at))
                                                 " in "
                                                 a href={ "/t/" (p.thread_public_id) } { "the thread" }
                                             }

@@ -18,6 +18,7 @@ pub fn thread_page(page: &ThreadPage) -> Markup {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                link rel="icon" href="data:,";
                 title { (t.title) " — " (space.name) }
                 link rel="alternate" type="application/rss+xml"
                      title=(t.title) href={ "/t/" (t.public_id) ".rss" };
@@ -65,7 +66,7 @@ pub fn thread_page(page: &ThreadPage) -> Markup {
                                     " "
                                     // Keeps resolving after a split or merge moves the post.
                                     a class="permalink" href={ "/p/" (post.public_id) } {
-                                        time datetime=(post.created_at) { (post.created_at) }
+                                        (crate::time::stamp(post.created_at))
                                     }
                                     @if post.edited_at.is_some() { span class="edited" { " (edited)" } }
                                     " "
@@ -114,8 +115,6 @@ pub fn thread_page(page: &ThreadPage) -> Markup {
                         }
                     }
                 }
-                // Personalisation is fetched separately, so this document is identical for all.
-                script defer src="/static/personalize.js" data-thread=(t.public_id) {}
             }
         }
     }

@@ -36,6 +36,7 @@ pub fn thread_list(threads: &[ThreadSummary]) -> Markup {
                             a href={ "/s/" (t.space_path.trim_end_matches('/')) } { (t.space_name) }
                             " · started by "
                             a href={ "/u/" (t.author_name) } { (t.author_name) }
+                            " · last activity " (crate::time::stamp(t.bumped_at))
                         }
                     }
                 }
@@ -65,6 +66,7 @@ pub fn index_page(spaces: &[Space], threads: &[ThreadSummary]) -> Markup {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                link rel="icon" href="data:,";
                 title { "notespace" }
                 style { (IndexStyle) }
             }
@@ -90,6 +92,7 @@ pub fn space_page(space: &Space, children: &[Space], threads: &[ThreadSummary]) 
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                link rel="icon" href="data:,";
                 title { (space.name) " — notespace" }
                 style { (IndexStyle) }
             }

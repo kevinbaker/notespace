@@ -53,6 +53,7 @@ pub fn queue_page(items: &[ReviewItem], csrf: &str, notice: Option<QueueNotice>)
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                link rel="icon" href="data:,";
                 title { "Review queue" }
                 style { (PreEscapedStyle) (PreEscaped(QUEUE_STYLE)) }
             }
@@ -163,6 +164,7 @@ pub fn modlog_page(entries: &[LogEntry]) -> Markup {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                link rel="icon" href="data:,";
                 title { "Moderation log" }
                 style { (PreEscapedStyle) (PreEscaped(QUEUE_STYLE)) }
             }
@@ -177,7 +179,7 @@ pub fn modlog_page(entries: &[LogEntry]) -> Markup {
                     ul class="log" {
                         @for e in entries {
                             li {
-                                time datetime=(e.created_at) { (e.created_at) }
+                                (crate::time::stamp(e.created_at))
                                 " — " (actor_label(e.actor_kind, &e.actor_name))
                                 " " (action_phrase(&e.action)) " "
                                 @match &e.target_public_id {
@@ -226,6 +228,7 @@ pub fn report_page(
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                link rel="icon" href="data:,";
                 title { "Report a post" }
                 style { (PreEscapedStyle) }
             }
@@ -285,6 +288,7 @@ pub fn appeal_page(csrf: &str, post: &str, error: Option<AppealError>, filed: bo
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                link rel="icon" href="data:,";
                 title { "Appeal" }
                 style { (PreEscapedStyle) }
             }
@@ -360,7 +364,11 @@ mod tests {
         assert!(html.contains("87%"));
         assert!(html.contains("spam"));
         assert!(html.contains(r#"action="/mod/review/3""#));
-        assert_eq!(html.matches(r#"name="csrf" value="tok""#).count(), 2, "one token per decision");
+        assert_eq!(
+            html.matches(r#"name="csrf" value="tok""#).count(),
+            2,
+            "one token per decision"
+        );
         assert!(html.contains("Approved and published."));
     }
 
@@ -390,7 +398,8 @@ mod tests {
         assert!(!done.contains("<form"), "no form after the report is taken");
         assert!(done.contains("taken down"));
 
-        let a = appeal_page("tok", "ABC", Some(AppealError::TooLong { max: 9 }), false).into_string();
+        let a =
+            appeal_page("tok", "ABC", Some(AppealError::TooLong { max: 9 }), false).into_string();
         assert!(a.contains(r#"action="/p/ABC/appeal""#));
         assert!(a.contains("under 9 characters"));
         let filed = appeal_page("tok", "ABC", None, true).into_string();

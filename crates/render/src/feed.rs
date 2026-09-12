@@ -1,5 +1,6 @@
 //! RSS for a thread. Baked like the page: user-agnostic, cache-keyed by the thread's version.
 
+use crate::time::civil_from_days;
 use notespace_core::model::{PostState, ThreadPage};
 
 /// RSS 2.0. Bodies go in `description` HTML-escaped, which is how readers expect them.
@@ -67,20 +68,6 @@ fn rfc2822(ts: i64) -> String {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ][(mo - 1) as usize];
     format!("{weekday}, {d:02} {month} {y:04} {h:02}:{m:02}:{s:02} +0000")
-}
-
-/// Howard Hinnant's days-to-civil, which needs no table of month lengths.
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 #[cfg(test)]

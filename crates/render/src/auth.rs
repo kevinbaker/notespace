@@ -55,6 +55,7 @@ pub fn login_page(
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                link rel="icon" href="data:,";
                 title { "Sign in" }
                 style { (PreEscapedStyle) }
             }
@@ -188,6 +189,7 @@ pub fn reply_page(
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                link rel="icon" href="data:,";
                 title { "Reply" }
                 style { (PreEscapedStyle) }
             }
@@ -226,6 +228,8 @@ pub enum RegisterError {
     },
     /// Carries the reason, which is safe to show.
     BadEmail(String),
+    /// Wrong or missing invite code.
+    BadInvite,
     RateLimited {
         retry_after_secs: i64,
     },
@@ -237,6 +241,7 @@ impl RegisterError {
         match self {
             RegisterError::BadName(why) => format!("That name will not work: {why}."),
             RegisterError::BadEmail(why) => format!("That email address will not work: {why}."),
+            RegisterError::BadInvite => "That invite code is not right.".into(),
             RegisterError::Taken => "That name is already taken.".into(),
             RegisterError::ShortPassword { min } => {
                 format!("Passwords need at least {min} characters.")
@@ -261,6 +266,7 @@ pub fn register_page(
     name: &str,
     email: &str,
     require_email: bool,
+    invite_required: bool,
     error: Option<RegisterError>,
 ) -> Markup {
     html! {
@@ -269,6 +275,7 @@ pub fn register_page(
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                link rel="icon" href="data:,";
                 title { "Create an account" }
                 style { (PreEscapedStyle) }
             }
@@ -295,6 +302,10 @@ pub fn register_page(
                         p class="muted" {
                             "Used to reset a forgotten password, and for nothing else."
                         }
+                        @if invite_required {
+                            label for="invite" { "Invite code" }
+                            input id="invite" name="invite" required autocomplete="off";
+                        }
                         button type="submit" { "Create account" }
                     }
                     p class="muted" {
@@ -315,6 +326,7 @@ pub fn held_page(thread: &str, post: &str) -> Markup {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                link rel="icon" href="data:,";
                 title { "Reply received" }
                 style { (PreEscapedStyle) }
             }
