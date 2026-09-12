@@ -1,0 +1,15 @@
+[package]
+name = "notespace-hn-import"
+description = "Turns a Hacker News NDJSON dump into notespace seed SQL, via the real write path."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+notespace-core = { workspace = true }
+notespace-render = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

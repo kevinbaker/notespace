@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/core",
+    "crates/hn-import",
     "crates/render",
     "crates/seed",
     "crates/store-sqlite",
@@ -9,7 +10,7 @@ members = [
     "crates/bench-wasm",
 ]
 
-default-members = ["crates/core", "crates/render", "crates/seed", "crates/store-sqlite"]
+default-members = ["crates/core", "crates/hn-import", "crates/render", "crates/seed", "crates/store-sqlite"]
 
 # `worker` and `bench-wasm` are wasm-only and are built explicitly with
 # `--target wasm32-unknown-unknown`; keeping them out of the default set means a bare
