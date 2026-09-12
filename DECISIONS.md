@@ -303,6 +303,14 @@ production-only was wrong. Local 404 matched the derived ~403.
 
 ## `crates/worker/src/cache.rs`
 
+**The key carries the template's revision as well as the thread's version.** The first deploy
+that changed the baked HTML served the old page from the edge for up to an hour, because
+nothing in the key knew a deploy had happened. `notespace_render::BAKE_REVISION` is a
+compile-time FNV-1a over the template sources (`page.rs`, `time.rs`, `feed.rs`), which is the
+one form of "bump this when the HTML changes" that cannot be forgotten. Old entries simply
+stop being asked for and age out.
+
+
 A Worker's response goes straight to the client; Cloudflare's CDN only caches `fetch()`
 subrequests the Worker makes, or what it explicitly stores through the Cache API. So the
 `s-maxage=60` the thread page had been sending since M0 was inert — confirmed on the deployed

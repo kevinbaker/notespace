@@ -446,7 +446,15 @@ pub async fn feed(State(env): State<Env>, headers: axum::http::HeaderMap, id: St
     let lookup = store.last_stats().server_timing();
     let host = host(&headers);
     let key = version.and_then(|v| {
-        host.and_then(|h| cache::thread_key(h, &format!("{canonical}.rss"), v, None))
+        host.and_then(|h| {
+            cache::thread_key(
+                h,
+                &format!("{canonical}.rss"),
+                v,
+                notespace_render::BAKE_REVISION,
+                None,
+            )
+        })
     });
     if let Some(k) = &key {
         if let Some(hit) = cache::get(k, &lookup).await {

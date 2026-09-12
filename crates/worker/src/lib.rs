@@ -656,7 +656,13 @@ async fn render_thread(
             .get(header::HOST)
             .and_then(|h| h.to_str().ok())
             .and_then(|host| {
-                cache::thread_key(host, &canonical, v, after.as_ref().map(|p| p.as_str()))
+                cache::thread_key(
+                    host,
+                    &canonical,
+                    v,
+                    notespace_render::BAKE_REVISION,
+                    after.as_ref().map(|p| p.as_str()),
+                )
             })
     });
     if let Some(k) = &key {

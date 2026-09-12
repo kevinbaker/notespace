@@ -5,19 +5,25 @@
 /// bypass the cache. Internal to the Cache API, which is why the version can appear here while
 /// the public URL stays `/t/{id}`.
 ///
+/// `revision` is the baked template's, so a deploy that changes the HTML misses the cache
+/// rather than serving the old page until it expires.
+///
 /// `None` for anything that is not a plain hostname.
 pub fn thread_key(
     host: &str,
     canonical_id: &str,
     version: i64,
+    revision: u64,
     after: Option<&str>,
 ) -> Option<String> {
     if !is_hostname(host) {
         return None;
     }
     Some(match after {
-        Some(cursor) => format!("https://{host}/t/{canonical_id}/v{version}?after={cursor}"),
-        None => format!("https://{host}/t/{canonical_id}/v{version}"),
+        Some(cursor) => {
+            format!("https://{host}/t/{canonical_id}/v{version}/r{revision:x}?after={cursor}")
+        }
+        None => format!("https://{host}/t/{canonical_id}/v{version}/r{revision:x}"),
     })
 }
 
@@ -37,32 +43,41 @@ mod tests {
     #[test]
     fn a_page_has_exactly_one_key() {
         assert_eq!(
-            thread_key("dev.notespace.org", "06a1yabw03jnhej1", 0, None).as_deref(),
-            Some("https://dev.notespace.org/t/06a1yabw03jnhej1/v0")
+            thread_key("dev.notespace.org", "06a1yabw03jnhej1", 0, 0xab, None).as_deref(),
+            Some("https://dev.notespace.org/t/06a1yabw03jnhej1/v0/rab")
         );
     }
 
     #[test]
     fn the_cursor_is_part_of_the_key_and_nothing_else_is() {
-        let first = thread_key("h", "abc", 0, None);
-        let second = thread_key("h", "abc", 0, Some("000C"));
+        let first = thread_key("h", "abc", 0, 1, None);
+        let second = thread_key("h", "abc", 0, 1, Some("000C"));
         assert_ne!(first, second);
-        assert_eq!(second.as_deref(), Some("https://h/t/abc/v0?after=000C"));
+        assert_eq!(second.as_deref(), Some("https://h/t/abc/v0/r1?after=000C"));
     }
 
     #[test]
     fn junk_query_parameters_cannot_split_the_entry() {
-        let plain = thread_key("h", "abc", 3, None);
+        let plain = thread_key("h", "abc", 3, 1, None);
         for _junk in ["?x=1", "?x=2", "?utm_source=whatever"] {
-            assert_eq!(thread_key("h", "abc", 3, None), plain);
+            assert_eq!(thread_key("h", "abc", 3, 1, None), plain);
         }
     }
 
     #[test]
     fn bumping_the_version_changes_the_key() {
-        let before = thread_key("h", "abc", 7, None);
-        let after = thread_key("h", "abc", 8, None);
+        let before = thread_key("h", "abc", 7, 1, None);
+        let after = thread_key("h", "abc", 8, 1, None);
         assert_ne!(before, after);
+    }
+
+    /// A deploy that changes the template must not serve the old page from the cache.
+    #[test]
+    fn a_new_template_revision_changes_the_key() {
+        assert_ne!(
+            thread_key("h", "abc", 7, 1, None),
+            thread_key("h", "abc", 7, 2, None)
+        );
     }
 
     #[test]
@@ -77,15 +92,15 @@ mod tests {
             "hos\nt",
             "hos\tt",
         ] {
-            assert_eq!(thread_key(bad, "abc", 0, None), None, "accepted {bad:?}");
+            assert_eq!(thread_key(bad, "abc", 0, 1, None), None, "accepted {bad:?}");
         }
     }
 
     #[test]
     fn a_host_with_a_port_is_allowed_for_local_development() {
         assert_eq!(
-            thread_key("127.0.0.1:8787", "abc", 0, None).as_deref(),
-            Some("https://127.0.0.1:8787/t/abc/v0")
+            thread_key("127.0.0.1:8787", "abc", 0, 1, None).as_deref(),
+            Some("https://127.0.0.1:8787/t/abc/v0/r1")
         );
     }
 }
