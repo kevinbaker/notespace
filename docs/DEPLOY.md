@@ -102,7 +102,14 @@ rather than one per pepper, because a scan over numbered bindings cannot tell "i
 used" from "id 3 failed to load" — and silently holding fewer peppers than intended strands
 accounts. Any parse error refuses login outright rather than loading part of the set.
 
-Then build with the feature: `worker-build --release -- --features password`.
+Then build with the feature. The `[build]` command reads it from the environment, because
+`wrangler dev` and `wrangler deploy` run the build themselves and would otherwise overwrite a
+hand-built bundle with the default one:
+
+```bash
+NOTESPACE_FEATURES=password wrangler deploy
+NOTESPACE_FEATURES=password wrangler dev --local
+```
 
 ### Choosing where the hashing happens
 
@@ -146,6 +153,30 @@ the id that made it, so nothing already stored changes meaning. Logins under an 
 rewritten under the current one as accounts come back. Nothing has to be retired on a deadline:
 holding every pepper is free, because verification looks up exactly one.
 
+## Enabling mail (optional, needs password login for reset)
+
+Address verification, password reset and the "your password changed" notice go through Resend.
+Nothing is sent unless both halves are configured:
+
+```bash
+wrangler secret put RESEND_API_KEY        # re_... from https://resend.com/api-keys
+```
+
+and in `wrangler.toml` under `[vars]`, a sender on a domain you have verified in the Resend
+dashboard (an unverified domain is a 4xx from the API, logged, and the flow carries on without
+the mail):
+
+```toml
+EMAIL_FROM = "notespace <no-reply@your.domain>"
+SITE_NAME = "notespace"
+REQUIRE_EMAIL = "false"   # "true" once mail works, if accounts must have an address
+BASE_URL = ""             # links use the request's host unless set
+```
+
+For local `wrangler dev`, `RESEND_API_KEY` goes in `.dev.vars` like the pepper. Without it,
+signup says the address is saved but unconfirmed, and `/forgot` still answers "if that address
+belongs to a confirmed account, a link is on its way" -- the log says it was not.
+
 ## Gotchas
 
 - **`name` must match the Worker that owns the route.** `wrangler.toml` says `notespace-dev`
@@ -159,3 +190,9 @@ holding every pepper is free, because verification looks up exactly one.
   overwritten.
 - **Undeclared routes survive.** `wrangler.toml` deliberately does not declare
   `dev.notespace.org`, so the dashboard-attached route is left alone by a deploy.
+- **`wrangler dev` rebuilds on every source change with the `[build]` command**, which means
+  with whatever `NOTESPACE_FEATURES` was in its environment when it started. A bundle built by
+  hand with other features is replaced the first time a file changes.
+- **Resetting the local D1 under a running `wrangler dev`** (`rm -rf .wrangler/state/v3/d1`, as
+  `scripts/spike.sh` does) leaves that server holding a deleted database: every query 500s
+  until it is restarted.

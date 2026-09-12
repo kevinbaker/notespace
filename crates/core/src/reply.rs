@@ -64,7 +64,9 @@ pub enum Outcome {
     /// permalink; it renders as awaiting review until the pipeline decides.
     Held(Box<Post>),
     Rejected(Rejected),
-    RateLimited { retry_after_secs: i64 },
+    RateLimited {
+        retry_after_secs: i64,
+    },
 }
 
 /// Separate from [`post`] so a handler can check before rendering markdown.
@@ -80,6 +82,44 @@ pub fn check_body(body_md: &str) -> Result<(), Rejected> {
         });
     }
     Ok(())
+}
+
+/// Tier 0 over one write. `scanned` is what the heuristics read -- for a new thread, the title
+/// as well -- and `body_md` is what the duplicate check compares exactly; `None` skips it. `Ok(empty)` publishes,
+/// `Ok(reasons)` holds, `Err` refuses. **Budget: 0-1 statements.**
+pub(crate) async fn triage<S: Store>(
+    store: &S,
+    ctx: &crate::moderation::WriteContext,
+    author: UserId,
+    scanned: &str,
+    body_md: Option<&str>,
+    now: Timestamp,
+) -> StoreResult<Result<Vec<crate::moderation::heuristics::Reason>, Refusal>> {
+    let policy = ModerationPolicy::from_config(&ctx.space_config);
+    let is_duplicate = match body_md {
+        Some(body) if policy.duplicate_window_ms() > 0 => {
+            store
+                .author_posted_recently(author, body, now - policy.duplicate_window_ms())
+                .await?
+        }
+        _ => false,
+    };
+    Ok(
+        match heuristics::triage(
+            &policy,
+            &Signals {
+                body_md: scanned,
+                author_created_at: ctx.author_created_at,
+                author_role: ctx.author_role,
+                is_duplicate,
+                now,
+            },
+        ) {
+            Triage::Refuse(why) => Err(why),
+            Triage::Publish => Ok(Vec::new()),
+            Triage::Hold(reasons) => Ok(reasons),
+        },
+    )
 }
 
 /// **Budget: 4-9 statements.** A rate-limited attempt costs one and no write; a held post costs
@@ -122,26 +162,9 @@ pub async fn post<S: Store, Q: ModerationQueue>(
     if ctx.thread_state == ThreadState::Locked {
         return Ok(Outcome::Rejected(Rejected::Locked));
     }
-    let policy = ModerationPolicy::from_config(&ctx.space_config);
-    let is_duplicate = policy.duplicate_window_ms() > 0
-        && store
-            .author_posted_recently(r.author, r.body_md, r.now - policy.duplicate_window_ms())
-            .await?;
-    let reasons = match heuristics::triage(
-        &policy,
-        &Signals {
-            body_md: r.body_md,
-            author_created_at: ctx.author_created_at,
-            author_role: ctx.author_role,
-            is_duplicate,
-            now: r.now,
-        },
-    ) {
-        Triage::Refuse(Refusal::Duplicate) => {
-            return Ok(Outcome::Rejected(Rejected::Duplicate));
-        }
-        Triage::Publish => Vec::new(),
-        Triage::Hold(reasons) => reasons,
+    let reasons = match triage(store, &ctx, r.author, r.body_md, Some(r.body_md), r.now).await? {
+        Err(Refusal::Duplicate) => return Ok(Outcome::Rejected(Rejected::Duplicate)),
+        Ok(reasons) => reasons,
     };
     let state = if reasons.is_empty() {
         PostState::Visible
@@ -173,7 +196,8 @@ pub async fn post<S: Store, Q: ModerationQueue>(
                 }
                 if state == PostState::Pending {
                     // The enqueue result is not this function's to report; the sweep covers it.
-                    let _ = pipeline::hold(store, queue, &post, &reasons, r.now).await?;
+                    let _ = pipeline::hold(store, queue, post.id, &post.public_id, &reasons, r.now)
+                        .await?;
                     return Ok(Outcome::Held(Box::new(post)));
                 }
                 return Ok(Outcome::Posted(Box::new(post)));

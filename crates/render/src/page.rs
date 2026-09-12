@@ -30,11 +30,15 @@ pub fn thread_page(page: &ThreadPage) -> Markup {
                     a href={ "/s/" (space.path.trim_end_matches('/')) } { (space.name) }
                     // Which of these applies to the reader is not knowable in a baked page.
                     span class="site-auth" {
+                        a href={ "/t/" (t.public_id) ".rss" } { "rss" }
+                        " · "
                         a href="/modlog" { "modlog" }
                         " · "
                         a href="/login" { "sign in" }
                         " · "
                         a href="/register" { "register" }
+                        " · "
+                        a href="/settings" { "account" }
                     }
                 }
                 main {
@@ -87,9 +91,15 @@ pub fn thread_page(page: &ThreadPage) -> Markup {
                                     },
                                 }
                                 div class="post-actions" {
-                                    a href={ "/p/" (post.public_id) "/reply" } { "reply" }
+                                    a href={
+                                        "/t/" (t.public_id) "/reply?parent=" (post.public_id)
+                                    } { "reply" }
                                     " · "
-                                    // A link for the same reason reply is: the form needs a token.
+                                    // Links for the same reason reply is: each form needs a token.
+                                    // Whether the reader is the author is not knowable here; the
+                                    // edit page says so if not.
+                                    a href={ "/p/" (post.public_id) "/edit" } rel="nofollow" { "edit" }
+                                    " · "
                                     a href={ "/p/" (post.public_id) "/report" } rel="nofollow" { "report" }
                                 }
                             }
@@ -315,6 +325,23 @@ mod tests {
             !html.contains(r#"data-depth="1""#),
             "flat board indented: {html}"
         );
+    }
+
+    /// Every action link points at a route that exists.
+    #[test]
+    fn action_links_point_at_live_routes() {
+        let p = page(vec![post(1, "0001", PostState::Visible, "<p>hi</p>")]);
+        let html = thread_page(&p).into_string();
+        let pid = p.posts[0].public_id.as_str();
+        let tid = p.thread.public_id.as_str();
+        assert!(
+            !html.contains(&format!("/p/{pid}/reply")),
+            "a /p/{{id}}/reply link, which 404s"
+        );
+        assert!(html.contains(&format!("/t/{tid}/reply?parent={pid}")));
+        assert!(html.contains(&format!("/p/{pid}/edit")));
+        assert!(html.contains(&format!("/p/{pid}/report")));
+        assert!(html.contains(&format!("/t/{tid}.rss")));
     }
 
     #[test]

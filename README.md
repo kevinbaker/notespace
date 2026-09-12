@@ -3,15 +3,15 @@
 A configurable, AI-moderated, threaded forum in Rust that deploys to a free Cloudflare account
 *or* runs as a single self-hosted binary.
 
-> **Status: read path, auth, writing and moderation work; no deployment story yet.** The
-> free-tier premise is measured and confirmed. See [DESIGN.md](DESIGN.md) for where this is
+> **Status: reading, accounts, posting, editing and moderation work; email goes through Resend;
+> no one-line deployment story yet.** The free-tier premise is measured and confirmed. See [DESIGN.md](DESIGN.md) for where this is
 > going, [IMPLEMENTATION.md](IMPLEMENTATION.md) for what exists, and
 > [docs/M0-findings.md](docs/M0-findings.md) for what has been proven by measurement.
 
 ## What exists today
 
-A Cloudflare Worker that serves a threaded forum from D1, with accounts, replies, and an
-AI-triaged moderation pipeline:
+A Cloudflare Worker that serves a threaded forum from D1, with spaces, accounts, threads,
+replies, editing, profiles, RSS, and an AI-triaged moderation pipeline:
 
 - **`crates/core`** — domain model, the `Store` trait, and materialized tree paths. No I/O, no
   target awareness, property-tested.
@@ -31,7 +31,7 @@ AI-triaged moderation pipeline:
 | Budget (Cloudflare free plan) | Limit | Measured |
 |---|---|---|
 | Worker CPU / request | 10 ms | **0.048 ms** (200-post page) |
-| Worker script size | 3 MB | **139.6 KB** gzipped (M0, read path only); **746 KB** today |
+| Worker script size | 3 MB | **139.6 KB** gzipped (M0, read path only); **802 KB** today, 850 KB with password login |
 | D1 queries / invocation | 50 | **2**, one batched round trip |
 | D1 rows read / page | 5M/day | **404** (production) |
 | D1 round trip | — | **2.52 ms** p50, 6.24 ms p99 (production) |
@@ -44,6 +44,34 @@ emulation. `rows_read` came out identical in both, so the emulator was not merel
 
 Still unmeasured: billed CPU in production, which appears in the Worker's dashboard metrics
 rather than in a response header.
+
+## Accounts, posting, email
+
+Registration takes a username, a password, and an optional email address; the address is stored
+unconfirmed and a link is mailed. Following the link lands on a page with a button, because mail
+scanners follow links. An address becomes unique only once confirmed, so nobody can squat on
+yours by typing it into the form. `/settings` changes the address or the password (ending every
+other session) and `/forgot` mails a reset link -- only to a confirmed address, and with the same
+reply whether or not the address is known.
+
+Anyone signed in can start a thread from a space page (`/s/general/new`), reply, edit their own
+posts, and delete them, which leaves a `[deleted]` marker so replies keep their context. Edited
+text goes back through the same Tier 0 heuristics as a new post. Every thread has a feed at
+`/t/{id}.rss`, and `/u/{name}` lists a member's recent posts.
+
+Mail goes through [Resend](https://resend.com), the one external service:
+
+```sh
+wrangler secret put RESEND_API_KEY          # from the Resend dashboard
+# and in wrangler.toml [vars]:
+#   EMAIL_FROM = "notespace <no-reply@your.domain>"   # a domain verified with Resend
+#   SITE_NAME  = "notespace"
+#   REQUIRE_EMAIL = "false"                            # "true" to make it mandatory
+```
+
+With either the key or the sender missing, mail is simply off: accounts still work, addresses
+stay unconfirmed, and `/forgot` accepts requests it cannot fulfil (and logs that it could not).
+The Resend free plan is 100 mails a day and 3,000 a month.
 
 ## Moderation
 
@@ -122,8 +150,11 @@ mapping, the BigQuery alternative, and what it costs against a deployed D1.
 
 Not a one-liner yet (that is M5). `wrangler.toml` targets the `notespace-dev` Worker and
 database; a fresh instance needs its own `wrangler d1 create`, `wrangler queues create
-notespace-moderation`, `wrangler secret put CSRF_KEY`, and the returned ids pasted in. There is
-no email, so no password reset; and no user-facing way to grant the moderator role.
+notespace-moderation`, `wrangler secret put CSRF_KEY`, and the returned ids pasted in. Local
+password login is a cargo feature, passed through the build as
+`NOTESPACE_FEATURES=password wrangler deploy` (or `wrangler dev`); without it, `/login`,
+`/register` and `/forgot` answer 404 and authentication is expected to be external. There is no
+user-facing way to grant the moderator role.
 
 ## Layout
 

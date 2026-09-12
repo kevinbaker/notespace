@@ -30,7 +30,11 @@ workers_dev = false
 # Wrangler runs this through /bin/sh, which does not source your shell profile, so ~/.cargo/bin
 # is usually absent from PATH even when worker-build is installed. Prepending it here avoids
 # "worker-build: not found" (exit 127).
-command = 'PATH="$HOME/.cargo/bin:$PATH" worker-build --release'
+#
+# Cargo features come from NOTESPACE_FEATURES, since wrangler has no flag for them:
+# `NOTESPACE_FEATURES=password wrangler deploy` builds local password login in. Empty is the
+# default build. An empty --features list is accepted by cargo, so the variable can be unset.
+command = 'PATH="$HOME/.cargo/bin:$PATH" worker-build --release -- --features "${NOTESPACE_FEATURES:-}"'
 cwd = "crates/worker"
 
 [[d1_databases]]
@@ -86,6 +90,20 @@ MOD_PROVIDER = "workers_ai"
 # Comma-separated usernames who may work /mod/queue in addition to anyone with the moderator
 # role in the database. The bootstrap path for the first admin.
 MODERATORS = ""
+
+# Outbound mail, through Resend (https://resend.com): address verification, password reset,
+# and the "your password changed" notice. Needs `wrangler secret put RESEND_API_KEY` AND a sender
+# on a domain verified in the Resend dashboard; with either missing, mail is off -- accounts
+# still work, addresses stay unconfirmed, and /forgot accepts requests it cannot fulfil (logged).
+# The free plan allows 100 mails a day and 3,000 a month, which a small forum stays under.
+EMAIL_FROM = ""
+# Names the site in mail subjects and bodies.
+SITE_NAME = "notespace"
+# "true" makes an address mandatory at signup. Only sensible once mail is configured.
+REQUIRE_EMAIL = "false"
+# Where links in mail point. Empty means the request's own host, which is right when there is
+# one hostname; set it when the Worker is reached through several.
+BASE_URL = ""
 
 [observability]
 enabled = true

@@ -2,15 +2,17 @@
 //! plus one indexed range scan over `(thread_id, path)`.
 
 use core::cell::Cell;
+use notespace_core::email::{ConsumedToken, EmailAddress, StoredToken, TokenKind};
 use notespace_core::id::PublicId;
 use notespace_core::model::*;
 use notespace_core::moderation::{
-    classify::Call, ActorKind, AgreementStats, Category, LogEntry, NewAction, NewReview,
-    NewSignal, ReportTally, Resolution, ReviewItem, ReviewPost, ReviewReason, WriteContext,
+    classify::Call, ActorKind, AgreementStats, Category, LogEntry, NewAction, NewReview, NewSignal,
+    ReportTally, Resolution, ReviewItem, ReviewPost, ReviewReason, WriteContext,
 };
 use notespace_core::path::Path;
 use notespace_core::ratelimit::{AttemptKeys, Attempts};
 use notespace_core::session::{Session, TokenHash};
+use notespace_core::space_key::SpacePath;
 use notespace_core::sql;
 use notespace_core::store::{
     async_trait, Authenticated, Credential, NextPath, Page, PostLocation, Store, StoreError,
@@ -75,6 +77,55 @@ struct ThreadSummaryRow {
     author_name: String,
     space_name: String,
     space_path: String,
+}
+
+#[derive(Deserialize)]
+struct SpaceRow {
+    id: i64,
+    path: String,
+    name: String,
+    parent_id: Option<i64>,
+    ranking: String,
+    depth_cap: i64,
+}
+
+#[derive(Deserialize)]
+struct UserRow {
+    id: i64,
+    name: String,
+    state: String,
+    role: String,
+}
+
+#[derive(Deserialize)]
+struct ProfileHeadRow {
+    id: i64,
+    name: String,
+    state: String,
+    role: String,
+    created_at: i64,
+}
+
+#[derive(Deserialize)]
+struct ProfilePostRow {
+    public_id: String,
+    thread_public_id: String,
+    thread_title: String,
+    body_html: String,
+    created_at: i64,
+}
+
+#[derive(Deserialize)]
+struct AccountRow {
+    email: Option<String>,
+    email_verified_at: Option<i64>,
+    has_password: i64,
+}
+
+#[derive(Deserialize)]
+struct ConsumedRow {
+    user_id: i64,
+    email: String,
 }
 
 #[derive(Deserialize)]
@@ -174,6 +225,65 @@ struct FoundRow {
 
 fn parse_id(raw: &str, what: &str) -> StoreResult<PublicId> {
     PublicId::parse(raw).map_err(|e| StoreError::Corrupt(format!("{what} {raw:?}: {e}")))
+}
+
+fn summary_from_row(r: ThreadSummaryRow) -> StoreResult<ThreadSummary> {
+    Ok(ThreadSummary {
+        public_id: parse_id(&r.public_id, "thread public_id")?,
+        title: r.title,
+        post_count: r.post_count.max(0) as u32,
+        bumped_at: r.bumped_at,
+        author_name: r.author_name,
+        space_name: r.space_name,
+        space_path: r.space_path,
+    })
+}
+
+fn space_from_row(r: SpaceRow) -> Space {
+    Space {
+        id: r.id,
+        path: r.path,
+        name: r.name,
+        parent_id: r.parent_id,
+        ranking: ranking(&r.ranking),
+        depth_cap: r.depth_cap.clamp(0, i64::from(u32::MAX)) as u32,
+    }
+}
+
+fn user_from_row(r: UserRow) -> User {
+    User {
+        id: r.id,
+        name: r.name,
+        state: r.state.parse().unwrap_or_default(),
+        role: r.role.parse().unwrap_or_default(),
+    }
+}
+
+fn write_context_from_row(r: WriteContextRow) -> WriteContext {
+    WriteContext {
+        space_id: r.space_id,
+        space_config: r.space_config,
+        thread_state: thread_state(&r.thread_state),
+        author_created_at: r.author_created_at,
+        author_role: r.author_role.parse().unwrap_or_default(),
+    }
+}
+
+/// `Conflict` for a unique-index violation, which D1 reports as a message rather than a code.
+fn write_error(e: impl std::fmt::Display) -> StoreError {
+    let msg = e.to_string();
+    if msg.contains("UNIQUE constraint failed") {
+        StoreError::Conflict
+    } else {
+        StoreError::Backend(msg)
+    }
+}
+
+fn opt_str(v: Option<&str>) -> worker::wasm_bindgen::JsValue {
+    match v {
+        Some(s) => s.into(),
+        None => worker::wasm_bindgen::JsValue::NULL,
+    }
 }
 
 fn review_from_row(r: ReviewRow) -> StoreResult<ReviewItem> {
@@ -736,31 +846,269 @@ impl Store for D1Store {
     }
 
     async fn recent_threads(&self, limit: u32) -> StoreResult<Vec<ThreadSummary>> {
+        let rows: Vec<ThreadSummaryRow> = self
+            .query(sql::RECENT_THREADS, vec![num(limit as i64)])
+            .await?;
+        rows.into_iter().map(summary_from_row).collect()
+    }
+
+    async fn space_threads(
+        &self,
+        space: &SpacePath,
+        limit: u32,
+    ) -> StoreResult<Vec<ThreadSummary>> {
+        let (lo, hi) = space.subtree_range();
+        let rows: Vec<ThreadSummaryRow> = self
+            .query(
+                sql::SPACE_THREADS,
+                vec![lo.as_str().into(), hi.as_str().into(), num(limit as i64)],
+            )
+            .await?;
+        rows.into_iter().map(summary_from_row).collect()
+    }
+
+    async fn space_by_path(&self, path: &SpacePath) -> StoreResult<Option<Space>> {
+        let rows: Vec<SpaceRow> = self
+            .query(sql::SPACE_BY_PATH, vec![path.as_stored().into()])
+            .await?;
+        Ok(rows.into_iter().next().map(space_from_row))
+    }
+
+    async fn spaces_under(&self, parent: Option<SpaceId>) -> StoreResult<Vec<Space>> {
+        let bind = match parent {
+            Some(id) => num(id),
+            None => worker::wasm_bindgen::JsValue::NULL,
+        };
+        let rows: Vec<SpaceRow> = self.query(sql::SPACES_UNDER, vec![bind]).await?;
+        Ok(rows.into_iter().map(space_from_row).collect())
+    }
+
+    async fn space_context(&self, space: SpaceId, author: UserId) -> StoreResult<WriteContext> {
+        let rows: Vec<WriteContextRow> = self
+            .query(sql::SPACE_CONTEXT, vec![num(space), num(author)])
+            .await?;
+        rows.into_iter()
+            .next()
+            .map(write_context_from_row)
+            .ok_or(StoreError::NotFound)
+    }
+
+    async fn create_thread(&self, t: &NewThread) -> StoreResult<Thread> {
         let res = self
             .db
-            .prepare(sql::RECENT_THREADS)
-            .bind(&[num(limit as i64)])
+            .prepare(sql::INSERT_THREAD)
+            .bind(&[
+                t.public_id.as_str().into(),
+                num(t.space_id),
+                t.space_path.as_str().into(),
+                t.kind.as_str().into(),
+                t.title.as_str().into(),
+                opt_str(t.url.as_deref()),
+                num(t.author_id),
+                num(t.created_at),
+            ])
             .map_err(backend)?
-            .all()
+            .run()
             .await
-            .map_err(backend)?;
+            .map_err(write_error)?;
         self.last_stats.set(collect_stats(&[&res]));
-        let rows: Vec<ThreadSummaryRow> = res.results().map_err(backend)?;
+        let id = res
+            .meta()
+            .ok()
+            .flatten()
+            .and_then(|m| m.last_row_id)
+            .ok_or_else(|| StoreError::Backend("insert reported no row id".into()))?;
+        Ok(Thread {
+            id,
+            public_id: t.public_id.clone(),
+            space_id: t.space_id,
+            kind: t.kind,
+            title: t.title.clone(),
+            url: t.url.clone(),
+            author_id: t.author_id,
+            author_name: String::new(),
+            created_at: t.created_at,
+            bumped_at: t.created_at,
+            post_count: 0,
+            state: ThreadState::Visible,
+            cache_version: 0,
+        })
+    }
+
+    async fn update_post_body(
+        &self,
+        post: &PublicId,
+        body_md: &str,
+        body_html: &SanitizedHtml,
+        edited_at: Timestamp,
+    ) -> StoreResult<()> {
+        let update = self
+            .db
+            .prepare(sql::UPDATE_POST_BODY)
+            .bind(&[
+                post.as_str().into(),
+                body_md.into(),
+                body_html.as_str().into(),
+                num(edited_at),
+            ])
+            .map_err(backend)?;
+        let bump = self
+            .db
+            .prepare(sql::BUMP_THREAD_FOR_POST)
+            .bind(&[post.as_str().into()])
+            .map_err(backend)?;
+        // One batch: the body and the page version move together or not at all.
+        let results = self.db.batch(vec![update, bump]).await.map_err(backend)?;
+        let refs: Vec<&D1Result> = results.iter().collect();
+        self.last_stats.set(collect_stats(&refs));
+        let changed = results
+            .first()
+            .and_then(|r| r.meta().ok().flatten())
+            .and_then(|m| m.changes)
+            .unwrap_or(0);
+        if changed == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn user_profile(&self, name: &str, limit: u32) -> StoreResult<Option<Profile>> {
+        let heads: Vec<ProfileHeadRow> = self.query(sql::USER_PROFILE, vec![name.into()]).await?;
+        let Some(head) = heads.into_iter().next() else {
+            return Ok(None);
+        };
+        let stats = self.last_stats();
+        let rows: Vec<ProfilePostRow> = self
+            .query(
+                sql::USER_RECENT_POSTS,
+                vec![num(head.id), num(limit as i64)],
+            )
+            .await?;
+        self.last_stats.set(stats.plus(self.last_stats()));
+        let mut posts = Vec::with_capacity(rows.len());
+        for r in rows {
+            posts.push(ProfilePost {
+                public_id: parse_id(&r.public_id, "post public_id")?,
+                thread_public_id: parse_id(&r.thread_public_id, "thread public_id")?,
+                thread_title: r.thread_title,
+                body_html: r.body_html,
+                created_at: r.created_at,
+            });
+        }
+        Ok(Some(Profile {
+            user: User {
+                id: head.id,
+                name: head.name,
+                state: head.state.parse().unwrap_or_default(),
+                role: head.role.parse().unwrap_or_default(),
+            },
+            created_at: head.created_at,
+            posts,
+        }))
+    }
+
+    // -- Email ----------------------------------------------------------------
+
+    async fn account(&self, user: UserId) -> StoreResult<Option<Account>> {
+        let rows: Vec<AccountRow> = self.query(sql::ACCOUNT, vec![num(user)]).await?;
+        Ok(rows.into_iter().next().map(|r| Account {
+            email: r.email,
+            email_verified_at: r.email_verified_at,
+            has_password: r.has_password != 0,
+        }))
+    }
+
+    async fn user_by_verified_email(&self, email: &str) -> StoreResult<Option<User>> {
+        let rows: Vec<UserRow> = self
+            .query(sql::USER_BY_VERIFIED_EMAIL, vec![email.into()])
+            .await?;
+        Ok(rows.into_iter().next().map(user_from_row))
+    }
+
+    async fn set_email(&self, user: UserId, email: Option<&str>) -> StoreResult<()> {
+        self.run(sql::SET_EMAIL, vec![num(user), opt_str(email)])
+            .await
+            .map(|_| ())
+    }
+
+    async fn mark_email_verified(
+        &self,
+        user: UserId,
+        email: &str,
+        now: Timestamp,
+    ) -> StoreResult<bool> {
+        let res = self
+            .db
+            .prepare(sql::MARK_EMAIL_VERIFIED)
+            .bind(&[num(user), email.into(), num(now)])
+            .map_err(backend)?
+            .run()
+            .await
+            .map_err(write_error)?;
+        self.last_stats.set(collect_stats(&[&res]));
+        Ok(res
+            .meta()
+            .ok()
+            .flatten()
+            .and_then(|m| m.changes)
+            .unwrap_or(0)
+            > 0)
+    }
+
+    async fn create_email_token(&self, t: &StoredToken) -> StoreResult<()> {
+        self.run(
+            sql::INSERT_EMAIL_TOKEN,
+            vec![
+                t.token_hash.as_str().into(),
+                num(t.user_id),
+                t.kind.as_str().into(),
+                t.email.as_str().into(),
+                num(t.created_at),
+                num(t.expires_at),
+            ],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn consume_email_token(
+        &self,
+        token_hash: &str,
+        kind: TokenKind,
+        now: Timestamp,
+    ) -> StoreResult<Option<ConsumedToken>> {
+        // `RETURNING` makes the update its own read.
+        let rows: Vec<ConsumedRow> = self
+            .query(
+                sql::CONSUME_EMAIL_TOKEN,
+                vec![token_hash.into(), kind.as_str().into(), num(now)],
+            )
+            .await?;
         rows.into_iter()
+            .next()
             .map(|r| {
-                Ok(ThreadSummary {
-                    public_id: PublicId::parse(&r.public_id).map_err(|e| {
-                        StoreError::Corrupt(format!("thread public_id {:?}: {e}", r.public_id))
-                    })?,
-                    title: r.title,
-                    post_count: r.post_count.max(0) as u32,
-                    bumped_at: r.bumped_at,
-                    author_name: r.author_name,
-                    space_name: r.space_name,
-                    space_path: r.space_path,
+                Ok(ConsumedToken {
+                    user_id: r.user_id,
+                    email: EmailAddress::parse(&r.email)
+                        .map_err(|e| StoreError::Corrupt(format!("token email: {e}")))?,
                 })
             })
-            .collect()
+            .transpose()
+    }
+
+    async fn retire_email_tokens(
+        &self,
+        user: UserId,
+        kind: TokenKind,
+        now: Timestamp,
+    ) -> StoreResult<u32> {
+        Ok(self
+            .run(
+                sql::RETIRE_EMAIL_TOKENS,
+                vec![num(user), kind.as_str().into(), num(now)],
+            )
+            .await?
+            .unwrap_or(0))
     }
 
     async fn thread_version(&self, thread: &PublicId) -> StoreResult<Option<i64>> {
@@ -801,6 +1149,11 @@ impl Store for D1Store {
             },
             password_hash: r.password_hash,
         }))
+    }
+
+    async fn user_by_id(&self, id: UserId) -> StoreResult<Option<User>> {
+        let rows: Vec<UserRow> = self.query(sql::USER_BY_ID, vec![num(id)]).await?;
+        Ok(rows.into_iter().next().map(user_from_row))
     }
 
     async fn create_user(
@@ -977,16 +1330,15 @@ impl Store for D1Store {
 
     async fn write_context(&self, thread: &PublicId, author: UserId) -> StoreResult<WriteContext> {
         let rows: Vec<WriteContextRow> = self
-            .query(sql::WRITE_CONTEXT, vec![thread.as_str().into(), num(author)])
+            .query(
+                sql::WRITE_CONTEXT,
+                vec![thread.as_str().into(), num(author)],
+            )
             .await?;
-        let r = rows.into_iter().next().ok_or(StoreError::NotFound)?;
-        Ok(WriteContext {
-            space_id: r.space_id,
-            space_config: r.space_config,
-            thread_state: thread_state(&r.thread_state),
-            author_created_at: r.author_created_at,
-            author_role: r.author_role.parse().unwrap_or_default(),
-        })
+        rows.into_iter()
+            .next()
+            .map(write_context_from_row)
+            .ok_or(StoreError::NotFound)
     }
 
     async fn author_posted_recently(
@@ -1192,9 +1544,7 @@ impl Store for D1Store {
     }
 
     async fn public_log(&self, limit: u32) -> StoreResult<Vec<LogEntry>> {
-        let rows: Vec<LogRow> = self
-            .query(sql::PUBLIC_LOG, vec![num(limit as i64)])
-            .await?;
+        let rows: Vec<LogRow> = self.query(sql::PUBLIC_LOG, vec![num(limit as i64)]).await?;
         Ok(rows
             .into_iter()
             .map(|r| LogEntry {

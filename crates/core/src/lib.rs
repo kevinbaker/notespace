@@ -4,10 +4,14 @@
 //! dependency that cannot compile to `wasm32-unknown-unknown`. Everything
 //! here is unit-testable without a database or a network.
 
+pub mod account;
 pub mod cache_key;
+pub mod compose;
 pub mod conformance;
 pub mod cookie;
 pub mod csrf;
+pub mod edit;
+pub mod email;
 pub mod id;
 #[cfg(feature = "password")]
 pub mod login;

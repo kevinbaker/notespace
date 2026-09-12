@@ -40,18 +40,24 @@ pub async fn get(key: &str, spent: &str) -> Option<Response> {
 
 /// Errors are swallowed: a cache that will not accept a write should not fail the pageview.
 pub async fn put(key: &str, html: &str, server_timing: &str) {
+    put_typed(key, html, PAGE_HEADERS[0].1, server_timing).await
+}
+
+/// The same headers as a page, with a different content type: a feed shares the page's
+/// invariants and its key scheme.
+pub async fn put_typed(key: &str, body: &str, content_type: &str, server_timing: &str) {
     let headers = Headers::new();
     for (k, v) in PAGE_HEADERS {
+        let v = if k == "content-type" { content_type } else { v };
         if headers.set(k, v).is_err() {
             return;
         }
     }
     let _ = headers.set("server-timing", server_timing);
+    // `fixed` rather than `from_html`, which would overwrite the content type just set.
     let stored = WorkerResponse::builder()
         .with_status(200)
         .with_headers(headers)
-        .from_html(html);
-    if let Ok(resp) = stored {
-        let _ = Cache::default().put(key, resp).await;
-    }
+        .fixed(body.as_bytes().to_vec());
+    let _ = Cache::default().put(key, stored).await;
 }

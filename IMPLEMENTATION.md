@@ -74,8 +74,12 @@ property-tested in the same module.
 | Space keys and paths, unique per parent | `crates/core/src/space_key.rs` |
 | Schema | `migrations/0003_space_paths_and_names.sql` |
 
-Not yet served: there are no `/s/{path}` or `/u/{name}` routes. The types exist and are tested;
-nothing routes to them.
+| Space page and new-thread form | `/s/{*path}` in `crates/worker/src/posting.rs` — `space`, `space_post` |
+| Profile | `/u/{name}` — `posting::profile`; `Store::user_profile`; `crates/render/src/profile.rs` |
+
+A space lists its own threads and every subspace's, through `Store::space_threads` and the
+`SpacePath::subtree_range` scan; `migrations/0009_email_and_spaces.sql` backfills
+`thread.space_path` so seeded rows are included.
 
 ## §4.7 Post public ids
 
@@ -88,6 +92,23 @@ returns the page cursor that makes the post's anchor reachable; the arithmetic i
 
 Not implemented. `migrations/0004_post_public_id.sql` carries the note about what archiving will
 need.
+
+## Email and account self-service
+
+| what | where |
+|---|---|
+| Addresses, tokens, messages, the `Mailer` seam, Resend's request shape | `crates/core/src/email.rs` |
+| Verification, address change, reset request/completion, password change | `crates/core/src/account.rs` — `send_verification`, `change_email`, `confirm_email`, `request_reset`, `complete_reset`, `change_password` |
+| Signup's email field and verification mail | `crates/core/src/register.rs` — `Signup.email`, `RegisterConfig.require_email` |
+| Resend transport, link base URL, the vars | `crates/worker/src/mail.rs` — `Resend`, `MaybeMailer`, `LinkConfig` |
+| Handlers | `crates/worker/src/account.rs` — `/settings`, `/settings/{email,password,sessions}`, `/verify`, `/forgot`, `/reset` |
+| Pages | `crates/render/src/account.rs` |
+| Store methods | `Store::account` through `Store::retire_email_tokens` |
+| Schema | `migrations/0009_email_and_spaces.sql` — `user.email`, `user.email_verified_at`, `email_token` |
+| Flows end to end with a recording mailer | `crates/store-sqlite/tests/account.rs` |
+
+Mail is off unless `RESEND_API_KEY` and `EMAIL_FROM` are both set; every flow works without it
+and says so. Password recovery needs the `password` feature; verification does not.
 
 ## §4.9 Sessions
 
@@ -135,6 +156,15 @@ cookie used before a session exists is `cookie::ANON`.
 
 The form is a separate uncached page, not part of the baked thread.
 
+| Starting a thread | `crates/core/src/compose.rs` — `create`, `check`; `Store::create_thread`, `Store::space_context` |
+| Editing and deleting | `crates/core/src/edit.rs` — `edit`, `delete`; `Store::update_post_body` |
+| Handlers | `crates/worker/src/posting.rs` — `compose_form`, `compose_submit`, `edit_form`, `edit_submit`, `delete_submit` |
+| Forms | `crates/render/src/compose.rs` |
+| RSS | `crates/render/src/feed.rs` — `thread_rss`; `posting::feed`, reached from `/t/{id}.rss` |
+| Against a real store | `crates/store-sqlite/tests/posting.rs` |
+
+Tier 0 is shared: `reply::triage` runs for a reply, a new thread (title included), and an edit.
+
 Not built: the progressive enhancement described in DESIGN.md §7.1 that opens the form in place
 when JS is available. There is no `/api/me/thread/{id}` endpoint yet, which is where the CSRF
 token for that path has to come from.
@@ -150,10 +180,7 @@ token for that path has to come from.
 | Index route | `/` in `crates/worker/src/lib.rs` |
 
 The index is uncached: every reply bumps a thread and reorders the list, so a version key would
-change on nearly every write.
-
-Two dangling links in the UI: `/s/{path}` in the thread header and `/u/{name}` on every byline
-both 404, because neither route exists.
+change on nearly every write. It also lists the top-level spaces (`Store::spaces_under`).
 
 ## §5 Moderation pipeline
 
@@ -190,8 +217,9 @@ is how the first moderator comes to exist. There is no UI for granting the role;
 update for now.
 
 Not built: a general rule engine (the heuristics are fixed code with policy-supplied numbers),
-reporter accuracy weighting, per-user notification that a post was held or hidden, and the
-author's view of their own pending post -- the baked page shows everyone the same tombstone.
+reporter accuracy weighting, per-user notification that a post was held or hidden, the
+author's view of their own pending post -- the baked page shows everyone the same tombstone --
+and a pending state for a *thread*: a held first post leaves its title visible.
 
 ## §6 Presets
 
@@ -200,20 +228,25 @@ There is no preset table or selector yet.
 
 ## §7 Routes
 
-`router()` in `crates/worker/src/lib.rs` is the live list. Currently: `/`, `/healthz`, `/t/{id}`,
-`/t/{id}/{slug}`, `/p/{id}`, `/t/{id}/reply`, `/t/{id}/held/{post}`, `/p/{id}/report`,
+`router()` in `crates/worker/src/lib.rs` is the live list. Currently: `/`, `/healthz`,
+`/s/{path}`, `/s/{path}/new`, `/u/{name}`, `/t/{id}`, `/t/{id}.rss`, `/t/{id}/{slug}`, `/p/{id}`,
+`/p/{id}/edit`, `/p/{id}/delete`, `/t/{id}/reply`, `/t/{id}/held/{post}`, `/p/{id}/report`,
 `/p/{id}/appeal`, `/mod/queue`, `/mod/review/{id}`, `/modlog`, `/login`, `/logout`, `/register`,
+`/settings`, `/settings/{email,password,sessions}`, `/verify`, `/forgot`, `/reset`,
 `/__conformance`.
+
+Not served from the sketch: `POST /p/{id}/signal` (votes), `/api/me/thread/{id}`,
+`/uploads/sign`, and `/t/{id}/live`.
 
 `SpaceKey::RESERVED` and `Username::RESERVED` are hand-maintained and should be derived from this
 router instead.
 
 ## §8 Milestones
 
-M0 and the read path are done and measured. M1's `Store` seam is done. M2 is partial: login,
-logout, registration and the reply form exist; edit/delete and RSS do not. M4's moderation
-pipeline is in, ahead of M3, because the write path needed it. `crates/server` (M5) does not
-exist.
+M0 and the read path are done and measured. M1's `Store` seam is done. M2 is done except for
+htmx and voting: auth, sessions, registration with email, spaces, threads, nested replies,
+edit/delete with tombstones, RSS. M4's moderation pipeline is in, ahead of M3, because the
+write path needed it. `crates/server` (M5) does not exist.
 
 ---
 

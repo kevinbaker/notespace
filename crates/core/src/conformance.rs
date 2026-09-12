@@ -10,7 +10,10 @@ use crate::id::PublicId;
 
 /// Page size the suite paginates by. Only has to be self-consistent.
 const PAGE_SIZE: u32 = 200;
-use crate::model::{NewPost, PostState, SanitizedHtml};
+use crate::email::{
+    EmailAddress, EmailToken, StoredToken, TokenKind, TOKEN_BYTES as EMAIL_TOKEN_BYTES,
+};
+use crate::model::{NewPost, NewThread, PostState, SanitizedHtml, ThreadKind};
 use crate::moderation::classify::{Call, Verdict};
 use crate::moderation::{
     ActorKind, NewAction, NewReview, NewSignal, Resolution, ReviewReason, SIGNAL_REPORT,
@@ -18,6 +21,7 @@ use crate::moderation::{
 use crate::path::Path;
 use crate::ratelimit::{AttemptKeys, Attempts, Limit};
 use crate::session::{Session, SessionPolicy, SessionToken, TOKEN_BYTES};
+use crate::space_key::SpacePath;
 use crate::store::{Page, Store, StoreError};
 
 /// What the suite expects the store to already contain.
@@ -32,9 +36,15 @@ pub struct Fixture {
     pub known_post_path: Path,
     /// A well-formed id that is definitely absent.
     pub absent: PublicId,
-    /// At least 4, or empty to skip the write checks. Supplied because `core` has no RNG.
+    /// At least [`Fixture::WRITABLE`], or empty to skip the write checks. Supplied because
+    /// `core` has no RNG.
     pub writable: Vec<PublicId>,
     pub author_id: i64,
+}
+
+impl Fixture {
+    /// Ids the write checks consume: four posts, a thread, and its first post.
+    pub const WRITABLE: usize = 6;
 }
 
 /// Outcome of one check.
@@ -94,7 +104,7 @@ pub async fn run_all<S: Store>(store: &S, fx: &Fixture) -> Vec<Check> {
 
 /// Run last, because they mutate the thread; everything above assumes a stable post count.
 async fn write_checks<S: Store>(store: &S, fx: &Fixture) -> Vec<Check> {
-    if fx.writable.len() < 4 {
+    if fx.writable.len() < Fixture::WRITABLE {
         return vec![Check::pass("write checks skipped (read-only fixture)")];
     }
     vec![
@@ -119,14 +129,495 @@ async fn write_checks<S: Store>(store: &S, fx: &Fixture) -> Vec<Check> {
         a_review_opens_once_keeps_its_verdict_and_resolves_once(store, fx).await,
         reports_count_distinct_reporters(store, fx).await,
         the_sweep_lists_pending_posts_nobody_is_looking_at(store, fx).await,
+        // Spaces, new threads, editing, profiles.
+        spaces_resolve_by_path_and_list_their_threads(store, fx).await,
+        a_new_thread_is_created_listed_and_writable(store, fx).await,
+        editing_rewrites_the_body_and_bumps_the_version(store, fx).await,
+        a_profile_lists_the_users_visible_posts_newest_first(store, fx).await,
+        // Email.
+        email_tokens_are_spent_exactly_once_and_only_as_their_kind(store, fx).await,
+        a_verified_address_belongs_to_one_account(store, fx).await,
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Spaces, threads, editing, profiles
+// ---------------------------------------------------------------------------
+
+async fn spaces_resolve_by_path_and_list_their_threads<S: Store>(store: &S, fx: &Fixture) -> Check {
+    const NAME: &str = "space_by_path, spaces_under and space_threads agree with thread_page";
+    let page = match store.thread_page(&fx.thread, &Page::first(1)).await {
+        Ok(p) => p,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    let path = match SpacePath::parse(&page.space.path) {
+        Ok(p) => p,
+        Err(e) => return Check::fail(NAME, format!("space path {:?}: {e}", page.space.path)),
+    };
+    let space = match store.space_by_path(&path).await {
+        Ok(Some(s)) => s,
+        other => return Check::fail(NAME, format!("space_by_path: {other:?}")),
+    };
+    require!(
+        NAME,
+        space.id == page.space.id,
+        "resolved a different space"
+    );
+    require!(
+        NAME,
+        space.path == page.space.path,
+        "path not round-tripped"
+    );
+    let siblings = match store.spaces_under(space.parent_id).await {
+        Ok(v) => v,
+        Err(e) => return Check::fail(NAME, format!("spaces_under: {e}")),
+    };
+    require!(
+        NAME,
+        siblings.iter().any(|s| s.id == space.id),
+        "the space is not listed under its parent"
+    );
+    let listed = match store.space_threads(&path, 1000).await {
+        Ok(v) => v,
+        Err(e) => return Check::fail(NAME, format!("space_threads: {e}")),
+    };
+    require!(
+        NAME,
+        listed.iter().any(|t| t.public_id == fx.thread),
+        "the fixture thread is not listed in its space"
+    );
+    require!(
+        NAME,
+        listed.windows(2).all(|w| w[0].bumped_at >= w[1].bumped_at),
+        "not most-recently-bumped first"
+    );
+    let ctx = match store.space_context(space.id, fx.author_id).await {
+        Ok(c) => c,
+        Err(e) => return Check::fail(NAME, format!("space_context: {e}")),
+    };
+    require!(NAME, ctx.space_id == space.id, "space_context: wrong space");
+    require!(
+        NAME,
+        ctx.author_created_at > 0,
+        "space_context: author not read"
+    );
+    match store.space_context(i64::MAX - 9, fx.author_id).await {
+        Err(StoreError::NotFound) => {}
+        other => return Check::fail(NAME, format!("absent space: {other:?}")),
+    }
+    let absent = SpacePath::parse("no-such-space-here").expect("valid path");
+    match store.space_by_path(&absent).await {
+        Ok(None) => Check::pass(NAME),
+        other => Check::fail(NAME, format!("absent path: {other:?}")),
+    }
+}
+
+async fn a_new_thread_is_created_listed_and_writable<S: Store>(store: &S, fx: &Fixture) -> Check {
+    const NAME: &str = "create_thread makes a listed, readable thread that accepts posts once";
+    let page = match store.thread_page(&fx.thread, &Page::first(1)).await {
+        Ok(p) => p,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    let new = NewThread {
+        public_id: fx.writable[4].clone(),
+        space_id: page.space.id,
+        space_path: page.space.path.clone(),
+        kind: ThreadKind::Link,
+        title: "Conformance thread".into(),
+        url: Some("https://example.com/conformance".into()),
+        author_id: fx.author_id,
+        created_at: NOW + 5,
+    };
+    let thread = match store.create_thread(&new).await {
+        Ok(t) => t,
+        Err(e) => return Check::fail(NAME, format!("create: {e}")),
+    };
+    require!(NAME, thread.id > 0, "no row id");
+    require!(NAME, thread.public_id == new.public_id, "id not preserved");
+    match store.create_thread(&new).await {
+        Err(StoreError::Conflict) => {}
+        other => return Check::fail(NAME, format!("reused id: {other:?}")),
+    }
+    let first = match store
+        .insert_post(&NewPost {
+            public_id: fx.writable[5].clone(),
+            thread: new.public_id.clone(),
+            parent: None,
+            author_id: fx.author_id,
+            body_md: "first post".into(),
+            body_html: SanitizedHtml::assert_sanitized("<p>first post</p>".into()),
+            created_at: NOW + 5,
+            state: PostState::Visible,
+        })
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return Check::fail(NAME, format!("first post: {e}")),
+    };
+    require!(NAME, first.depth == 0, "first post is not at the root");
+    let read = match store.thread_page(&new.public_id, &Page::first(10)).await {
+        Ok(p) => p,
+        Err(e) => return Check::fail(NAME, format!("read back: {e}")),
+    };
+    require!(
+        NAME,
+        read.thread.title == "Conformance thread",
+        "title lost"
+    );
+    require!(NAME, read.thread.kind == ThreadKind::Link, "kind lost");
+    require!(
+        NAME,
+        read.thread.url.as_deref() == Some("https://example.com/conformance"),
+        "url lost"
+    );
+    require!(
+        NAME,
+        read.thread.post_count == 1,
+        "post_count {}",
+        read.thread.post_count
+    );
+    require!(NAME, read.posts.len() == 1, "{} posts", read.posts.len());
+    require!(
+        NAME,
+        !read.thread.author_name.is_empty(),
+        "author not joined"
+    );
+    let path = match SpacePath::parse(&page.space.path) {
+        Ok(p) => p,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    let listed = match store.space_threads(&path, 1000).await {
+        Ok(v) => v,
+        Err(e) => return Check::fail(NAME, format!("space_threads: {e}")),
+    };
+    require!(
+        NAME,
+        listed.first().map(|t| &t.public_id) == Some(&new.public_id),
+        "the new thread is not first in its space"
+    );
+    match store.recent_threads(1000).await {
+        Ok(v) => require!(
+            NAME,
+            v.iter().any(|t| t.public_id == new.public_id),
+            "the new thread is missing from the index"
+        ),
+        Err(e) => return Check::fail(NAME, format!("recent_threads: {e}")),
+    }
+    Check::pass(NAME)
+}
+
+async fn editing_rewrites_the_body_and_bumps_the_version<S: Store>(
+    store: &S,
+    fx: &Fixture,
+) -> Check {
+    const NAME: &str =
+        "update_post_body rewrites both bodies, sets edited_at and bumps the version";
+    let post = &fx.writable[0];
+    let before = match store.thread_version(&fx.thread).await {
+        Ok(Some(v)) => v,
+        other => return Check::fail(NAME, format!("version: {other:?}")),
+    };
+    if let Err(e) = store
+        .update_post_body(
+            post,
+            "top level, edited",
+            &SanitizedHtml::assert_sanitized("<p>top level, edited</p>".into()),
+            NOW + 9,
+        )
+        .await
+    {
+        return Check::fail(NAME, format!("update: {e}"));
+    }
+    let rp = match store.post_for_review(post).await {
+        Ok(rp) => rp,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    require!(
+        NAME,
+        rp.body_md == "top level, edited",
+        "body_md not rewritten"
+    );
+    let after = match store.thread_version(&fx.thread).await {
+        Ok(Some(v)) => v,
+        other => return Check::fail(NAME, format!("version: {other:?}")),
+    };
+    require!(
+        NAME,
+        after > before,
+        "cache_version went {before} -> {after}"
+    );
+    let page = match store
+        .thread_page(&fx.thread, &Page::first(fx.post_count + 10))
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    let Some(shown) = page.posts.iter().find(|p| &p.public_id == post) else {
+        return Check::fail(NAME, "edited post missing from its page");
+    };
+    require!(
+        NAME,
+        shown.body_html.contains("edited"),
+        "body_html not rewritten"
+    );
+    require!(
+        NAME,
+        shown.edited_at == Some(NOW + 9),
+        "edited_at not set: {:?}",
+        shown.edited_at
+    );
+    // Restore, for the checks that follow.
+    if let Err(e) = store
+        .update_post_body(
+            post,
+            "top level",
+            &SanitizedHtml::assert_sanitized("<p>top level</p>".into()),
+            NOW + 10,
+        )
+        .await
+    {
+        return Check::fail(NAME, format!("restore: {e}"));
+    }
+    match store
+        .update_post_body(
+            &fx.absent,
+            "x",
+            &SanitizedHtml::assert_sanitized("<p>x</p>".into()),
+            NOW,
+        )
+        .await
+    {
+        Err(StoreError::NotFound) => Check::pass(NAME),
+        other => Check::fail(NAME, format!("absent post: {other:?}")),
+    }
+}
+
+async fn a_profile_lists_the_users_visible_posts_newest_first<S: Store>(
+    store: &S,
+    fx: &Fixture,
+) -> Check {
+    const NAME: &str = "user_profile finds the user and lists visible posts newest first";
+    let name = match store.thread_page(&fx.thread, &Page::first(1)).await {
+        Ok(p) => p.thread.author_name,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    let profile = match store.user_profile(&name, 1000).await {
+        Ok(Some(p)) => p,
+        other => return Check::fail(NAME, format!("profile of {name:?}: {other:?}")),
+    };
+    require!(NAME, profile.user.name == name, "wrong user");
+    require!(NAME, profile.created_at > 0, "created_at not read");
+    require!(
+        NAME,
+        profile.posts.iter().any(|p| p.public_id == fx.writable[0]),
+        "a visible post by the user is missing"
+    );
+    require!(
+        NAME,
+        profile
+            .posts
+            .windows(2)
+            .all(|w| w[0].created_at >= w[1].created_at),
+        "not newest first"
+    );
+    require!(
+        NAME,
+        profile.posts.iter().all(|p| !p.thread_title.is_empty()),
+        "thread title not joined"
+    );
+    let limited = match store.user_profile(&name, 2).await {
+        Ok(Some(p)) => p,
+        other => return Check::fail(NAME, format!("{other:?}")),
+    };
+    require!(NAME, limited.posts.len() <= 2, "limit ignored");
+    match store.user_profile("no-such-user-anywhere", 10).await {
+        Ok(None) => Check::pass(NAME),
+        other => Check::fail(NAME, format!("unknown user: {other:?}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Email
+// ---------------------------------------------------------------------------
+
+fn email_token(seed: u8) -> EmailToken {
+    EmailToken::from_bytes([seed; EMAIL_TOKEN_BYTES])
+}
+
+fn stored(fx: &Fixture, token: &EmailToken, kind: TokenKind, expires_at: i64) -> StoredToken {
+    StoredToken {
+        token_hash: token.hash(),
+        user_id: fx.author_id,
+        kind,
+        email: EmailAddress::parse("conformance@example.com").expect("valid"),
+        created_at: NOW,
+        expires_at,
+    }
+}
+
+async fn email_tokens_are_spent_exactly_once_and_only_as_their_kind<S: Store>(
+    store: &S,
+    fx: &Fixture,
+) -> Check {
+    const NAME: &str = "an email token is spent once, as its own kind, before it expires";
+    let live = email_token(0x61);
+    if let Err(e) = store
+        .create_email_token(&stored(fx, &live, TokenKind::Verify, NOW + 1000))
+        .await
+    {
+        return Check::fail(NAME, format!("create: {e}"));
+    }
+    match store
+        .consume_email_token(&live.hash(), TokenKind::Reset, NOW)
+        .await
+    {
+        Ok(None) => {}
+        other => return Check::fail(NAME, format!("spent as the wrong kind: {other:?}")),
+    }
+    match store
+        .consume_email_token(&live.hash(), TokenKind::Verify, NOW + 1000)
+        .await
+    {
+        Ok(None) => {}
+        other => return Check::fail(NAME, format!("spent at its own expiry: {other:?}")),
+    }
+    let got = match store
+        .consume_email_token(&live.hash(), TokenKind::Verify, NOW)
+        .await
+    {
+        Ok(Some(c)) => c,
+        other => return Check::fail(NAME, format!("first spend: {other:?}")),
+    };
+    require!(NAME, got.user_id == fx.author_id, "wrong user");
+    require!(
+        NAME,
+        got.email.as_str() == "conformance@example.com",
+        "address not round-tripped"
+    );
+    match store
+        .consume_email_token(&live.hash(), TokenKind::Verify, NOW)
+        .await
+    {
+        Ok(None) => {}
+        other => return Check::fail(NAME, format!("second spend: {other:?}")),
+    }
+    // Retiring spends every outstanding token of a kind and no other.
+    let a = email_token(0x62);
+    let b = email_token(0x63);
+    let other_kind = email_token(0x64);
+    for (t, kind) in [
+        (&a, TokenKind::Reset),
+        (&b, TokenKind::Reset),
+        (&other_kind, TokenKind::Verify),
+    ] {
+        if let Err(e) = store
+            .create_email_token(&stored(fx, t, kind, NOW + 1000))
+            .await
+        {
+            return Check::fail(NAME, format!("create: {e}"));
+        }
+    }
+    match store
+        .retire_email_tokens(fx.author_id, TokenKind::Reset, NOW)
+        .await
+    {
+        Ok(n) => require!(NAME, n >= 2, "retired {n}, expected at least 2"),
+        Err(e) => return Check::fail(NAME, format!("retire: {e}")),
+    }
+    for t in [&a, &b] {
+        match store
+            .consume_email_token(&t.hash(), TokenKind::Reset, NOW)
+            .await
+        {
+            Ok(None) => {}
+            other => return Check::fail(NAME, format!("retired token still spent: {other:?}")),
+        }
+    }
+    match store
+        .consume_email_token(&other_kind.hash(), TokenKind::Verify, NOW)
+        .await
+    {
+        Ok(Some(_)) => Check::pass(NAME),
+        other => Check::fail(
+            NAME,
+            format!("retiring resets took a verify token: {other:?}"),
+        ),
+    }
+}
+
+async fn a_verified_address_belongs_to_one_account<S: Store>(store: &S, fx: &Fixture) -> Check {
+    const NAME: &str = "an address is claimable by many and verifiable by one";
+    let addr = "conformance-verified@example.com";
+    if let Err(e) = store.set_email(fx.author_id, Some(addr)).await {
+        return Check::fail(NAME, format!("set: {e}"));
+    }
+    match store.account(fx.author_id).await {
+        Ok(Some(a)) => {
+            require!(NAME, a.email.as_deref() == Some(addr), "address not stored");
+            require!(
+                NAME,
+                !a.email_is_verified(),
+                "a fresh address counts as verified"
+            );
+        }
+        other => return Check::fail(NAME, format!("account: {other:?}")),
+    }
+    match store.user_by_verified_email(addr).await {
+        Ok(None) => {}
+        other => return Check::fail(NAME, format!("unverified address resolved: {other:?}")),
+    }
+    match store
+        .mark_email_verified(fx.author_id, "someone-else@example.com", NOW)
+        .await
+    {
+        Ok(false) => {}
+        other => return Check::fail(NAME, format!("verified a mismatched address: {other:?}")),
+    }
+    match store.mark_email_verified(fx.author_id, addr, NOW).await {
+        Ok(true) => {}
+        other => return Check::fail(NAME, format!("verify: {other:?}")),
+    }
+    match store.user_by_verified_email(addr).await {
+        Ok(Some(u)) => require!(NAME, u.id == fx.author_id, "resolved to the wrong user"),
+        other => return Check::fail(NAME, format!("verified address: {other:?}")),
+    }
+    // A second account can claim it but not prove it.
+    let rival = match store.create_user("conformance-rival", NOW, None).await {
+        Ok(id) => id,
+        Err(StoreError::Conflict) => match store.user_by_name("conformance-rival").await {
+            Ok(Some(c)) => c.user.id,
+            other => return Check::fail(NAME, format!("lookup: {other:?}")),
+        },
+        Err(e) => return Check::fail(NAME, format!("create: {e}")),
+    };
+    if let Err(e) = store.set_email(rival, Some(addr)).await {
+        return Check::fail(NAME, format!("rival claim: {e}"));
+    }
+    match store.mark_email_verified(rival, addr, NOW).await {
+        Err(StoreError::Conflict) => {}
+        other => return Check::fail(NAME, format!("rival verified a taken address: {other:?}")),
+    }
+    // Removing the address releases it.
+    if let Err(e) = store.set_email(fx.author_id, None).await {
+        return Check::fail(NAME, format!("clear: {e}"));
+    }
+    match store.account(fx.author_id).await {
+        Ok(Some(a)) => require!(NAME, a.email.is_none(), "address survived removal"),
+        other => return Check::fail(NAME, format!("{other:?}")),
+    }
+    match store.mark_email_verified(rival, addr, NOW).await {
+        Ok(true) => {}
+        other => return Check::fail(NAME, format!("released address not verifiable: {other:?}")),
+    }
+    // Tidy: the rival gives it up too, so a rerun starts clean.
+    let _ = store.set_email(rival, None).await;
+    Check::pass(NAME)
 }
 
 // ---------------------------------------------------------------------------
 // Moderation
 // ---------------------------------------------------------------------------
-
-
 
 async fn write_context_describes_the_space_thread_and_author<S: Store>(
     store: &S,
@@ -142,7 +633,11 @@ async fn write_context_describes_the_space_thread_and_author<S: Store>(
         Err(e) => return Check::fail(NAME, format!("{e}")),
     };
     require!(NAME, ctx.space_id == page.space.id, "wrong space");
-    require!(NAME, ctx.thread_state == page.thread.state, "wrong thread state");
+    require!(
+        NAME,
+        ctx.thread_state == page.thread.state,
+        "wrong thread state"
+    );
     require!(
         NAME,
         ctx.author_created_at > 0,
@@ -171,15 +666,27 @@ async fn duplicate_detection_is_bounded_by_the_window<S: Store>(store: &S, fx: &
     let hit = store
         .author_posted_recently(fx.author_id, "top level", NOW)
         .await;
-    require!(NAME, hit == Ok(true), "did not find the post just written: {hit:?}");
+    require!(
+        NAME,
+        hit == Ok(true),
+        "did not find the post just written: {hit:?}"
+    );
     let late = store
         .author_posted_recently(fx.author_id, "top level", NOW + 1)
         .await;
-    require!(NAME, late == Ok(false), "found a post from before the window: {late:?}");
+    require!(
+        NAME,
+        late == Ok(false),
+        "found a post from before the window: {late:?}"
+    );
     let other = store
         .author_posted_recently(fx.author_id, "top level ", NOW)
         .await;
-    require!(NAME, other == Ok(false), "matched a body that differs by a space");
+    require!(
+        NAME,
+        other == Ok(false),
+        "matched a body that differs by a space"
+    );
     Check::pass(NAME)
 }
 
@@ -198,17 +705,28 @@ async fn a_state_change_bumps_the_thread_version<S: Store>(store: &S, fx: &Fixtu
         Err(e) => return Check::fail(NAME, format!("post_for_review: {e}")),
     };
     require!(NAME, rp.state == PostState::Pending, "state did not change");
-    require!(NAME, rp.body_md == "top level", "post_for_review must carry body_md");
+    require!(
+        NAME,
+        rp.body_md == "top level",
+        "post_for_review must carry body_md"
+    );
     require!(NAME, rp.thread_public_id == fx.thread, "wrong thread");
     let after = match store.thread_version(&fx.thread).await {
         Ok(Some(v)) => v,
         other => return Check::fail(NAME, format!("version: {other:?}")),
     };
-    require!(NAME, after > before, "cache_version went {before} -> {after}");
+    require!(
+        NAME,
+        after > before,
+        "cache_version went {before} -> {after}"
+    );
     if let Err(e) = store.set_post_state(post, PostState::Visible, NOW).await {
         return Check::fail(NAME, format!("set visible: {e}"));
     }
-    match store.set_post_state(&fx.absent, PostState::Hidden, NOW).await {
+    match store
+        .set_post_state(&fx.absent, PostState::Hidden, NOW)
+        .await
+    {
         Err(StoreError::NotFound) => {}
         other => return Check::fail(NAME, format!("absent post: {other:?}")),
     }
@@ -241,11 +759,17 @@ async fn the_public_log_omits_private_rows_and_resolves_targets<S: Store>(
         Ok(rp) => rp.id,
         Err(e) => return Check::fail(NAME, format!("{e}")),
     };
-    let public_id = match store.log_action(&action(post_id, "conf_public", true)).await {
+    let public_id = match store
+        .log_action(&action(post_id, "conf_public", true))
+        .await
+    {
         Ok(id) => id,
         Err(e) => return Check::fail(NAME, format!("log: {e}")),
     };
-    let private_id = match store.log_action(&action(post_id, "conf_private", false)).await {
+    let private_id = match store
+        .log_action(&action(post_id, "conf_private", false))
+        .await
+    {
         Ok(id) => id,
         Err(e) => return Check::fail(NAME, format!("log: {e}")),
     };
@@ -271,7 +795,8 @@ async fn the_public_log_omits_private_rows_and_resolves_targets<S: Store>(
     require!(NAME, entry.actor_kind == ActorKind::Rule, "actor kind lost");
     require!(
         NAME,
-        log.windows(2).all(|w| (w[0].created_at, w[0].id) >= (w[1].created_at, w[1].id)),
+        log.windows(2)
+            .all(|w| (w[0].created_at, w[0].id) >= (w[1].created_at, w[1].id)),
         "not newest first"
     );
     Check::pass(NAME)
@@ -321,18 +846,38 @@ async fn a_review_opens_once_keeps_its_verdict_and_resolves_once<S: Store>(
     let mine: Vec<_> = items.iter().filter(|i| i.post_id == rp.id).collect();
     require!(NAME, mine.len() == 1, "{} items for one post", mine.len());
     let item = mine[0];
-    require!(NAME, item.reason == ReviewReason::Appeal, "reason not updated");
-    require!(NAME, item.model_verdict == Some(Call::Clean), "verdict was lost on reopen");
-    require!(NAME, item.model_confidence == Some(0.6), "confidence was lost on reopen");
+    require!(
+        NAME,
+        item.reason == ReviewReason::Appeal,
+        "reason not updated"
+    );
+    require!(
+        NAME,
+        item.model_verdict == Some(Call::Clean),
+        "verdict was lost on reopen"
+    );
+    require!(
+        NAME,
+        item.model_confidence == Some(0.6),
+        "confidence was lost on reopen"
+    );
     require!(
         NAME,
         item.model_categories == vec![crate::moderation::Category::OffTopic],
         "categories did not round trip: {:?}",
         item.model_categories
     );
-    require!(NAME, item.appeal_text.as_deref() == Some("please"), "appeal text missing");
+    require!(
+        NAME,
+        item.appeal_text.as_deref() == Some("please"),
+        "appeal text missing"
+    );
     require!(NAME, item.post_public_id == fx.writable[0], "wrong post");
-    require!(NAME, !item.body_html.is_empty(), "the reviewer needs the body");
+    require!(
+        NAME,
+        !item.body_html.is_empty(),
+        "the reviewer needs the body"
+    );
     require!(NAME, !item.resolved, "listed as open but marked resolved");
 
     let before = match store.agreement(rp.space_id).await {
@@ -401,17 +946,29 @@ async fn reports_count_distinct_reporters<S: Store>(store: &S, fx: &Fixture) -> 
         Ok(t) => t,
         Err(e) => return Check::fail(NAME, format!("{e}")),
     };
-    require!(NAME, first.added && first.count == 1, "first report: {first:?}");
+    require!(
+        NAME,
+        first.added && first.count == 1,
+        "first report: {first:?}"
+    );
     let repeat = match store.add_report(&sig(fx.author_id)).await {
         Ok(t) => t,
         Err(e) => return Check::fail(NAME, format!("{e}")),
     };
-    require!(NAME, !repeat.added && repeat.count == 1, "repeat report: {repeat:?}");
+    require!(
+        NAME,
+        !repeat.added && repeat.count == 1,
+        "repeat report: {repeat:?}"
+    );
     let second = match store.add_report(&sig(reporter)).await {
         Ok(t) => t,
         Err(e) => return Check::fail(NAME, format!("{e}")),
     };
-    require!(NAME, second.added && second.count == 2, "second reporter: {second:?}");
+    require!(
+        NAME,
+        second.added && second.count == 2,
+        "second reporter: {second:?}"
+    );
     Check::pass(NAME)
 }
 

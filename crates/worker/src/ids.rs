@@ -18,7 +18,6 @@ pub fn generate_many(n: usize) -> Result<Vec<PublicId>, String> {
 }
 
 /// 32 random bytes as hex, for anonymous CSRF cookies.
-#[cfg(feature = "password")]
 pub fn random_hex() -> Result<String, String> {
     let mut buf = [0u8; 32];
     getrandom::getrandom(&mut buf).map_err(|e| format!("csprng: {e}"))?;
@@ -31,6 +30,13 @@ pub fn random_session_token() -> Result<notespace_core::session::SessionToken, S
     let mut buf = [0u8; notespace_core::session::TOKEN_BYTES];
     getrandom::getrandom(&mut buf).map_err(|e| format!("csprng: {e}"))?;
     Ok(notespace_core::session::SessionToken::from_bytes(buf))
+}
+
+/// A fresh link token for mail.
+pub fn random_email_token() -> Result<notespace_core::email::EmailToken, String> {
+    let mut buf = [0u8; notespace_core::email::TOKEN_BYTES];
+    getrandom::getrandom(&mut buf).map_err(|e| format!("csprng: {e}"))?;
+    Ok(notespace_core::email::EmailToken::from_bytes(buf))
 }
 
 fn random_u32() -> u32 {

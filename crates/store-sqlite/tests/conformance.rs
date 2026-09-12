@@ -7,7 +7,7 @@ use notespace_core::path::Path;
 use notespace_store_sqlite::SqliteStore;
 
 /// `include_str!` needs literal paths; `migration_list_is_complete` guards the hand maintenance.
-const MIGRATIONS: [&str; 8] = [
+const MIGRATIONS: [&str; 9] = [
     include_str!("../../../migrations/0001_init.sql"),
     include_str!("../../../migrations/0002_thread_public_id.sql"),
     include_str!("../../../migrations/0003_space_paths_and_names.sql"),
@@ -16,6 +16,7 @@ const MIGRATIONS: [&str; 8] = [
     include_str!("../../../migrations/0006_login_attempt.sql"),
     include_str!("../../../migrations/0007_user_password.sql"),
     include_str!("../../../migrations/0008_moderation.sql"),
+    include_str!("../../../migrations/0009_email_and_spaces.sql"),
 ];
 
 const MIGRATIONS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations");
@@ -40,10 +41,10 @@ fn seeded() -> SqliteStore {
     )
     .unwrap();
     c.execute(
-        "INSERT INTO thread (id, public_id, space_id, kind, title, author_id, created_at,
-             bumped_at, post_count, state, cache_version)
-         VALUES (1, ?1, 1, 'discussion', 'Conformance', 1, 1735689600000, 1735689600000, ?2,
-                 'visible', 0)",
+        "INSERT INTO thread (id, public_id, space_id, space_path, kind, title, author_id,
+             created_at, bumped_at, post_count, state, cache_version)
+         VALUES (1, ?1, 1, 'general/', 'discussion', 'Conformance', 1, 1735689600000,
+                 1735689600000, ?2, 'visible', 0)",
         rusqlite::params![thread_id().as_str(), POSTS],
     )
     .unwrap();
@@ -92,7 +93,7 @@ fn fixture() -> Fixture {
         known_post: post_id(3),
         known_post_path: Path::parse("0001.0002").unwrap(),
         absent: PublicId::new(1_735_689_600_000, 0xDEAD).unwrap(),
-        writable: (0..4)
+        writable: (0..Fixture::WRITABLE as u64)
             .map(|i| PublicId::new(1_800_000_000_000 + i, 0x0A11_C0DE ^ i as u32).unwrap())
             .collect(),
         author_id: 1,
@@ -473,7 +474,14 @@ async fn an_oversized_body_never_reaches_the_database() {
     let huge = "a".repeat(reply::MAX_BODY_CHARS + 1);
     let before = store.thread_version(&thread_id()).await.unwrap().unwrap();
 
-    match reply::post(&store, &NoQueue, &reply_config(10), a_reply(&huge, &ids, "1.2.3.4")).await {
+    match reply::post(
+        &store,
+        &NoQueue,
+        &reply_config(10),
+        a_reply(&huge, &ids, "1.2.3.4"),
+    )
+    .await
+    {
         Ok(ReplyOutcome::Rejected(Rejected::TooLong { .. })) => {}
         _ => panic!("expected TooLong"),
     }
@@ -499,7 +507,14 @@ async fn the_limiter_bites_before_the_write() {
     }
     let before = store.thread_version(&thread_id()).await.unwrap().unwrap();
     let ids = reply_ids(99);
-    match reply::post(&store, &NoQueue, &cfg, a_reply("one too many", &ids, "9.9.9.9")).await {
+    match reply::post(
+        &store,
+        &NoQueue,
+        &cfg,
+        a_reply("one too many", &ids, "9.9.9.9"),
+    )
+    .await
+    {
         Ok(ReplyOutcome::RateLimited { retry_after_secs }) => {
             assert!(retry_after_secs > 0, "no retry hint");
         }
@@ -538,8 +553,14 @@ async fn the_retry_ids_are_distinct() {
 // Registration
 // ---------------------------------------------------------------------------
 
+use notespace_core::email::{EmailToken, Links, NoMailer, TOKEN_BYTES as EMAIL_TOKEN_BYTES};
 use notespace_core::register::{
     self, Outcome as SignupOutcome, RegisterConfig, Rejected as SignupRejected, Signup,
+};
+
+const LINKS: Links<'static> = Links {
+    base_url: "https://forum.example",
+    site_name: "forum",
 };
 
 fn register_config(per_client: u32) -> RegisterConfig {
@@ -552,6 +573,7 @@ fn register_config(per_client: u32) -> RegisterConfig {
             max: per_client,
             window_ms: 60_000,
         },
+        require_email: false,
     }
 }
 
@@ -559,9 +581,11 @@ fn a_signup<'a>(name: &'a str, pw: &'a str, client: &'a str, seed: u8) -> Signup
     Signup {
         username: name,
         password: pw,
+        email: "",
         client,
         token: SessionToken::from_bytes([seed; TOKEN_BYTES]),
         salt: "c29tZXNhbHR2YWx1ZTE",
+        verify_token: EmailToken::from_bytes([seed; EMAIL_TOKEN_BYTES]),
         now: NOW,
     }
 }
@@ -570,8 +594,16 @@ fn a_signup<'a>(name: &'a str, pw: &'a str, client: &'a str, seed: u8) -> Signup
 async fn a_signup_creates_an_account_that_can_then_log_in() {
     let store = seeded();
     let rcfg = register_config(10);
-    match register::signup(&store, &rcfg, a_signup("newcomer", PW, "1.2.3.4", 1)).await {
-        Ok(SignupOutcome::Created { user, session }) => {
+    match register::signup(
+        &store,
+        &NoMailer,
+        &LINKS,
+        &rcfg,
+        a_signup("newcomer", PW, "1.2.3.4", 1),
+    )
+    .await
+    {
+        Ok(SignupOutcome::Created { user, session, .. }) => {
             assert_eq!(user.name, "newcomer");
             let found = store
                 .lookup_session(&session.token_hash, NOW)
@@ -593,12 +625,28 @@ async fn a_signup_creates_an_account_that_can_then_log_in() {
 async fn the_name_is_stored_lowercase_and_matched_either_way() {
     let store = seeded();
     let rcfg = register_config(10);
-    match register::signup(&store, &rcfg, a_signup("MixedCase", PW, "1.2.3.4", 3)).await {
+    match register::signup(
+        &store,
+        &NoMailer,
+        &LINKS,
+        &rcfg,
+        a_signup("MixedCase", PW, "1.2.3.4", 3),
+    )
+    .await
+    {
         Ok(SignupOutcome::Created { user, .. }) => assert_eq!(user.name, "mixedcase"),
         _ => panic!("expected Created"),
     }
     // And the same name in any casing is now taken.
-    match register::signup(&store, &rcfg, a_signup("MIXEDCASE", PW, "1.2.3.4", 4)).await {
+    match register::signup(
+        &store,
+        &NoMailer,
+        &LINKS,
+        &rcfg,
+        a_signup("MIXEDCASE", PW, "1.2.3.4", 4),
+    )
+    .await
+    {
         Ok(SignupOutcome::Rejected(SignupRejected::Taken)) => {}
         _ => panic!("case-different duplicate was accepted"),
     }
@@ -613,6 +661,8 @@ async fn a_taken_name_is_rejected_without_disturbing_the_existing_account() {
 
     match register::signup(
         &store,
+        &NoMailer,
+        &LINKS,
         &rcfg,
         a_signup("incumbent", "a different one", "9.9.9.9", 5),
     )
@@ -632,17 +682,41 @@ async fn the_limiter_counts_signups_per_client_whatever_name_is_tried() {
     let store = seeded();
     let rcfg = register_config(2);
     for (i, name) in ["alpha-one", "beta-two"].iter().enumerate() {
-        match register::signup(&store, &rcfg, a_signup(name, PW, "7.7.7.7", 10 + i as u8)).await {
+        match register::signup(
+            &store,
+            &NoMailer,
+            &LINKS,
+            &rcfg,
+            a_signup(name, PW, "7.7.7.7", 10 + i as u8),
+        )
+        .await
+        {
             Ok(SignupOutcome::Created { .. }) => {}
             _ => panic!("signup {name} should have succeeded"),
         }
     }
-    match register::signup(&store, &rcfg, a_signup("gamma-three", PW, "7.7.7.7", 20)).await {
+    match register::signup(
+        &store,
+        &NoMailer,
+        &LINKS,
+        &rcfg,
+        a_signup("gamma-three", PW, "7.7.7.7", 20),
+    )
+    .await
+    {
         Ok(SignupOutcome::RateLimited { retry_after_secs }) => assert!(retry_after_secs > 0),
         _ => panic!("expected RateLimited"),
     }
     // A different client is unaffected.
-    match register::signup(&store, &rcfg, a_signup("delta-four", PW, "8.8.8.8", 21)).await {
+    match register::signup(
+        &store,
+        &NoMailer,
+        &LINKS,
+        &rcfg,
+        a_signup("delta-four", PW, "8.8.8.8", 21),
+    )
+    .await
+    {
         Ok(SignupOutcome::Created { .. }) => {}
         _ => panic!("a different client should not be limited"),
     }
@@ -653,7 +727,15 @@ async fn a_rejected_signup_writes_no_account() {
     let store = seeded();
     let rcfg = register_config(10);
     for (name, pw) in [("ok-name", "short"), ("bad name", PW), ("admin", PW)] {
-        match register::signup(&store, &rcfg, a_signup(name, pw, "1.2.3.4", 30)).await {
+        match register::signup(
+            &store,
+            &NoMailer,
+            &LINKS,
+            &rcfg,
+            a_signup(name, pw, "1.2.3.4", 30),
+        )
+        .await
+        {
             Ok(SignupOutcome::Rejected(_)) => {}
             _ => panic!("{name:?}/{pw:?} should have been rejected"),
         }
@@ -677,10 +759,10 @@ fn wide_thread(roots: u32) -> SqliteStore {
     )
     .unwrap();
     c.execute(
-        "INSERT INTO thread (id, public_id, space_id, kind, title, author_id, created_at,
-             bumped_at, post_count, state, cache_version)
-         VALUES (1, ?1, 1, 'discussion', 'Wide', 1, 1735689600000, 1735689600000, 0,
-                 'visible', 0)",
+        "INSERT INTO thread (id, public_id, space_id, space_path, kind, title, author_id,
+             created_at, bumped_at, post_count, state, cache_version)
+         VALUES (1, ?1, 1, 'general/', 'discussion', 'Wide', 1, 1735689600000, 1735689600000,
+                 0, 'visible', 0)",
         rusqlite::params![thread_id().as_str()],
     )
     .unwrap();
@@ -840,7 +922,10 @@ fn the_moderation_binding_names_match_wrangler_toml() {
     let toml = include_str!("../../../wrangler.toml");
     let constant = |name: &str| -> String {
         src.lines()
-            .find_map(|l| l.trim().strip_prefix(&format!("pub const {name}: &str = \"")))
+            .find_map(|l| {
+                l.trim()
+                    .strip_prefix(&format!("pub const {name}: &str = \""))
+            })
             .and_then(|l| l.split('"').next())
             .unwrap_or_else(|| panic!("{name} not found in moderation.rs"))
             .to_string()
@@ -866,8 +951,15 @@ fn the_moderation_binding_names_match_wrangler_toml() {
         .filter_map(|l| l.trim().strip_prefix("queue = \""))
         .filter_map(|l| l.split('"').next())
         .collect();
-    assert_eq!(queues.len(), 2, "expected one producer and one consumer: {queues:?}");
-    assert_eq!(queues[0], queues[1], "producer and consumer name different queues");
+    assert_eq!(
+        queues.len(),
+        2,
+        "expected one producer and one consumer: {queues:?}"
+    );
+    assert_eq!(
+        queues[0], queues[1],
+        "producer and consumer name different queues"
+    );
 }
 
 /// A mismatch here is a runtime "no D1 binding", never a build failure.
@@ -878,7 +970,7 @@ fn the_d1_binding_name_matches_wrangler_toml() {
 
     let in_code = src
         .lines()
-        .find_map(|l| l.trim().strip_prefix("const DB_BINDING: &str = \""))
+        .find_map(|l| l.trim().strip_prefix("pub(crate) const DB_BINDING: &str = \""))
         .and_then(|l| l.split('"').next())
         .expect("DB_BINDING not found in the worker source");
     let in_toml = toml
@@ -890,5 +982,34 @@ fn the_d1_binding_name_matches_wrangler_toml() {
     assert_eq!(
         in_code, in_toml,
         "worker binds {in_code:?} but wrangler.toml declares {in_toml:?}"
+    );
+}
+
+/// Mail is configured by variables rather than bindings, and a misspelt one is silently "no
+/// mail" rather than an error, so the names in the code and the names documented in
+/// wrangler.toml are checked against each other here.
+#[test]
+fn the_mail_variable_names_match_wrangler_toml() {
+    let src = include_str!("../../worker/src/mail.rs");
+    let toml = include_str!("../../../wrangler.toml");
+    let constant = |name: &str| -> String {
+        src.lines()
+            .find_map(|l| l.trim().strip_prefix(&format!("pub const {name}: &str = \"")))
+            .and_then(|l| l.split('"').next())
+            .unwrap_or_else(|| panic!("{name} not found in mail.rs"))
+            .to_string()
+    };
+    for var in ["FROM_VAR", "SITE_NAME_VAR", "REQUIRE_EMAIL_VAR"] {
+        let name = constant(var);
+        assert!(
+            toml.lines().any(|l| l.trim().starts_with(&format!("{name} ="))),
+            "{name} is not declared under [vars] in wrangler.toml"
+        );
+    }
+    // The secret is not in the file, but the instructions for setting it must name it right.
+    let secret = constant("API_KEY_SECRET");
+    assert!(
+        toml.contains(&format!("wrangler secret put {secret}")),
+        "wrangler.toml does not say how to set {secret}"
     );
 }

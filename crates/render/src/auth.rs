@@ -29,8 +29,26 @@ impl LoginError {
     }
 }
 
+/// Something that just happened elsewhere, worth a line above the form.
+pub enum LoginNotice {
+    PasswordReset,
+}
+
+impl LoginNotice {
+    fn message(&self) -> &'static str {
+        match self {
+            LoginNotice::PasswordReset => "Password reset. Sign in with the new one.",
+        }
+    }
+}
+
 /// `next` has to have been validated as a local path by the caller; unchecked, it is an open redirect.
-pub fn login_page(csrf: &str, next: Option<&str>, error: Option<LoginError>) -> Markup {
+pub fn login_page(
+    csrf: &str,
+    next: Option<&str>,
+    error: Option<LoginError>,
+    notice: Option<LoginNotice>,
+) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -43,6 +61,9 @@ pub fn login_page(csrf: &str, next: Option<&str>, error: Option<LoginError>) -> 
             body {
                 main class="auth" {
                     h1 { "Sign in" }
+                    @if let Some(n) = &notice {
+                        p class="notice" role="status" { (n.message()) }
+                    }
                     @if let Some(e) = &error {
                         p class="error" role="alert" { (e.message()) }
                     }
@@ -58,6 +79,11 @@ pub fn login_page(csrf: &str, next: Option<&str>, error: Option<LoginError>) -> 
                         input id="password" name="password" type="password"
                               autocomplete="current-password" required;
                         button type="submit" { "Sign in" }
+                    }
+                    p class="muted" {
+                        a href="/forgot" { "Forgot your password?" }
+                        " · "
+                        "New here? " a href="/register" { "Create an account" }
                     }
                 }
             }
@@ -84,10 +110,19 @@ impl maud::Render for PreEscapedStyle {
              border-radius:4px;background:#1a1a1a;color:#fff;cursor:pointer}\
              .error{background:#fdecea;border:1px solid #f5c2c0;padding:.6rem .75rem;\
              border-radius:4px;font-size:.9rem}\
+             .notice{background:#e8f5ec;border:1px solid #bfe3c8;padding:.6rem .75rem;\
+             border-radius:4px;font-size:.9rem}\
+             h2{font-size:1.1rem;margin:1.75rem 0 .25rem}\
+             form.inline{display:inline}button.link{width:auto;margin:0;padding:0;border:0;\
+             background:none;color:#3355bb;text-decoration:underline;font-size:inherit}\
+             button.secondary{background:none;color:inherit;border:1px solid #ccc}\
+             form.danger button{background:#a12a2a}\
              @media(prefers-color-scheme:dark){body{background:#16181c;color:#e8e8ea}\
              input{background:#1f2229;border-color:#3a3f4b;color:inherit}\
              button{background:#e8e8ea;color:#16181c}\
-             .error{background:#3a1d1d;border-color:#6b2b2b}}",
+             .error{background:#3a1d1d;border-color:#6b2b2b}\
+             .notice{background:#1d3a25;border-color:#2b6b3a}button.link{color:#8ab0ff}\
+             button.secondary{border-color:#3a3f4b}}",
         );
     }
 }
@@ -189,6 +224,8 @@ pub enum RegisterError {
     ShortPassword {
         min: usize,
     },
+    /// Carries the reason, which is safe to show.
+    BadEmail(String),
     RateLimited {
         retry_after_secs: i64,
     },
@@ -199,6 +236,7 @@ impl RegisterError {
     fn message(&self) -> String {
         match self {
             RegisterError::BadName(why) => format!("That name will not work: {why}."),
+            RegisterError::BadEmail(why) => format!("That email address will not work: {why}."),
             RegisterError::Taken => "That name is already taken.".into(),
             RegisterError::ShortPassword { min } => {
                 format!("Passwords need at least {min} characters.")
@@ -216,8 +254,15 @@ impl RegisterError {
     }
 }
 
-/// `name` is echoed back on rejection; the password never is, or it lands in every cache en route.
-pub fn register_page(csrf: &str, name: &str, error: Option<RegisterError>) -> Markup {
+/// `name` and `email` are echoed back on rejection; the password never is, or it lands in
+/// every cache en route.
+pub fn register_page(
+    csrf: &str,
+    name: &str,
+    email: &str,
+    require_email: bool,
+    error: Option<RegisterError>,
+) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -242,6 +287,14 @@ pub fn register_page(csrf: &str, name: &str, error: Option<RegisterError>) -> Ma
                         input id="password" name="password" type="password" required
                             autocomplete="new-password";
                         p class="muted" { "At least 12 characters. Usernames are permanent." }
+                        label for="email" {
+                            @if require_email { "Email" } @else { "Email (optional)" }
+                        }
+                        input id="email" name="email" type="email" value=(email)
+                            autocomplete="email" required[require_email];
+                        p class="muted" {
+                            "Used to reset a forgotten password, and for nothing else."
+                        }
                         button type="submit" { "Create account" }
                     }
                     p class="muted" {

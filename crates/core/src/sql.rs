@@ -160,6 +160,9 @@ pub const SWEEP_LOGIN_ATTEMPTS: &str = "DELETE FROM login_attempt WHERE window_s
 pub const USER_BY_NAME: &str = "\
 SELECT id, name, state, role, password_hash FROM user WHERE name = ?1";
 
+/// Binds: `?1` = user id.
+pub const USER_BY_ID: &str = "SELECT id, name, state, role FROM user WHERE id = ?1";
+
 /// Binds: `?1` name, `?2` created_at, `?3` password_hash (NULL for external auth).
 pub const INSERT_USER: &str = "\
 INSERT INTO user (name, created_at, password_hash, state) VALUES (?1, ?2, ?3, 'active')";
@@ -316,3 +319,129 @@ SUM(CASE WHEN (model_verdict = 'clean' AND resolution = 'reject') \
 OR (model_verdict = 'flag' AND resolution = 'approve') THEN 1 ELSE 0 END) AS disagreed \
 FROM review_item \
 WHERE space_id = ?1 AND state = 'resolved' AND model_verdict IS NOT NULL";
+
+// ---------------------------------------------------------------------------
+// Spaces and new threads
+// ---------------------------------------------------------------------------
+
+/// Matched on the stored form, trailing separator included.
+///
+/// Binds: `?1` = space path.
+pub const SPACE_BY_PATH: &str = "\
+SELECT id, path, name, parent_id, ranking, depth_cap FROM space WHERE path = ?1";
+
+/// `?1 IS NULL` selects the top level: SQLite's `=` never matches NULL.
+///
+/// Binds: `?1` = parent space id, or NULL.
+pub const SPACES_UNDER: &str = "\
+SELECT id, path, name, parent_id, ranking, depth_cap FROM space \
+WHERE (?1 IS NULL AND parent_id IS NULL) OR parent_id = ?1 \
+ORDER BY path";
+
+/// One range scan over `idx_thread_subtree`; the bounds come from `SpacePath::subtree_range`.
+///
+/// Binds: `?1` = range start (inclusive), `?2` = range end (exclusive), `?3` = limit.
+pub const SPACE_THREADS: &str = "\
+SELECT t.public_id, t.title, t.post_count, t.bumped_at, u.name AS author_name, \
+s.name AS space_name, s.path AS space_path \
+FROM thread t \
+JOIN user u ON u.id = t.author_id \
+JOIN space s ON s.id = t.space_id \
+WHERE t.space_path >= ?1 AND t.space_path < ?2 AND t.state = 'visible' \
+ORDER BY t.bumped_at DESC \
+LIMIT ?3";
+
+/// Like `WRITE_CONTEXT` for a thread that does not exist yet: the space and the author.
+///
+/// Binds: `?1` = space id, `?2` = author user id.
+pub const SPACE_CONTEXT: &str = "\
+SELECT s.id AS space_id, s.config AS space_config, 'visible' AS thread_state, \
+u.created_at AS author_created_at, u.role AS author_role \
+FROM space s, user u \
+WHERE s.id = ?1 AND u.id = ?2";
+
+/// `post_count` starts at zero; the first post bumps it like any other.
+///
+/// Binds: `?1` public_id, `?2` space_id, `?3` space_path, `?4` kind, `?5` title, `?6` url,
+/// `?7` author_id, `?8` created_at.
+pub const INSERT_THREAD: &str = "\
+INSERT INTO thread (public_id, space_id, space_path, kind, title, url, author_id, created_at, \
+bumped_at, post_count, score, rank, state, cache_version) \
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, 0, 0, 0, 'visible', 0)";
+
+// ---------------------------------------------------------------------------
+// Editing
+// ---------------------------------------------------------------------------
+
+/// Runs in the same batch as `BUMP_THREAD_FOR_POST`.
+///
+/// Binds: `?1` = post public id, `?2` = body_md, `?3` = body_html, `?4` = edited_at.
+pub const UPDATE_POST_BODY: &str = "\
+UPDATE post SET body_md = ?2, body_html = ?3, edited_at = ?4 WHERE public_id = ?1";
+
+// ---------------------------------------------------------------------------
+// Profiles
+// ---------------------------------------------------------------------------
+
+/// Binds: `?1` = username, lowercase.
+pub const USER_PROFILE: &str = "\
+SELECT id, name, state, role, created_at FROM user WHERE name = ?1";
+
+/// Served by `idx_post_author`. Visible posts only: a profile is a public page.
+///
+/// Binds: `?1` = user id, `?2` = limit.
+pub const USER_RECENT_POSTS: &str = "\
+SELECT p.public_id, p.body_html, p.created_at, \
+t.public_id AS thread_public_id, t.title AS thread_title \
+FROM post p JOIN thread t ON t.id = p.thread_id \
+WHERE p.author_id = ?1 AND p.state = 'visible' \
+ORDER BY p.created_at DESC \
+LIMIT ?2";
+
+// ---------------------------------------------------------------------------
+// Email
+// ---------------------------------------------------------------------------
+
+/// Binds: `?1` = user id.
+pub const ACCOUNT: &str = "\
+SELECT email, email_verified_at, password_hash IS NOT NULL AS has_password \
+FROM user WHERE id = ?1";
+
+/// The partial unique index makes this at most one row.
+///
+/// Binds: `?1` = email, lowercase.
+pub const USER_BY_VERIFIED_EMAIL: &str = "\
+SELECT id, name, state, role FROM user WHERE email = ?1 AND email_verified_at IS NOT NULL";
+
+/// A new address starts unverified, whatever the old one was.
+///
+/// Binds: `?1` = user id, `?2` = email or NULL.
+pub const SET_EMAIL: &str = "UPDATE user SET email = ?2, email_verified_at = NULL WHERE id = ?1";
+
+/// Conditional on the address still being the one the link was sent to. Verifying an address
+/// another account has already proven trips `idx_user_email_verified`, which adapters report
+/// as `Conflict`.
+///
+/// Binds: `?1` = user id, `?2` = email, `?3` = now.
+pub const MARK_EMAIL_VERIFIED: &str = "\
+UPDATE user SET email_verified_at = ?3 WHERE id = ?1 AND email = ?2";
+
+/// Binds: `?1` token_hash, `?2` user_id, `?3` kind, `?4` email, `?5` created_at, `?6` expires_at.
+pub const INSERT_EMAIL_TOKEN: &str = "\
+INSERT INTO email_token (token_hash, user_id, kind, email, created_at, expires_at, used_at) \
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)";
+
+/// Consumes in one statement, so two clicks on the same link cannot both succeed: the row is
+/// returned only by the update that marked it used.
+///
+/// Binds: `?1` = token_hash, `?2` = kind, `?3` = now.
+pub const CONSUME_EMAIL_TOKEN: &str = "\
+UPDATE email_token SET used_at = ?3 \
+WHERE token_hash = ?1 AND kind = ?2 AND used_at IS NULL AND expires_at > ?3 \
+RETURNING user_id, email";
+
+/// Issuing a new link retires the older ones of that kind.
+///
+/// Binds: `?1` = user id, `?2` = kind, `?3` = now.
+pub const RETIRE_EMAIL_TOKENS: &str = "\
+UPDATE email_token SET used_at = ?3 WHERE user_id = ?1 AND kind = ?2 AND used_at IS NULL";

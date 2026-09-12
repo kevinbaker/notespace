@@ -51,6 +51,21 @@ pub struct NewPost {
     pub state: PostState,
 }
 
+/// A thread to create. The first post, if any, is appended afterwards through
+/// [`NewPost`](crate::model::NewPost), so it takes the same write path as a reply.
+#[derive(Debug, Clone)]
+pub struct NewThread {
+    pub public_id: PublicId,
+    pub space_id: SpaceId,
+    /// The space's stored path, denormalized onto the thread for subtree listings.
+    pub space_path: String,
+    pub kind: ThreadKind,
+    pub title: String,
+    pub url: Option<String>,
+    pub author_id: UserId,
+    pub created_at: Timestamp,
+}
+
 /// A container of threads, and the unit configuration attaches to: it owns the permissions
 /// and the ranking function that decide how its threads behave.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -185,6 +200,42 @@ pub struct ThreadSummary {
     pub author_name: String,
     pub space_name: String,
     pub space_path: String,
+}
+
+/// A member's public page: who they are and what they wrote lately.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Profile {
+    pub user: User,
+    pub created_at: Timestamp,
+    /// Newest first. Visible posts only.
+    pub posts: Vec<ProfilePost>,
+}
+
+/// One post as listed on a profile: enough to link to it and quote it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfilePost {
+    pub public_id: PublicId,
+    pub thread_public_id: PublicId,
+    pub thread_title: String,
+    pub body_html: String,
+    pub created_at: Timestamp,
+}
+
+/// What the account's own settings page needs and nothing else reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Account {
+    /// Lowercase, or `None` if never given.
+    pub email: Option<String>,
+    /// `None` until the link in the verification mail is followed.
+    pub email_verified_at: Option<Timestamp>,
+    /// False for an account that signs in some other way.
+    pub has_password: bool,
+}
+
+impl Account {
+    pub fn email_is_verified(&self) -> bool {
+        self.email.is_some() && self.email_verified_at.is_some()
+    }
 }
 
 /// A single message in a thread, positioned by its materialized `path`.

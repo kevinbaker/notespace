@@ -957,16 +957,21 @@ has a hole in it — fix the model, not the preset.
 
 ```
 GET  /                          space index
-GET  /s/{slug}                  thread list (ranked)
+GET  /s/{path}                  thread list (ranked), subspaces included
 GET  /t/{id}/{slug?}            thread page (baked)
 GET  /t/{id}.rss                feed
 POST /t/{id}/reply
-POST /s/{slug}/new
+POST /s/{path}/new
+POST /p/{id}/edit               author only; the edited body goes back through Tier 0
+POST /p/{id}/delete             tombstone; author or moderator
 POST /p/{id}/signal             vote / like  (idempotent)
 GET  /p/{id}/report             report form; POST records a Signal of kind 'report'
 GET  /p/{id}/appeal             appeal form for the author of a hidden post
 GET  /api/me/thread/{id}        personalization layer (vote state, unread)
 GET  /u/{name}                  profile
+GET  /settings                  the account: email, password, sessions
+GET  /verify?token=             confirm an address (the POST spends the token)
+GET  /forgot, /reset?token=     password recovery, by mail
 GET  /modlog                    public action log
 GET  /mod/queue                 review queue (capability-gated)
 POST /mod/review/{id}           approve or reject one item
@@ -1023,6 +1028,10 @@ suite, and extend `Store` past reads.)*
 **M2 — MVP.** Axum on Workers (`worker` crate's `http` feature makes axum usable), maud templates,
 pulldown-cmark + ammonia at write time, htmx for interactions. Auth, sessions, boards, threads,
 nested replies, edit/delete with tombstones, RSS. No SPA.
+*(Delivered: all of it except htmx. Registration takes an optional email address and mails a
+verification link; password reset works by mail; both through Resend behind a `Mailer` trait,
+and both degrade to "no mail" rather than to failure. Space pages, profiles, new threads,
+edit/delete and per-thread RSS are served. See §10 Q6.)*
 
 **M3 — Community features.** FTS5 search, notifications, capabilities/trust, signals + ranking
 functions, mod actions, public modlog.
@@ -1138,8 +1147,11 @@ than shipping a binary. That is M5.
 4. Search on the wasm target — does D1 expose FTS5? If not, an external index or a native-only
    feature flag is needed. **Untested in M0.**
 5. Archive strategy when a D1 database approaches the 500 MB free ceiling.
-6. Email: needed for notifications and password reset, but there is no SMTP from a Worker.
-   Requires a third-party API, which is a dependency on someone else's free tier.
+6. ~~Email: needed for notifications and password reset, but there is no SMTP from a Worker.~~
+   **Decided: Resend, behind a trait.** One JSON POST per message; the free tier (100/day,
+   3,000/month) covers verification and reset for a small forum. The dependency on someone
+   else's free tier is contained by `email::Mailer`: every flow works with `NoMailer`, and the
+   native binary can put SMTP behind the same seam. Notifications are still M3.
 
 ### Raised by M0
 

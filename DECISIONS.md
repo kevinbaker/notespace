@@ -448,6 +448,100 @@ avoid spending an Argon2 hash on a doomed insert. Neither adapter mapped a dupli
 Signup logs you in. The rejected name is echoed back into the form; the password never is,
 because re-rendering it puts it in the page and from there into anything that caches it.
 
+## `crates/core/src/email.rs`, `account.rs`, and Resend
+
+**Resend, because a Worker has no SMTP.** Outbound mail from a Worker is an HTTP call to
+somebody's API, so the choice is which API. Resend's is one JSON POST with a bearer token, its
+free tier (100 mails a day, 3,000 a month) covers a small forum's verification and reset traffic
+with room to spare, and its failure modes are legible: a 4xx with a `message`. It is still a
+dependency on someone else's free tier, which is why the whole thing is a `Mailer` trait with a
+`NoMailer` and every flow is written to work without it. The self-hosted binary can put SMTP
+behind the same trait.
+
+**Nothing fails because mail did.** Signup creates the account and signs in before it tries to
+send; `Delivery` reports how the send went and the page says so. A provider outage, a missing
+key, or an unverified sending domain cost a confirmation, never an account.
+`a_failed_send_does_not_fail_the_signup` pins it.
+
+**Uniqueness is on *verified* addresses only.** A unique index over every stored address would
+let anyone squat on anyone else's by typing it into the signup form, and would force the form
+to say "that address is taken" -- an oracle over every member's email. So any number of accounts
+may *claim* an address and exactly one may *prove* it: the partial index in 0009 is the guard,
+`MARK_EMAIL_VERIFIED` trips it, and the adapters report that as `Conflict`. Removing the address
+from the account that verified it releases it. Signup therefore never reveals whether an address
+is in use.
+
+**Links land on a form.** Mail scanners follow links, so a `GET` that acts would let a corporate
+proxy verify addresses and, worse, spend reset tokens before their owner sees them. `/verify` and
+`/reset` show a button; the `POST` spends the token. The token is hashed in the database for the
+same reason session tokens are: a leaked copy yields no usable links.
+
+**A reset request is silent.** Known, unknown, unverified, and banned all get "if that address
+belongs to a confirmed account, a link is on its way" -- and the same rate-limit bookkeeping, so
+timing does not separate them either. Only a *verified* address gets mail, because a reset to an
+unverified one hands the account to whoever typed it at signup. The per-address limit exists so
+a known address cannot be used to flood its owner's inbox.
+
+**Spending a token is one statement.** `UPDATE ... WHERE used_at IS NULL AND expires_at > ?
+RETURNING` is atomic on both targets; D1 has no interactive transaction, and a select-then-update
+would let two clicks both succeed. Resets end every session and retire every other reset link,
+so a leaked older link is dead the moment a newer one is used.
+
+**Plain text only.** These mails are read on phones, in terminals, and by people who have just
+lost a password. None of them wants a layout, and a text-only message is what spam filters
+trust most.
+
+## `crates/core/src/compose.rs`
+
+**The body is the first post.** There is no `thread.body`; the thread row carries the title and
+URL and the body takes the reply path unchanged, so validation, rate limiting, path allocation
+and moderation are one code path rather than two that drift. The cost is two round trips on
+D1 (thread, then post), which is nowhere near the budget.
+
+**The title is scanned, but only the post can be held.** Tier 0 reads `title + body`, so a
+blocklisted word or a link farm in the title holds the first post. The title itself stays
+visible in the index under a `[awaiting review]` body, because a thread has no pending state
+and adding one means teaching review, the sweep and the index about it. Title-only spam is
+therefore bounded by the per-author limit (five threads an hour) rather than caught; if that
+turns out to matter, the fix is a `thread.state = 'pending'` that review resolves alongside the
+post. `the_title_is_scanned_by_tier_zero` pins what is in place.
+
+**Rejections re-render in place.** The reply form redirects on error and loses the draft, which
+is tolerable for a reply. A thread body can be 32 KB and a query string is no place for it, so
+a rejected compose comes back as a 200 with the form filled in. A reload resubmits a form that
+was already refused, which is harmless.
+
+**Limits are namespaced.** `thread:{author}` rather than the reply bucket: starting threads is
+the scarcer act and gets the tighter limit, and one should not spend the other's allowance.
+
+## `crates/core/src/edit.rs`
+
+**Deletion is a tombstone.** The row stays, its path stays, and replies keep their parent;
+`[deleted]` is what the page shows. Removing the row would either orphan replies or renumber
+the tree, and both break permalinks. `post_count` counts tombstones for the same reason.
+
+**Edits go back through Tier 0.** The text a moderator approved is not the text a reader sees
+after an edit, and an approved post is the obvious place to put something afterwards. A
+re-held edit is the same `pending` state and the same queue; the duplicate check is skipped
+because a body is not a duplicate of itself.
+
+**Moderators delete but do not edit.** Rewriting someone's words under their name is not a
+moderation action this system offers; hiding is. A moderator's deletion of someone else's post
+is in the public log, an author's own is not.
+
+**The edit link is on every post.** The baked page cannot know who is reading it, so the
+choice is a link everyone sees or no link at all. It is a link; a non-author who follows it is
+told, without a form. When the personalisation layer (§7.1) exists it can hide the link for
+everyone else, and until then the reply and report links are already in the same position.
+
+## `crates/core/src/sql.rs` -- space listings
+
+`SPACE_THREADS` is the subtree range scan the 0003 migration was designed for, and that
+nothing had used: the seed never wrote `thread.space_path`, so the column was NULL on every
+seeded row. 0009 backfills it from the space and the seed now writes it. Listing `/s/sports`
+therefore includes `/s/sports/hockey`, which is what a section page of a hierarchical forum
+means.
+
 ## Permalinks and the page cursor
 
 `/p/{id}` used to redirect to `/t/{id}#p{post}`, which is page one. For any post past the page
@@ -508,6 +602,15 @@ Cargo only warns), and a measure script that grepped for success and swallowed a
 Wrangler runs `[build]` through `/bin/sh`, which does not source a shell profile, so
 `~/.cargo/bin` is absent from `PATH` even when `worker-build` is installed — `exit 127`,
 `worker-build: not found`. The build command prepends it.
+
+Cargo features reach the build through `NOTESPACE_FEATURES`, because wrangler has no flag for
+them and `wrangler dev` runs the build itself, overwriting anything built by hand — which is
+how a Worker built with `--features password` came to serve without it. An empty
+`--features ""` is accepted by cargo, so the variable can be unset.
+
+Mail is configured by `[vars]` plus one secret rather than a binding, and a misspelt variable
+is silently "no mail". `the_mail_variable_names_match_wrangler_toml` checks the names in
+`mail.rs` against the file.
 
 Cloudflare's own build environment (Workers Builds, the dashboard's Git integration) ships Node
 but not rustup, cargo or worker-build, so a dashboard-driven build fails and the Worker keeps

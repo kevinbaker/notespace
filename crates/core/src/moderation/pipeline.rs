@@ -7,14 +7,14 @@
 //! - the model's output is never applied without being logged first;
 //! - a human decision is final for that item -- nothing automatic reopens or reverses it.
 
-use super::classify::{Call, ClassifyError, ClassifyInput, Classifier, PROMPT_VERSION};
+use super::classify::{Call, Classifier, ClassifyError, ClassifyInput, PROMPT_VERSION};
 use super::heuristics::Reason;
 use super::policy::{Disposition, ModerationPolicy};
 use super::{
     ActorKind, NewAction, NewReview, NewSignal, Resolution, ReviewReason, Verdict, SIGNAL_REPORT,
 };
 use crate::id::PublicId;
-use crate::model::{Post, PostState, Timestamp, User};
+use crate::model::{PostId, PostState, Timestamp, User};
 use crate::store::{Store, StoreError, StoreResult};
 
 /// Where held posts are announced so a consumer picks them up promptly. Failure is not fatal:
@@ -49,7 +49,8 @@ pub const SWEEP_GRACE_MS: i64 = 60_000;
 pub async fn hold<S: Store, Q: ModerationQueue>(
     store: &S,
     queue: &Q,
-    post: &Post,
+    post_id: PostId,
+    public_id: &PublicId,
     reasons: &[Reason],
     now: Timestamp,
 ) -> StoreResult<Result<(), String>> {
@@ -59,14 +60,14 @@ pub async fn hold<S: Store, Q: ModerationQueue>(
             actor_id: None,
             actor_name: RULE_ACTOR.into(),
             target_kind: "post",
-            target_id: post.id,
+            target_id: post_id,
             action: "hold",
             detail: serde_json::json!({ "reasons": reasons }),
             public: true,
             created_at: now,
         })
         .await?;
-    Ok(queue.enqueue(&post.public_id, reasons).await)
+    Ok(queue.enqueue(public_id, reasons).await)
 }
 
 /// What the consumer did with one post.
@@ -371,7 +372,10 @@ pub async fn review<S: Store>(
     if !reviewer.role.can_moderate() {
         return Ok(ReviewOutcome::Forbidden);
     }
-    let Some(item) = store.resolve_review(id, resolution, reviewer.id, now).await? else {
+    let Some(item) = store
+        .resolve_review(id, resolution, reviewer.id, now)
+        .await?
+    else {
         return Ok(ReviewOutcome::Gone);
     };
     let now_state = match resolution {
@@ -422,7 +426,9 @@ pub enum AppealOutcome {
     /// Only a hidden post can be appealed; a pending one is already in the queue.
     NotHidden,
     Empty,
-    TooLong { max: usize },
+    TooLong {
+        max: usize,
+    },
 }
 
 /// The author of a hidden post asks for another look. Reopens the item with the text attached;

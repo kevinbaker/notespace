@@ -7,18 +7,20 @@ use std::collections::VecDeque;
 
 use notespace_core::id::PublicId;
 use notespace_core::model::{PostState, Role, SanitizedHtml, User, UserState};
-use notespace_core::moderation::classify::{Call, ClassifyError, ClassifyInput, Classifier, Verdict};
+use notespace_core::moderation::classify::{
+    Call, Classifier, ClassifyError, ClassifyInput, Verdict,
+};
 use notespace_core::moderation::heuristics::Reason;
 use notespace_core::moderation::pipeline::{
     self, AppealOutcome, ModerationQueue, Processed, ReportOutcome, ReviewOutcome,
 };
-use notespace_core::moderation::{Category, ReviewReason, Resolution};
+use notespace_core::moderation::{Category, Resolution, ReviewReason};
 use notespace_core::ratelimit::Limit;
 use notespace_core::reply::{self, Outcome, Rejected, Reply, ReplyConfig};
 use notespace_core::store::Store;
 use notespace_store_sqlite::SqliteStore;
 
-const MIGRATIONS: [&str; 8] = [
+const MIGRATIONS: [&str; 9] = [
     include_str!("../../../migrations/0001_init.sql"),
     include_str!("../../../migrations/0002_thread_public_id.sql"),
     include_str!("../../../migrations/0003_space_paths_and_names.sql"),
@@ -27,6 +29,7 @@ const MIGRATIONS: [&str; 8] = [
     include_str!("../../../migrations/0006_login_attempt.sql"),
     include_str!("../../../migrations/0007_user_password.sql"),
     include_str!("../../../migrations/0008_moderation.sql"),
+    include_str!("../../../migrations/0009_email_and_spaces.sql"),
 ];
 
 const NOW: i64 = 1_800_000_000_000;
@@ -140,7 +143,9 @@ struct RecordingQueue {
 #[async_trait::async_trait(?Send)]
 impl ModerationQueue for RecordingQueue {
     async fn enqueue(&self, post: &PublicId, reasons: &[Reason]) -> Result<(), String> {
-        self.sent.borrow_mut().push((post.clone(), reasons.to_vec()));
+        self.sent
+            .borrow_mut()
+            .push((post.clone(), reasons.to_vec()));
         Ok(())
     }
 }
@@ -234,7 +239,9 @@ fn log_actions(store: &SqliteStore, post_public_id: &PublicId) -> Vec<(String, S
 fn version(store: &SqliteStore) -> i64 {
     store
         .conn()
-        .query_row("SELECT cache_version FROM thread WHERE id = 1", [], |r| r.get(0))
+        .query_row("SELECT cache_version FROM thread WHERE id = 1", [], |r| {
+            r.get(0)
+        })
         .unwrap()
 }
 
@@ -337,7 +344,10 @@ async fn a_confident_clean_verdict_publishes_and_the_log_says_the_model_did_it()
 
     assert_eq!(out, Processed::Published);
     assert_eq!(state_of(&store, &post).await, PostState::Visible);
-    assert!(version(&store) > before, "the baked page was not invalidated");
+    assert!(
+        version(&store) > before,
+        "the baked page was not invalidated"
+    );
     assert_eq!(
         log_actions(&store, &post),
         vec![
@@ -362,10 +372,19 @@ async fn the_model_is_told_why_the_post_was_held_but_not_who_wrote_it() {
 
     let seen = model.seen.borrow();
     let (system, user_msg) = &seen[0];
-    assert!(system.ends_with("Be kind. No crypto."), "space rules not passed");
-    assert!(user_msg.contains("new account"), "hold reason not passed:\n{user_msg}");
+    assert!(
+        system.ends_with("Be kind. No crypto."),
+        "space rules not passed"
+    );
+    assert!(
+        user_msg.contains("new account"),
+        "hold reason not passed:\n{user_msg}"
+    );
     assert!(user_msg.contains("Thread title: Welcome"));
-    assert!(!user_msg.contains("newcomer"), "username leaked to the model");
+    assert!(
+        !user_msg.contains("newcomer"),
+        "username leaked to the model"
+    );
 }
 
 #[tokio::test]
@@ -451,7 +470,10 @@ async fn a_failing_classifier_hands_the_post_to_a_human_and_is_not_retried_by_th
         .await
         .unwrap();
 
-    assert!(matches!(out, Processed::ClassifierFailed(ClassifyError::Unavailable(_))));
+    assert!(matches!(
+        out,
+        Processed::ClassifierFailed(ClassifyError::Unavailable(_))
+    ));
     assert_eq!(state_of(&store, &post).await, PostState::Pending);
     let items = store.open_reviews(10).await.unwrap();
     assert_eq!(items.len(), 1);
@@ -460,7 +482,9 @@ async fn a_failing_classifier_hands_the_post_to_a_human_and_is_not_retried_by_th
 
     // The sweep sees an open item and leaves it alone: no second model call.
     let again = Scripted::saying(verdict(Call::Clean, 1.0, &[]));
-    let drained = pipeline::drain(&store, &again, NOW + DAY, 10).await.unwrap();
+    let drained = pipeline::drain(&store, &again, NOW + DAY, 10)
+        .await
+        .unwrap();
     assert!(drained.is_empty());
     assert_eq!(again.calls(), 0);
 }
@@ -481,7 +505,11 @@ async fn a_redelivered_message_costs_a_read_and_no_model_call() {
         .unwrap();
     assert_eq!(out, Processed::Skipped);
     assert_eq!(second.calls(), 0);
-    assert_eq!(state_of(&store, &post).await, PostState::Visible, "the redelivery undid a publish");
+    assert_eq!(
+        state_of(&store, &post).await,
+        PostState::Visible,
+        "the redelivery undid a publish"
+    );
 }
 
 #[tokio::test]
@@ -502,7 +530,9 @@ async fn the_sweep_takes_only_posts_past_the_grace_period_and_processes_each() {
         .push_back(Ok(verdict(Call::Flag, 0.99, &[Category::Spam])));
 
     // Inside the grace period nothing is swept: the queue consumer gets first go.
-    let early = pipeline::drain(&store, &model, NOW + 1_000, 10).await.unwrap();
+    let early = pipeline::drain(&store, &model, NOW + 1_000, 10)
+        .await
+        .unwrap();
     assert!(early.is_empty());
 
     let late = pipeline::drain(&store, &model, NOW + pipeline::SWEEP_GRACE_MS + 1, 10)
@@ -533,7 +563,11 @@ async fn a_space_that_turned_moderation_off_releases_its_held_posts() {
         .await
         .unwrap();
     assert_eq!(out, Processed::Published);
-    assert_eq!(model.calls(), 0, "a disabled policy still paid for a model call");
+    assert_eq!(
+        model.calls(),
+        0,
+        "a disabled policy still paid for a model call"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -611,13 +645,17 @@ async fn humans_overruling_the_model_tightens_what_it_may_publish() {
         let model = Scripted::saying(verdict(Call::Clean, 0.8, &[]));
         // Published straight away -- so to get a human decision on record, report it back in.
         assert_eq!(
-            pipeline::process_post(&store, &model, &post, &[], NOW).await.unwrap(),
+            pipeline::process_post(&store, &model, &post, &[], NOW)
+                .await
+                .unwrap(),
             Processed::Published
         );
         // Three reporters pull it back into the queue with its verdict still on file.
         for reporter in [OLD_USER, MOD_USER, OTHER_USER] {
             let u = user(reporter, "r", Role::Member);
-            pipeline::report(&store, &q, &post, &u, Some("spam"), NOW).await.unwrap();
+            pipeline::report(&store, &q, &post, &u, Some("spam"), NOW)
+                .await
+                .unwrap();
         }
         let item = store.open_reviews(10).await.unwrap().remove(0);
         // The item was opened by reports without a verdict; attach the model's call the way
@@ -659,22 +697,30 @@ async fn reports_hold_a_visible_post_at_the_threshold_and_ask_the_model_for_a_se
     let r2 = user(MOD_USER, "mod", Role::Moderator);
 
     assert_eq!(
-        pipeline::report(&store, &q, &post, &author, None, NOW).await.unwrap(),
+        pipeline::report(&store, &q, &post, &author, None, NOW)
+            .await
+            .unwrap(),
         ReportOutcome::OwnPost
     );
     assert_eq!(
-        pipeline::report(&store, &q, &post, &r1, Some("rude"), NOW).await.unwrap(),
+        pipeline::report(&store, &q, &post, &r1, Some("rude"), NOW)
+            .await
+            .unwrap(),
         ReportOutcome::Recorded { count: 1 }
     );
     assert_eq!(
-        pipeline::report(&store, &q, &post, &r1, Some("still rude"), NOW).await.unwrap(),
+        pipeline::report(&store, &q, &post, &r1, Some("still rude"), NOW)
+            .await
+            .unwrap(),
         ReportOutcome::AlreadyReported { count: 1 }
     );
     assert_eq!(state_of(&store, &post).await, PostState::Visible);
     assert!(q.sent.borrow().is_empty());
 
     assert_eq!(
-        pipeline::report(&store, &q, &post, &r2, None, NOW).await.unwrap(),
+        pipeline::report(&store, &q, &post, &r2, None, NOW)
+            .await
+            .unwrap(),
         ReportOutcome::Held { count: 2 }
     );
     assert_eq!(state_of(&store, &post).await, PostState::Pending);
@@ -710,26 +756,47 @@ async fn an_appeal_reopens_the_item_with_the_original_verdict_still_on_it() {
     let author = user(NEW_USER, "newcomer", Role::Member);
     let stranger = user(OLD_USER, "oldtimer", Role::Member);
     assert_eq!(
-        pipeline::appeal(&store, &post, &stranger, "let me", NOW).await.unwrap(),
+        pipeline::appeal(&store, &post, &stranger, "let me", NOW)
+            .await
+            .unwrap(),
         AppealOutcome::NotYours
     );
     assert_eq!(
-        pipeline::appeal(&store, &post, &author, "   ", NOW).await.unwrap(),
+        pipeline::appeal(&store, &post, &author, "   ", NOW)
+            .await
+            .unwrap(),
         AppealOutcome::Empty
     );
     assert_eq!(
-        pipeline::appeal(&store, &post, &author, "It was a joke between friends.", NOW + 1)
-            .await
-            .unwrap(),
+        pipeline::appeal(
+            &store,
+            &post,
+            &author,
+            "It was a joke between friends.",
+            NOW + 1
+        )
+        .await
+        .unwrap(),
         AppealOutcome::Filed
     );
     let items = store.open_reviews(10).await.unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].id, item.id, "reopened the same row");
     assert_eq!(items[0].reason, ReviewReason::Appeal);
-    assert_eq!(items[0].appeal_text.as_deref(), Some("It was a joke between friends."));
-    assert_eq!(items[0].model_verdict, Some(Call::Flag), "the verdict under appeal was lost");
-    assert_eq!(state_of(&store, &post).await, PostState::Hidden, "an appeal does not unhide");
+    assert_eq!(
+        items[0].appeal_text.as_deref(),
+        Some("It was a joke between friends.")
+    );
+    assert_eq!(
+        items[0].model_verdict,
+        Some(Call::Flag),
+        "the verdict under appeal was lost"
+    );
+    assert_eq!(
+        state_of(&store, &post).await,
+        PostState::Hidden,
+        "an appeal does not unhide"
+    );
 
     // A visible post has nothing to appeal.
     let visible = match post_as(&store, &q, OLD_USER, "fine", 41).await {
@@ -737,7 +804,9 @@ async fn an_appeal_reopens_the_item_with_the_original_verdict_still_on_it() {
         _ => panic!(),
     };
     assert_eq!(
-        pipeline::appeal(&store, &visible, &stranger, "why", NOW).await.unwrap(),
+        pipeline::appeal(&store, &visible, &stranger, "why", NOW)
+            .await
+            .unwrap(),
         AppealOutcome::NotHidden
     );
 }
@@ -756,8 +825,13 @@ async fn the_public_log_links_to_posts_and_never_shows_a_rationale() {
 
     let log = store.public_log(10).await.unwrap();
     assert!(!log.is_empty());
-    assert!(log.iter().any(|e| e.action == "hide" && e.target_public_id.as_ref() == Some(&post)));
-    assert!(log.iter().all(|e| e.action != "classify"), "model calls are private");
+    assert!(log
+        .iter()
+        .any(|e| e.action == "hide" && e.target_public_id.as_ref() == Some(&post)));
+    assert!(
+        log.iter().all(|e| e.action != "classify"),
+        "model calls are private"
+    );
     let dump = format!("{log:?}");
     assert!(!dump.contains("SECRET-RATIONALE"));
 }

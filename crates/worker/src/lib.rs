@@ -1,10 +1,13 @@
 //! Cloudflare Workers entrypoint for notespace.
 
+mod account;
 #[cfg(feature = "password")]
 mod auth_config;
 mod cache;
 mod ids;
+mod mail;
 mod moderation;
+mod posting;
 mod startup;
 mod store;
 #[cfg(feature = "kdf-subtle")]
@@ -30,10 +33,10 @@ use tower_service::Service;
 use worker::{event, Context, Env, HttpRequest, MessageBatch, MessageExt, Result as WorkerResult};
 
 /// Kept in step with wrangler.toml by `the_d1_binding_name_matches_wrangler_toml`.
-const DB_BINDING: &str = "DATABASE";
+pub(crate) const DB_BINDING: &str = "DATABASE";
 
 /// Posts per page.
-const PAGE_SIZE: u32 = 200;
+pub(crate) const PAGE_SIZE: u32 = 200;
 
 #[derive(Deserialize, Default)]
 struct PageQuery {
@@ -86,6 +89,31 @@ fn router(env: Env) -> Router {
         .route("/register", get(register_form).post(register_submit))
         .route("/t/{id}/reply", get(reply_form).post(reply_submit))
         .route("/t/{id}/held/{post}", get(held_notice))
+        // `/s/{path}` and `/s/{path}/new` share one catch-all; the handler splits them.
+        .route("/s/{*path}", get(posting::space).post(posting::space_post))
+        .route("/u/{name}", get(posting::profile))
+        .route(
+            "/p/{id}/edit",
+            get(posting::edit_form).post(posting::edit_submit),
+        )
+        .route("/p/{id}/delete", post(posting::delete_submit))
+        // Account self-service.
+        .route("/settings", get(account::settings))
+        .route("/settings/email", post(account::change_email))
+        .route("/settings/password", post(account::change_password))
+        .route("/settings/sessions", post(account::end_other_sessions))
+        .route(
+            "/verify",
+            get(account::verify_form).post(account::verify_submit),
+        )
+        .route(
+            "/forgot",
+            get(account::forgot_form).post(account::forgot_submit),
+        )
+        .route(
+            "/reset",
+            get(account::reset_form).post(account::reset_submit),
+        )
         // Moderation. Forms are separate uncached pages for the same reason the reply form is.
         .route("/p/{id}/report", get(report_form).post(report_submit))
         .route("/p/{id}/appeal", get(appeal_form).post(appeal_submit))
@@ -120,6 +148,10 @@ async fn thread_page(
     UrlPath(id): UrlPath<String>,
     query: Query<PageQuery>,
 ) -> Response {
+    // `/t/{id}.rss` is the same thread as a feed.
+    if let Some(id) = id.strip_suffix(".rss") {
+        return posting::feed(state, headers, id.to_string()).await;
+    }
     render_thread(state, headers, id, None, query).await
 }
 
@@ -142,37 +174,48 @@ async fn login_form(
         );
     };
 
-    // Reuse an existing anonymous cookie, so a reload does not invalidate an open form.
-    let (anon, set_anon) = match cookie::get(cookie_header(&headers), cookie::ANON) {
-        Some(existing) => (existing, None),
-        None => match ids::random_hex() {
-            Ok(v) => {
-                let c = cookie::set(cookie::ANON, &v, 60 * 60);
-                (v, Some(c))
-            }
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
-        },
+    let (token, set_anon) = match anon_token(&key, &headers) {
+        Ok(t) => t,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
     };
-
-    let token = key.mint(
-        &anon,
-        worker::Date::now().as_millis() as i64,
-        csrf::DEFAULT_LIFETIME_MS,
-    );
     let next = q.next.as_deref().and_then(cookie::safe_next);
+    let notice = q.done.as_deref().and_then(|d| match d {
+        "reset" => Some(notespace_render::auth::LoginNotice::PasswordReset),
+        _ => None,
+    });
     let body =
-        notespace_render::auth::login_page(token.as_str(), next, q.error.and_then(parse_error));
+        notespace_render::auth::login_page(&token, next, q.error.and_then(parse_error), notice);
+    anon_page(body, set_anon)
+}
 
-    let mut resp = (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
-            // Carries a token bound to one visitor.
-            (header::CACHE_CONTROL, "no-store".to_string()),
-        ],
-        Html(body.into_string()),
-    )
-        .into_response();
+/// A CSRF token for a visitor with no session, bound to a short-lived anonymous cookie. Reuses
+/// an existing cookie, so a reload does not invalidate an open form. The cookie to set, if any,
+/// comes back alongside.
+pub(crate) fn anon_token(
+    key: &csrf::CsrfKey,
+    headers: &axum::http::HeaderMap,
+) -> Result<(String, Option<String>), String> {
+    let (anon, set_anon) = match cookie::get(cookie_header(headers), cookie::ANON) {
+        Some(existing) => (existing, None),
+        None => {
+            let v = ids::random_hex()?;
+            let c = cookie::set(cookie::ANON, &v, 60 * 60);
+            (v, Some(c))
+        }
+    };
+    let token = key.mint(&anon, now_ms(), csrf::DEFAULT_LIFETIME_MS);
+    Ok((token.as_str().to_string(), set_anon))
+}
+
+/// The anonymous cookie's value, for verifying a token minted by [`anon_token`].
+pub(crate) fn anon_binding(headers: &axum::http::HeaderMap) -> String {
+    // No anonymous cookie means nothing to bind against, which is a failure not a skip.
+    cookie::get(cookie_header(headers), cookie::ANON).unwrap_or_default()
+}
+
+/// An uncached page carrying a per-visitor token, setting the anonymous cookie if needed.
+pub(crate) fn anon_page(body: maud::Markup, set_anon: Option<String>) -> Response {
+    let mut resp = uncached_html(body);
     if let Some(c) = set_anon {
         if let Ok(v) = c.parse() {
             resp.headers_mut().append(header::SET_COOKIE, v);
@@ -234,9 +277,7 @@ async fn login_submit(
             "CSRF_KEY is not configured",
         );
     };
-    // No anonymous cookie means nothing to bind against, which is a failure not a skip.
-    let anon = cookie::get(cookie_header(&headers), cookie::ANON).unwrap_or_default();
-    if key.verify(&token, &anon, now).is_err() {
+    if key.verify(&token, &anon_binding(&headers), now).is_err() {
         return redirect_to_login("expired", next.as_deref());
     }
 
@@ -313,12 +354,12 @@ fn urlencode(s: &str) -> String {
 }
 
 /// The raw `Cookie:` header, if present.
-fn cookie_header(headers: &axum::http::HeaderMap) -> Option<&str> {
+pub(crate) fn cookie_header(headers: &axum::http::HeaderMap) -> Option<&str> {
     headers.get(header::COOKIE).and_then(|v| v.to_str().ok())
 }
 
 /// `CF-Connecting-IP` is set by the edge and unspoofable; `X-Forwarded-For` is not consulted.
-fn client_address(headers: &axum::http::HeaderMap) -> String {
+pub(crate) fn client_address(headers: &axum::http::HeaderMap) -> String {
     headers
         .get("cf-connecting-ip")
         .and_then(|v| v.to_str().ok())
@@ -326,7 +367,7 @@ fn client_address(headers: &axum::http::HeaderMap) -> String {
         .to_string()
 }
 
-fn csrf_key(env: &Env) -> Option<csrf::CsrfKey> {
+pub(crate) fn csrf_key(env: &Env) -> Option<csrf::CsrfKey> {
     csrf::CsrfKey::new(env.secret("CSRF_KEY").ok()?.to_string().as_bytes()).ok()
 }
 
@@ -336,6 +377,7 @@ fn csrf_key(env: &Env) -> Option<csrf::CsrfKey> {
 struct LoginQuery {
     next: Option<String>,
     error: Option<String>,
+    done: Option<String>,
 }
 
 /// Password login compiled out: the endpoints do not exist.
@@ -436,7 +478,7 @@ async fn run_conformance(
 
     // Real generated ids, so the write checks exercise the same id path a real post takes.
     let writable = if writes {
-        match (0..4)
+        match (0..Fixture::WRITABLE)
             .map(|_| ids::generate())
             .collect::<Result<Vec<_>, _>>()
         {
@@ -651,7 +693,7 @@ async fn render_thread(
     }
 }
 
-fn error(code: StatusCode, msg: &str) -> Response {
+pub(crate) fn error(code: StatusCode, msg: &str) -> Response {
     worker::console_log!("notespace error {}: {}", code.as_u16(), msg);
     // The message goes to the log, not the body, so errors cannot leak schema details.
     let public = if code == StatusCode::BAD_REQUEST {
@@ -684,15 +726,22 @@ async fn current_user(
     store: &D1Store,
     headers: &axum::http::HeaderMap,
 ) -> Option<notespace_core::model::User> {
+    current_auth(store, headers).await.map(|a| a.user)
+}
+
+async fn current_auth(
+    store: &D1Store,
+    headers: &axum::http::HeaderMap,
+) -> Option<notespace_core::store::Authenticated> {
     let raw = cookie::get(cookie_header(headers), cookie::SESSION)?;
     let token = SessionToken::parse(&raw)?;
     let now = worker::Date::now().as_millis() as i64;
     let auth = store.lookup_session(&token.hash(), now).await.ok()??;
-    auth.user.state.can_act().then_some(auth.user)
+    auth.user.state.can_act().then_some(auth)
 }
 
 /// Ask for sign-in, preserving where they were trying to go.
-fn needs_sign_in(next: &str) -> Response {
+pub(crate) fn needs_sign_in(next: &str) -> Response {
     (
         StatusCode::SEE_OTHER,
         [(
@@ -704,7 +753,7 @@ fn needs_sign_in(next: &str) -> Response {
 }
 
 /// Percent-encode the few characters that would break out of a query parameter.
-fn urlencoding(s: &str) -> String {
+pub(crate) fn urlencoding(s: &str) -> String {
     form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
@@ -919,7 +968,10 @@ async fn held_notice(UrlPath((thread, post)): UrlPath<(String, String)>) -> Resp
     let (Ok(thread), Ok(post)) = (PublicId::parse(&thread), PublicId::parse(&post)) else {
         return error(StatusCode::BAD_REQUEST, "bad id");
     };
-    uncached_html(notespace_render::auth::held_page(&thread.encode(), &post.encode()))
+    uncached_html(notespace_render::auth::held_page(
+        &thread.encode(),
+        &post.encode(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -931,6 +983,7 @@ async fn held_notice(UrlPath((thread, post)): UrlPath<(String, String)>) -> Resp
 #[derive(Deserialize, Default)]
 struct RegisterQuery {
     name: Option<String>,
+    email: Option<String>,
     error: Option<String>,
 }
 
@@ -951,41 +1004,18 @@ async fn register_form(
             "CSRF_KEY is not configured",
         );
     };
-    let (anon, set_anon) = match cookie::get(cookie_header(&headers), cookie::ANON) {
-        Some(existing) => (existing, None),
-        None => match ids::random_hex() {
-            Ok(v) => {
-                let c = cookie::set(cookie::ANON, &v, 60 * 60);
-                (v, Some(c))
-            }
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
-        },
+    let (token, set_anon) = match anon_token(&key, &headers) {
+        Ok(t) => t,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
     };
-    let token = key.mint(
-        &anon,
-        worker::Date::now().as_millis() as i64,
-        csrf::DEFAULT_LIFETIME_MS,
-    );
     let body = notespace_render::auth::register_page(
-        token.as_str(),
+        &token,
         q.name.as_deref().unwrap_or(""),
+        q.email.as_deref().unwrap_or(""),
+        mail::require_email(&env),
         q.error.and_then(parse_register_error),
     );
-    let mut resp = (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        Html(body.into_string()),
-    )
-        .into_response();
-    if let Some(c) = set_anon {
-        if let Ok(v) = c.parse() {
-            resp.headers_mut().append(header::SET_COOKIE, v);
-        }
-    }
-    resp
+    anon_page(body, set_anon)
 }
 
 /// Turn `?error=` back into something to show. Only values this handler itself emits.
@@ -1004,6 +1034,9 @@ fn parse_register_error(code: String) -> Option<notespace_render::auth::Register
             }
             if let Some(why) = other.strip_prefix("name-") {
                 return Some(RegisterError::BadName(why.to_string()));
+            }
+            if let Some(why) = other.strip_prefix("email-") {
+                return Some(RegisterError::BadEmail(why.to_string()));
             }
             other
                 .strip_prefix("wait-")
@@ -1035,25 +1068,28 @@ async fn register_submit(
 
     let mut form_name = String::new();
     let mut form_pw = String::new();
+    let mut form_email = String::new();
     let mut form_csrf = String::new();
     for (k, v) in form_urlencoded::parse(body.as_bytes()) {
         match k.as_ref() {
             "username" => form_name = v.into_owned(),
             "password" => form_pw = v.into_owned(),
+            "email" => form_email = v.into_owned(),
             "csrf" => form_csrf = v.into_owned(),
             _ => {}
         }
     }
 
-    // The name is echoed back on rejection; the password never is.
+    // The name and address are echoed back on rejection; the password never is.
     let back = |e: &str| -> Response {
         (
             StatusCode::SEE_OTHER,
             [(
                 header::LOCATION,
                 format!(
-                    "/register?name={}&error={}",
+                    "/register?name={}&email={}&error={}",
                     urlencoding(&form_name),
+                    urlencoding(&form_email),
                     urlencoding(e)
                 ),
             )],
@@ -1067,9 +1103,11 @@ async fn register_submit(
             "CSRF_KEY is not configured",
         );
     };
-    let anon = cookie::get(cookie_header(&headers), cookie::ANON).unwrap_or_default();
     let now = worker::Date::now().as_millis() as i64;
-    if key.verify(&form_csrf, &anon, now).is_err() {
+    if key
+        .verify(&form_csrf, &anon_binding(&headers), now)
+        .is_err()
+    {
         return back("expired");
     }
 
@@ -1091,6 +1129,10 @@ async fn register_submit(
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
 
+    let verify_token = match ids::random_email_token() {
+        Ok(t) => t,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    };
     let cfg = RegisterConfig {
         scheme,
         peppers,
@@ -1099,38 +1141,56 @@ async fn register_submit(
             max: 3,
             window_ms: 60 * 60_000,
         },
+        require_email: mail::require_email(&env),
     };
     let attempt = Signup {
         username: &form_name,
         password: &form_pw,
+        email: &form_email,
         client: &client_address(&headers),
         token: token.clone(),
         salt: &salt,
+        verify_token,
         now,
     };
+    let mailer = mail::MaybeMailer::from_env(&env);
+    let link_cfg = mail::LinkConfig::resolve(&env, host(&headers));
 
-    match register::signup(&store, &cfg, attempt).await {
-        Ok(Outcome::Created { .. }) => (
-            StatusCode::SEE_OTHER,
-            [
-                (header::LOCATION, "/".to_string()),
-                (
-                    header::SET_COOKIE,
-                    cookie::set(
-                        cookie::SESSION,
-                        &token.to_cookie_value(),
-                        cfg.sessions.lifetime_ms / 1000,
+    match register::signup(&store, &mailer, &link_cfg.links(), &cfg, attempt).await {
+        Ok(Outcome::Created { verification, .. }) => {
+            // Land where the verification status is visible, if there is one to show.
+            let target = match verification {
+                Some(d) => format!("/settings?did={}", account::delivery_code(&d)),
+                None => "/".to_string(),
+            };
+            (
+                StatusCode::SEE_OTHER,
+                [
+                    (header::LOCATION, target),
+                    (
+                        header::SET_COOKIE,
+                        cookie::set(
+                            cookie::SESSION,
+                            &token.to_cookie_value(),
+                            cfg.sessions.lifetime_ms / 1000,
+                        ),
                     ),
-                ),
-            ],
-        )
-            .into_response(),
+                ],
+            )
+                .into_response()
+        }
         Ok(Outcome::RateLimited { retry_after_secs }) => back(&format!("wait-{retry_after_secs}")),
         Ok(Outcome::Rejected(Rejected::Taken)) => back("taken"),
         Ok(Outcome::Rejected(Rejected::ShortPassword { min })) => back(&format!("short-{min}")),
         Ok(Outcome::Rejected(Rejected::BadName(why))) => back(&format!("name-{why}")),
+        Ok(Outcome::Rejected(Rejected::BadEmail(why))) => back(&format!("email-{why}")),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+/// The request's `Host`, for links in mail and cache keys.
+pub(crate) fn host(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers.get(header::HOST).and_then(|h| h.to_str().ok())
 }
 
 /// Local accounts compiled out: the endpoints do not exist.
@@ -1153,9 +1213,14 @@ async fn index(State(env): State<Env>) -> Response {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding");
     };
     let store = D1Store::new(db);
+    let spaces = match store.spaces_under(None).await {
+        Ok(s) => s,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let stats = store.last_stats();
     match store.recent_threads(INDEX_LIMIT).await {
         Ok(threads) => {
-            let html = notespace_render::index::index_page(&threads).into_string();
+            let html = notespace_render::index::index_page(&spaces, &threads).into_string();
             let mut resp = (
                 StatusCode::OK,
                 [
@@ -1167,7 +1232,7 @@ async fn index(State(env): State<Env>) -> Response {
                 Html(html),
             )
                 .into_response();
-            if let Ok(v) = store.last_stats().server_timing().parse() {
+            if let Ok(v) = stats.plus(store.last_stats()).server_timing().parse() {
                 resp.headers_mut()
                     .insert(header::HeaderName::from_static("server-timing"), v);
             }
@@ -1188,11 +1253,11 @@ const MODLOG_LIMIT: u32 = 100;
 /// Posts the cron sweep classifies per run. Bounded by the model budget, not by D1.
 const SWEEP_LIMIT: u32 = 10;
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     worker::Date::now().as_millis() as i64
 }
 
-fn uncached_html(body: maud::Markup) -> Response {
+pub(crate) fn uncached_html(body: maud::Markup) -> Response {
     (
         StatusCode::OK,
         [
@@ -1205,13 +1270,13 @@ fn uncached_html(body: maud::Markup) -> Response {
         .into_response()
 }
 
-fn see_other(target: String) -> Response {
+pub(crate) fn see_other(target: String) -> Response {
     (StatusCode::SEE_OTHER, [(header::LOCATION, target)]).into_response()
 }
 
 /// A moderator by role, or listed in the `MODERATORS` variable -- the bootstrap path for the
 /// first admin, who has nobody to grant them the role.
-fn can_moderate(env: &Env, user: &notespace_core::model::User) -> bool {
+pub(crate) fn can_moderate(env: &Env, user: &notespace_core::model::User) -> bool {
     if user.role.can_moderate() {
         return true;
     }
@@ -1225,19 +1290,25 @@ fn can_moderate(env: &Env, user: &notespace_core::model::User) -> bool {
 
 /// The signed-in user, the store, and a CSRF token bound to their session -- what every
 /// moderation form needs. `Err` is the response to send instead.
-struct Signed {
-    store: D1Store,
-    user: notespace_core::model::User,
+pub(crate) struct Signed {
+    pub(crate) store: D1Store,
+    pub(crate) user: notespace_core::model::User,
+    /// The session row, for flows that end every session but this one.
+    pub(crate) auth: notespace_core::session::Session,
     session: String,
     key: csrf::CsrfKey,
 }
 
-async fn signed_in(env: &Env, headers: &axum::http::HeaderMap, next: &str) -> Result<Signed, Response> {
+pub(crate) async fn signed_in(
+    env: &Env,
+    headers: &axum::http::HeaderMap,
+    next: &str,
+) -> Result<Signed, Response> {
     let Ok(db) = env.d1(DB_BINDING) else {
         return Err(error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding"));
     };
     let store = D1Store::new(db);
-    let Some(user) = current_user(&store, headers).await else {
+    let Some(auth) = current_auth(&store, headers).await else {
         return Err(needs_sign_in(next));
     };
     let Some(key) = csrf_key(env) else {
@@ -1251,25 +1322,26 @@ async fn signed_in(env: &Env, headers: &axum::http::HeaderMap, next: &str) -> Re
     };
     Ok(Signed {
         store,
-        user,
+        user: auth.user,
+        auth: auth.session,
         session,
         key,
     })
 }
 
 impl Signed {
-    fn mint(&self) -> String {
+    pub(crate) fn mint(&self) -> String {
         self.key
             .mint(&self.session, now_ms(), csrf::DEFAULT_LIFETIME_MS)
             .as_str()
             .to_string()
     }
-    fn verify(&self, token: &str) -> bool {
+    pub(crate) fn verify(&self, token: &str) -> bool {
         self.key.verify(token, &self.session, now_ms()).is_ok()
     }
 }
 
-fn form_fields(body: &str) -> std::collections::HashMap<String, String> {
+pub(crate) fn form_fields(body: &str) -> std::collections::HashMap<String, String> {
     form_urlencoded::parse(body.as_bytes())
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect()
@@ -1473,7 +1545,10 @@ async fn mod_review(
         return see_other("/mod/queue".into());
     }
     let Some(resolution) = fields.get("resolution").and_then(|r| Resolution::parse(r)) else {
-        return error(StatusCode::BAD_REQUEST, "resolution must be approve or reject");
+        return error(
+            StatusCode::BAD_REQUEST,
+            "resolution must be approve or reject",
+        );
     };
     // The role check above covers the `MODERATORS` bootstrap list; the pipeline checks the
     // role on the user record, so lift a listed user to moderator for this call.
@@ -1529,7 +1604,10 @@ async fn queue(batch: MessageBatch<moderation::Job>, env: Env, _ctx: Context) ->
         Ok(None) => {
             // Nothing to classify with. Leave the posts pending for a human; ack so the
             // messages do not churn.
-            worker::console_log!("moderation: no classifier configured; {} held posts await a human", batch.messages()?.len());
+            worker::console_log!(
+                "moderation: no classifier configured; {} held posts await a human",
+                batch.messages()?.len()
+            );
             batch.ack_all();
             return Ok(());
         }

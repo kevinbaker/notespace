@@ -6,6 +6,8 @@
 //! The taken-check and the insert are not atomic. `UNIQUE(user.name)` is the guard; the check
 //! only avoids spending a hash on a doomed insert.
 
+use crate::account::{self, Delivery};
+use crate::email::{EmailAddress, EmailError, EmailToken, Links, Mailer};
 use crate::model::{Timestamp, User, UserState};
 use crate::password::{self, PepperSet, Scheme, MIN_PASSWORD_CHARS};
 use crate::ratelimit::{AttemptKeys, Limit};
@@ -20,16 +22,22 @@ pub struct RegisterConfig {
     pub sessions: SessionPolicy,
     /// Per client, not per name: an enumerator supplies a different name every time.
     pub per_client: Limit,
+    /// Whether an address is mandatory. Only sensible with a mailer configured.
+    pub require_email: bool,
 }
 
 pub struct Signup<'a> {
     pub username: &'a str,
     pub password: &'a str,
+    /// Optional unless [`RegisterConfig::require_email`]. Stored unverified; a link is mailed.
+    pub email: &'a str,
     pub client: &'a str,
     /// Caller-generated: `core` has no RNG on wasm.
     pub token: SessionToken,
     /// Base64, caller-generated for the same reason.
     pub salt: &'a str,
+    /// For the verification link, if there is an address to send it to.
+    pub verify_token: EmailToken,
     pub now: Timestamp,
 }
 
@@ -41,13 +49,15 @@ pub enum Rejected {
     ShortPassword {
         min: usize,
     },
+    BadEmail(EmailError),
 }
 
 pub enum Outcome {
-    /// Created and signed in.
+    /// Created and signed in. `verification` says whether a link went out.
     Created {
         session: Session,
         user: User,
+        verification: Option<Delivery>,
     },
     Rejected(Rejected),
     RateLimited {
@@ -55,24 +65,36 @@ pub enum Outcome {
     },
 }
 
-/// Validate without touching storage.
-pub fn check(username: &str, password: &str) -> Result<Username, Rejected> {
+/// Validate without touching storage. An empty address is `None` unless one is required.
+pub fn check(
+    username: &str,
+    password: &str,
+    email: &str,
+    require_email: bool,
+) -> Result<(Username, Option<EmailAddress>), Rejected> {
     let name = Username::parse(username).map_err(|e| Rejected::BadName(e.to_string()))?;
     if password.chars().count() < MIN_PASSWORD_CHARS {
         return Err(Rejected::ShortPassword {
             min: MIN_PASSWORD_CHARS,
         });
     }
-    Ok(name)
+    let email = if email.trim().is_empty() && !require_email {
+        None
+    } else {
+        Some(EmailAddress::parse(email).map_err(Rejected::BadEmail)?)
+    };
+    Ok((name, email))
 }
 
-/// **Budget: 3-4 statements.**
-pub async fn signup<S: Store>(
+/// **Budget: 3-7 statements.**
+pub async fn signup<S: Store, M: Mailer>(
     store: &S,
+    mailer: &M,
+    links: &Links<'_>,
     cfg: &RegisterConfig,
     s: Signup<'_>,
 ) -> StoreResult<Outcome> {
-    let name = match check(s.username, s.password) {
+    let (name, email) = match check(s.username, s.password, s.email, cfg.require_email) {
         Ok(n) => n,
         Err(why) => return Ok(Outcome::Rejected(why)),
     };
@@ -127,14 +149,36 @@ pub async fn signup<S: Store>(
     };
     store.create_session(&session).await?;
 
+    let user = User {
+        id: user_id,
+        name: name.as_str().to_string(),
+        state: UserState::Active,
+        role: crate::model::Role::Member,
+    };
+    // Whether the mail goes has no bearing on the account: it exists and is signed in.
+    let verification = match email {
+        Some(address) => {
+            store.set_email(user_id, Some(address.as_str())).await?;
+            Some(
+                account::send_verification(
+                    store,
+                    mailer,
+                    links,
+                    &user,
+                    &address,
+                    s.verify_token,
+                    s.now,
+                )
+                .await?,
+            )
+        }
+        None => None,
+    };
+
     Ok(Outcome::Created {
         session,
-        user: User {
-            id: user_id,
-            name: name.as_str().to_string(),
-            state: UserState::Active,
-            role: crate::model::Role::Member,
-        },
+        user,
+        verification,
     })
 }
 
@@ -146,24 +190,44 @@ mod tests {
 
     #[test]
     fn a_valid_signup_passes_the_free_checks() {
-        assert!(check("newcomer", GOOD_PW).is_ok());
+        assert!(check("newcomer", GOOD_PW, "", false).is_ok());
     }
 
     #[test]
     fn a_short_password_is_refused_before_anything_costs() {
         assert_eq!(
-            check("newcomer", "short"),
+            check("newcomer", "short", "", false),
             Err(Rejected::ShortPassword {
                 min: MIN_PASSWORD_CHARS
             })
         );
     }
 
+    #[test]
+    fn an_address_is_optional_unless_required() {
+        assert!(matches!(
+            check("newcomer", GOOD_PW, "", false),
+            Ok((_, None))
+        ));
+        assert!(matches!(
+            check("newcomer", GOOD_PW, "", true),
+            Err(Rejected::BadEmail(EmailError::Empty))
+        ));
+        assert!(matches!(
+            check("newcomer", GOOD_PW, "not-an-address", false),
+            Err(Rejected::BadEmail(_))
+        ));
+        match check("newcomer", GOOD_PW, " Who@Example.org ", false) {
+            Ok((_, Some(a))) => assert_eq!(a.as_str(), "who@example.org"),
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// Pins that registration applies the `username` rules rather than the database's.
     #[test]
     fn an_invalid_name_is_refused_with_something_to_show() {
         for bad in ["", "a", "has space", "trailing-", "-leading", "double--sep"] {
-            match check(bad, GOOD_PW) {
+            match check(bad, GOOD_PW, "", false) {
                 Err(Rejected::BadName(msg)) => {
                     assert!(!msg.is_empty(), "empty message for {bad:?}")
                 }
@@ -174,7 +238,7 @@ mod tests {
 
     #[test]
     fn a_reserved_name_is_refused() {
-        match check("admin", GOOD_PW) {
+        match check("admin", GOOD_PW, "", false) {
             Err(Rejected::BadName(msg)) => assert!(msg.contains("reserved"), "got {msg:?}"),
             other => panic!("accepted a reserved name: {other:?}"),
         }
@@ -182,6 +246,9 @@ mod tests {
 
     #[test]
     fn the_name_is_reported_before_the_password() {
-        assert!(matches!(check("!!", "x"), Err(Rejected::BadName(_))));
+        assert!(matches!(
+            check("!!", "x", "", false),
+            Err(Rejected::BadName(_))
+        ));
     }
 }

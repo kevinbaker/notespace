@@ -3,17 +3,20 @@
 //! Binding on every implementation: identical SQLite dialect, no N+1 (D1 allows 50 statements
 //! per invocation — each method states its budget), and no connection pool on wasm.
 
+use crate::email::{ConsumedToken, StoredToken, TokenKind};
 use crate::id::PublicId;
 use crate::model::{
-    NewPost, Post, PostState, SpaceId, ThreadPage, ThreadSummary, Timestamp, User, UserId,
+    Account, NewPost, NewThread, Post, PostState, Profile, SanitizedHtml, Space, SpaceId, Thread,
+    ThreadPage, ThreadSummary, Timestamp, User, UserId,
 };
 use crate::moderation::{
-    AgreementStats, LogEntry, NewAction, NewReview, NewSignal, ReportTally, Resolution,
-    ReviewItem, ReviewPost, WriteContext,
+    AgreementStats, LogEntry, NewAction, NewReview, NewSignal, ReportTally, Resolution, ReviewItem,
+    ReviewPost, WriteContext,
 };
 use crate::path::Path;
 use crate::ratelimit::{AttemptKeys, Attempts};
 use crate::session::{Session, TokenHash};
+use crate::space_key::SpacePath;
 
 /// `?Send` is required: wasm futures are not `Send`.
 pub use async_trait::async_trait;
@@ -130,6 +133,9 @@ pub trait Store {
     /// **Budget: 1 statement.**
     async fn user_by_name(&self, name: &str) -> StoreResult<Option<Credential>>;
 
+    /// **Budget: 1 statement.**
+    async fn user_by_id(&self, id: UserId) -> StoreResult<Option<User>>;
+
     /// **Budget: 1 statement.** A duplicate name is a [`StoreError::Conflict`].
     async fn create_user(
         &self,
@@ -224,6 +230,81 @@ pub trait Store {
     /// How often reviewers in `space` have agreed with the model. Counts only resolved items
     /// where the model made a call. **Budget: 1 statement.**
     async fn agreement(&self, space: SpaceId) -> StoreResult<AgreementStats>;
+
+    // -- Spaces and threads -------------------------------------------------
+
+    /// **Budget: 1 statement.**
+    async fn space_by_path(&self, path: &SpacePath) -> StoreResult<Option<Space>>;
+
+    /// Direct children, `None` for the top level. **Budget: 1 statement.**
+    async fn spaces_under(&self, parent: Option<SpaceId>) -> StoreResult<Vec<Space>>;
+
+    /// Threads in the space and every space under it, most recently bumped first.
+    /// **Budget: 1 statement**, one range scan.
+    async fn space_threads(&self, space: &SpacePath, limit: u32)
+        -> StoreResult<Vec<ThreadSummary>>;
+
+    /// [`Store::write_context`] for a thread that does not exist yet. `NotFound` if either the
+    /// space or the author is absent. **Budget: 1 statement.**
+    async fn space_context(&self, space: SpaceId, author: UserId) -> StoreResult<WriteContext>;
+
+    /// The thread row alone; the body is a post appended afterwards. A reused public id is a
+    /// [`StoreError::Conflict`]. **Budget: 1 statement.**
+    async fn create_thread(&self, thread: &NewThread) -> StoreResult<Thread>;
+
+    /// Rewrite a post's body and bump its thread's `cache_version`, so the baked page turns
+    /// over. `NotFound` for an absent post. **Budget: 2 statements, one batch.**
+    async fn update_post_body(
+        &self,
+        post: &PublicId,
+        body_md: &str,
+        body_html: &SanitizedHtml,
+        edited_at: Timestamp,
+    ) -> StoreResult<()>;
+
+    /// The user and their latest `limit` visible posts. `None` for an unknown name; a deleted
+    /// account is `Some` with its state, so the page can say so. **Budget: 2 statements.**
+    async fn user_profile(&self, name: &str, limit: u32) -> StoreResult<Option<Profile>>;
+
+    // -- Email ----------------------------------------------------------------
+
+    /// **Budget: 1 statement.**
+    async fn account(&self, user: UserId) -> StoreResult<Option<Account>>;
+
+    /// At most one, by construction of the schema. **Budget: 1 statement.**
+    async fn user_by_verified_email(&self, email: &str) -> StoreResult<Option<User>>;
+
+    /// Replace the address and reset verification. `None` removes it. **Budget: 1 statement.**
+    async fn set_email(&self, user: UserId, email: Option<&str>) -> StoreResult<()>;
+
+    /// `Ok(false)` when the account's address is no longer `email`; [`StoreError::Conflict`]
+    /// when another account has already verified it. **Budget: 1 statement.**
+    async fn mark_email_verified(
+        &self,
+        user: UserId,
+        email: &str,
+        now: Timestamp,
+    ) -> StoreResult<bool>;
+
+    /// **Budget: 1 statement.**
+    async fn create_email_token(&self, token: &StoredToken) -> StoreResult<()>;
+
+    /// Spend a token: `None` if it is unknown, of another kind, expired, or already spent.
+    /// Exactly one caller can ever get `Some` for a given token. **Budget: 1 statement.**
+    async fn consume_email_token(
+        &self,
+        token_hash: &str,
+        kind: TokenKind,
+        now: Timestamp,
+    ) -> StoreResult<Option<ConsumedToken>>;
+
+    /// Spend every outstanding token of a kind, returning how many. **Budget: 1 statement.**
+    async fn retire_email_tokens(
+        &self,
+        user: UserId,
+        kind: TokenKind,
+        now: Timestamp,
+    ) -> StoreResult<u32>;
 }
 
 /// `password_hash` is `None` for an account with no local credential. Reached after hashing, so

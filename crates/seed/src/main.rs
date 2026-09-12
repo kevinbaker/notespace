@@ -169,8 +169,9 @@ fn main() {
              VALUES (1, 'General', 'bump', 8, 'general/');"
         );
         println!(
-            "INSERT INTO thread (id, public_id, space_id, kind, title, author_id, created_at, \
-             bumped_at, post_count, state, cache_version) VALUES (1, '{}', 1, 'discussion', \
+            "INSERT INTO thread (id, public_id, space_id, space_path, kind, title, author_id, \
+             created_at, bumped_at, post_count, state, cache_version) VALUES (1, '{}', 1, \
+             'general/', 'discussion', \
              'Is a Rust forum on a free Cloudflare account actually viable?', 1, {base_time}, \
              {}, {post_count}, 'visible', 0);",
             thread_public_id,
