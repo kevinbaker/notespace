@@ -1,0 +1,6 @@
+# Served by Cloudflare's static-asset layer, in front of the Worker. Everything under /static/
+# is referenced with a version in its URL (?v=BAKE_REVISION for the sheet; a renamed file for
+# a font), so it can be held for a year.
+/static/*
+  Cache-Control: public, max-age=31536000, immutable
+  X-Content-Type-Options: nosniff

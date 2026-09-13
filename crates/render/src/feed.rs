@@ -86,6 +86,7 @@ mod tests {
                 parent_id: None,
                 ranking: Ranking::Bump,
                 depth_cap: 8,
+                config: "{}".into(),
             },
             thread: Thread {
                 id: 42,

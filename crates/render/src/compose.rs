@@ -1,7 +1,7 @@
 //! Starting a thread and editing a post. Uncached, token-bearing pages like the reply form.
 
-use crate::auth::PreEscapedStyle;
-use maud::{html, Markup, DOCTYPE};
+use crate::layout::Shell;
+use maud::{html, Markup};
 
 /// Why a new thread was refused.
 pub enum ComposeError {
@@ -59,42 +59,32 @@ pub fn new_thread_page(
     draft: &ComposeDraft<'_>,
     error: Option<ComposeError>,
 ) -> Markup {
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                link rel="icon" href="data:,";
-                title { "New thread in " (space_name) }
-                style { (PreEscapedStyle) }
-            }
-            body {
-                main class="auth wide" {
-                    h1 { "New thread in " (space_name) }
-                    @if let Some(e) = error {
-                        p class="error" role="alert" { (e.message()) }
-                    }
-                    form method="post" action={ "/s/" (space_url) "/new" } {
-                        input type="hidden" name="csrf" value=(csrf);
-                        label for="title" { "Title" }
-                        input id="title" name="title" value=(draft.title) required autofocus
-                            maxlength="200";
-                        label for="url" { "Link (optional)" }
-                        input id="url" name="url" type="url" value=(draft.url)
-                            placeholder="https://";
-                        label for="body" { "Body" }
-                        textarea id="body" name="body" rows="12" required
-                            placeholder="Markdown is supported." { (draft.body) }
-                        button type="submit" { "Start thread" }
-                    }
-                    p class="muted" {
-                        a href={ "/s/" (space_url) } { "Back to " (space_name) }
-                    }
-                }
-            }
-        }
+    Shell {
+        title: &format!("New thread in {}", space_name),
+        ..Default::default()
     }
+    .render(html! {
+        h1 { "New thread in " (space_name) }
+        @if let Some(e) = error {
+            p class="error" role="alert" { (e.message()) }
+        }
+        form method="post" action={ "/s/" (space_url) "/new" } {
+            input type="hidden" name="csrf" value=(csrf);
+            label for="title" { "Title" }
+            input id="title" name="title" value=(draft.title) required autofocus
+                maxlength="200";
+            label for="url" { "Link (optional)" }
+            input id="url" name="url" type="url" value=(draft.url)
+                placeholder="https://";
+            label for="body" { "Body" }
+            textarea id="body" name="body" rows="12" required
+                placeholder="Markdown is supported." { (draft.body) }
+            button type="submit" { "Start thread" }
+        }
+        p class="muted" {
+            a href={ "/s/" (space_url) } { "Back to " (space_name) }
+        }
+    })
 }
 
 /// Why an edit or deletion was refused.
@@ -130,47 +120,37 @@ pub fn edit_page(
     body_md: Option<&str>,
     error: Option<EditError>,
 ) -> Markup {
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                link rel="icon" href="data:,";
-                title { "Edit post" }
-                style { (PreEscapedStyle) }
+    Shell {
+        title: "Edit post",
+        ..Default::default()
+    }
+    .render(html! {
+        h1 { "Edit post" }
+        @if let Some(e) = error {
+            p class="error" role="alert" { (e.message()) }
+        }
+        @if let Some(body) = body_md {
+            form method="post" action={ "/p/" (post) "/edit" } {
+                input type="hidden" name="csrf" value=(csrf);
+                label for="body" { "Post" }
+                textarea id="body" name="body" rows="12" required autofocus { (body) }
+                button type="submit" { "Save changes" }
             }
-            body {
-                main class="auth wide" {
-                    h1 { "Edit post" }
-                    @if let Some(e) = error {
-                        p class="error" role="alert" { (e.message()) }
-                    }
-                    @if let Some(body) = body_md {
-                        form method="post" action={ "/p/" (post) "/edit" } {
-                            input type="hidden" name="csrf" value=(csrf);
-                            label for="body" { "Post" }
-                            textarea id="body" name="body" rows="12" required autofocus { (body) }
-                            button type="submit" { "Save changes" }
-                        }
-                        // Its own form: a delete must never be a link.
-                        form method="post" action={ "/p/" (post) "/delete" } class="danger" {
-                            input type="hidden" name="csrf" value=(csrf);
-                            p class="muted" {
-                                "Deleting leaves a "
-                                em { "[deleted]" }
-                                " marker in place so replies keep their context."
-                            }
-                            button type="submit" name="confirm" value="yes" { "Delete this post" }
-                        }
-                    }
-                    p class="muted" {
-                        a href={ "/p/" (post) } { "Back to the post" }
-                    }
+            // Its own form: a delete must never be a link.
+            form method="post" action={ "/p/" (post) "/delete" } class="danger" {
+                input type="hidden" name="csrf" value=(csrf);
+                p class="muted" {
+                    "Deleting leaves a "
+                    em { "[deleted]" }
+                    " marker in place so replies keep their context."
                 }
+                button type="submit" name="confirm" value="yes" { "Delete this post" }
             }
         }
-    }
+        p class="muted" {
+            a href={ "/p/" (post) } { "Back to the post" }
+        }
+    })
 }
 
 #[cfg(test)]

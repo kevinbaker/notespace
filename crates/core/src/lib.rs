@@ -32,6 +32,7 @@ pub mod session;
 pub mod space_key;
 pub mod sql;
 pub mod store;
+pub mod theme;
 pub mod username;
 
 pub use id::{IdError, PublicId, ID_CHARS, MAX_TIMESTAMP_MS};

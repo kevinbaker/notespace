@@ -2,8 +2,10 @@
 //! personalisation is layered client-side from `GET /api/me/thread/{id}`. Posts arrive already
 //! rendered and in preorder, so this is one linear pass.
 
-use maud::{html, Markup, PreEscaped, DOCTYPE};
+use crate::layout::{crumbs, Shell, SpaceTheme};
+use maud::{html, Markup, PreEscaped};
 use notespace_core::model::{PostState, ThreadPage, ThreadState};
+use notespace_core::theme::Theme;
 
 /// Deepest visual indent, so a deep subthread cannot squeeze the text column to nothing.
 const MAX_INDENT: u32 = 8;
@@ -12,149 +14,100 @@ const MAX_INDENT: u32 = 8;
 pub fn thread_page(page: &ThreadPage) -> Markup {
     let space = &page.space;
     let t = &page.thread;
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                link rel="icon" href="data:,";
-                title { (t.title) " — " (space.name) }
-                link rel="alternate" type="application/rss+xml"
-                     title=(t.title) href={ "/t/" (t.public_id) ".rss" };
-                style { (PreEscaped(STYLE)) }
+    let theme = Theme::from_config(&space.config);
+    let space_url = format!("/s/{}", space.path.trim_end_matches('/'));
+    Shell {
+        title: &t.title,
+        crumbs: crumbs([(space.name.as_str(), Some(space_url.clone()))]),
+        links: html! {
+            a href={ "/t/" (t.public_id) ".rss" } { "rss" }
+            a href="/modlog" { "modlog" }
+        },
+        head: html! {
+            link rel="alternate" type="application/rss+xml"
+                 title=(t.title) href={ "/t/" (t.public_id) ".rss" };
+        },
+        theme: Some(SpaceTheme {
+            url: space_url,
+            theme: &theme,
+        }),
+        ..Default::default()
+    }
+    .render(html! {
+        h1 class="thread-title" { (t.title) }
+        @if let Some(url) = &t.url {
+            p class="thread-url meta" { a href=(url) rel="nofollow ugc noopener" { (url) } }
+        }
+        p class="meta" {
+            "by " a href={ "/u/" (t.author_name) } { (t.author_name) }
+            " · " (t.post_count) " posts"
+            @match t.state {
+                ThreadState::Pinned => " · pinned",
+                ThreadState::Locked => " · locked: no new replies",
+                _ => "",
             }
-            body {
-                header class="site" {
-                    a href="/" { "notespace" }
-                    " / "
-                    a href={ "/s/" (space.path.trim_end_matches('/')) } { (space.name) }
-                    // Which of these applies to the reader is not knowable in a baked page.
-                    span class="site-auth" {
-                        a href={ "/t/" (t.public_id) ".rss" } { "rss" }
-                        " · "
-                        a href="/modlog" { "modlog" }
-                        " · "
-                        a href="/login" { "sign in" }
-                        " · "
-                        a href="/register" { "register" }
-                        " · "
-                        a href="/settings" { "account" }
-                    }
-                }
-                main {
-                    h1 class="thread-title" { (t.title) }
-                    @if let Some(url) = &t.url {
-                        p class="thread-url" { a href=(url) rel="nofollow ugc noopener" { (url) } }
-                    }
-                    p class="thread-meta" {
-                        "by " a href={ "/u/" (t.author_name) } { (t.author_name) }
-                        " · " (t.post_count) " posts"
-                        @match t.state {
-                            ThreadState::Pinned => " · pinned",
-                            ThreadState::Locked => " · locked: no new replies",
-                            _ => "",
-                        }
-                    }
+        }
 
-                    ol class="posts" {
-                        @for post in &page.posts {
-                            @let indent = post.path.render_depth(space.depth_cap).min(MAX_INDENT);
-                            // The public id: `post.id` would leak the post count into every page.
-                            li class="post" id={ "p" (post.public_id) }
-                               style={ "--indent:" (indent) }
-                               data-depth=(indent) {
-                                div class="post-head" {
-                                    a class="author" href={ "/u/" (post.author_name) } {
-                                        (post.author_name)
-                                    }
-                                    " "
-                                    // Keeps resolving after a split or merge moves the post.
-                                    a class="permalink" href={ "/p/" (post.public_id) } {
-                                        (crate::time::stamp(post.created_at))
-                                    }
-                                    @if post.edited_at.is_some() { span class="edited" { " (edited)" } }
-                                    " "
-                                    // A link, not a form: a CSRF token here reaches every reader.
-                                    a class="reply" href={
-                                        "/t/" (t.public_id) "/reply?parent=" (post.public_id)
-                                    } { "reply" }
-                                }
-                                @match post.state {
-                                    // Tombstones, not deletions: the thread keeps its shape.
-                                    PostState::Deleted => div class="post-body tombstone" {
-                                        em { "[deleted]" }
-                                    },
-                                    PostState::Hidden => div class="post-body tombstone" {
-                                        em { "[removed by moderator]" }
-                                    },
-                                    PostState::Pending => div class="post-body tombstone" {
-                                        em { "[awaiting review]" }
-                                    },
-                                    // Sanitized at write time; the one legitimate PreEscaped.
-                                    PostState::Visible => div class="post-body" {
-                                        (PreEscaped(&post.body_html))
-                                    },
-                                }
-                                div class="post-actions" {
-                                    a href={
-                                        "/t/" (t.public_id) "/reply?parent=" (post.public_id)
-                                    } { "reply" }
-                                    " · "
-                                    // Links for the same reason reply is: each form needs a token.
-                                    // Whether the reader is the author is not knowable here; the
-                                    // edit page says so if not.
-                                    a href={ "/p/" (post.public_id) "/edit" } rel="nofollow" { "edit" }
-                                    " · "
-                                    a href={ "/p/" (post.public_id) "/report" } rel="nofollow" { "report" }
-                                }
-                            }
+        ol class="posts" {
+            @for post in &page.posts {
+                @let indent = post.path.render_depth(space.depth_cap).min(MAX_INDENT);
+                // The public id: `post.id` would leak the post count into every page.
+                li class="post" id={ "p" (post.public_id) }
+                   style={ "--depth:" (indent) }
+                   data-depth=(indent) {
+                    div class="post-head meta" {
+                        a class="author" href={ "/u/" (post.author_name) } {
+                            (post.author_name)
                         }
+                        " "
+                        // Keeps resolving after a split or merge moves the post.
+                        a class="permalink" href={ "/p/" (post.public_id) } {
+                            (crate::time::stamp(post.created_at))
+                        }
+                        @if post.edited_at.is_some() { span class="edited" { " (edited)" } }
                     }
-
-                    @if let Some(cursor) = &page.next_cursor {
-                        nav class="pager" {
-                            a rel="next" href={ "/t/" (t.public_id) "?after=" (cursor.as_str()) } {
-                                "next page →"
-                            }
-                        }
+                    @match post.state {
+                        // Tombstones, not deletions: the thread keeps its shape.
+                        PostState::Deleted => div class="post-body muted" {
+                            em { "[deleted]" }
+                        },
+                        PostState::Hidden => div class="post-body muted" {
+                            em { "[removed by moderator]" }
+                        },
+                        PostState::Pending => div class="post-body muted" {
+                            em { "[awaiting review]" }
+                        },
+                        // Sanitized at write time; the one legitimate PreEscaped.
+                        PostState::Visible => div class="post-body" {
+                            (PreEscaped(&post.body_html))
+                        },
+                    }
+                    div class="post-actions" {
+                        // Links, not forms: a form needs a CSRF token, and a token here
+                        // would reach every reader.
+                        a href={
+                            "/t/" (t.public_id) "/reply?parent=" (post.public_id)
+                        } { "reply" }
+                        " · "
+                        // Whether the reader is the author is not knowable here; the
+                        // edit page says so if not.
+                        a href={ "/p/" (post.public_id) "/edit" } rel="nofollow" { "edit" }
+                        " · "
+                        a href={ "/p/" (post.public_id) "/report" } rel="nofollow" { "report" }
                     }
                 }
             }
         }
-    }
-}
 
-const STYLE: &str = "\
-:root{--fg:#111;--dim:#666;--line:#e2e2e2;--bg:#fff;--accent:#0b5}\
-@media(prefers-color-scheme:dark){:root{--fg:#e8e8e8;--dim:#999;--line:#333;--bg:#141414}}\
-*{box-sizing:border-box}\
-body{margin:0;padding:0 1rem 4rem;background:var(--bg);color:var(--fg);\
-font:16px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}\
-main,header.site{max-width:52rem;margin:0 auto}\
-header.site{padding:.75rem 0;border-bottom:1px solid var(--line);font-size:.875rem}\
-a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}\
-.thread-title{font-size:1.5rem;line-height:1.25;margin:1.25rem 0 .25rem}\
-.thread-meta,.post-head{color:var(--dim);font-size:.8125rem}\
-.posts{list-style:none;padding:0;margin:1.5rem 0}\
-.post{margin-left:calc(var(--indent,0)*1.25rem);padding:.6rem 0 .6rem .75rem;\
-border-left:2px solid var(--line);margin-bottom:.4rem}\
-.post[data-depth='0']{border-left-color:transparent;padding-left:0}\
-.post:target{background:rgba(255,200,0,.14);border-left-color:var(--accent)}\
-.post:target[data-depth='0']{border-left-color:var(--accent);padding-left:.75rem}\
-.post-body{margin:.35rem 0}\
-.post-body>*:first-child{margin-top:0}.post-body>*:last-child{margin-bottom:0}\
-.post-body pre{overflow-x:auto;padding:.6rem;background:rgba(128,128,128,.12);border-radius:4px}\
-.post-body code{font-size:.9em}\
-.post-body blockquote{margin:.5rem 0;padding-left:.75rem;border-left:3px solid var(--line);color:var(--dim)}\
-.post-body img{max-width:100%;height:auto}\
-.post-body table{border-collapse:collapse}\
-.post-body th,.post-body td{border:1px solid var(--line);padding:.25rem .5rem}\
-.tombstone{color:var(--dim)}\
-.post-actions{font-size:.8125rem}\
-.pager{margin:2rem 0;font-size:.9375rem}\
-@media(max-width:34rem){.post{margin-left:calc(min(var(--indent,0),4)*.6rem)}}\
-";
+        @if let Some(cursor) = &page.next_cursor {
+            nav class="pager" {
+                a rel="next" href={ "/t/" (t.public_id) "?after=" (cursor.as_str()) } {
+                    "next page →"
+                }
+            }
+        }
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -171,6 +124,7 @@ mod tests {
             parent_id: None,
             ranking: Ranking::Bump,
             depth_cap: 8,
+            config: "{}".into(),
         }
     }
 
@@ -374,6 +328,24 @@ mod tests {
                 "viewer-specific marker {marker:?} in baked HTML"
             );
         }
+    }
+
+    #[test]
+    fn the_space_theme_rides_into_the_thread_page() {
+        let mut p = page(vec![post(1, "0001", PostState::Visible, "<p>a</p>")]);
+        p.space.config = r##"{"theme":{"accent":"#1d4ed8","dark":{"accent":"#7aa2ff"}}}"##.into();
+        let html = thread_page(&p).into_string();
+        let theme = notespace_core::theme::Theme::from_config(&p.space.config);
+        assert!(
+            html.contains(&format!(
+                r#"href="/s/general/theme.css?v={}""#,
+                theme.version()
+            )),
+            "{html}"
+        );
+        // And an unthemed space links nothing.
+        p.space.config = "{}".into();
+        assert!(!thread_page(&p).into_string().contains("theme.css"));
     }
 
     #[test]

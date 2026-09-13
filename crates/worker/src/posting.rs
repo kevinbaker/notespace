@@ -7,6 +7,7 @@ use axum::response::{IntoResponse, Response};
 use notespace_core::id::PublicId;
 use notespace_core::space_key::SpacePath;
 use notespace_core::store::{Page, Store, StoreError};
+use notespace_core::theme::Theme;
 use notespace_core::username::Username;
 use notespace_render::compose::{ComposeDraft, ComposeError, EditError};
 use worker::Env;
@@ -58,6 +59,9 @@ pub async fn space(
     if let Some(space) = path.strip_suffix("/new") {
         return compose_form(&env, &headers, space).await;
     }
+    if let Some(space) = path.strip_suffix("/theme.css") {
+        return theme_css(&env, space).await;
+    }
     let Ok(space_path) = SpacePath::parse(&path) else {
         return error(StatusCode::NOT_FOUND, "no such space");
     };
@@ -91,6 +95,38 @@ pub async fn space(
     stats = stats.plus(store.last_stats());
     let html = notespace_render::index::space_page(&space, &children, &threads).into_string();
     brief_html(html, &stats.server_timing(), 10)
+}
+
+/// A space's stylesheet: its token overrides and its own CSS, from `space.config`. Linked with
+/// `?v={theme hash}` and served immutable, so a reader fetches it once per change; it is built
+/// from one indexed row and is not worth the edge cache. A space without a theme has no sheet.
+async fn theme_css(env: &Env, space: &str) -> Response {
+    let Ok(space_path) = SpacePath::parse(space) else {
+        return error(StatusCode::NOT_FOUND, "no such space");
+    };
+    let Ok(db) = env.d1(DB_BINDING) else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding");
+    };
+    let store = D1Store::new(db);
+    let space = match store.space_by_path(&space_path).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "no such space"),
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let theme = Theme::from_config(&space.config);
+    if theme.is_empty() {
+        return error(StatusCode::NOT_FOUND, "this space has no theme");
+    }
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        notespace_render::layout::theme_css(&theme),
+    )
+        .into_response()
 }
 
 /// Only `/s/{path}/new` accepts a POST.

@@ -1,58 +1,49 @@
 //! A member's page. Public and user-agnostic, so briefly cacheable.
 
-use crate::index::{nav, IndexStyle};
-use maud::{html, Markup, PreEscaped, DOCTYPE};
+use crate::layout::{crumbs, Shell};
+use maud::{html, Markup, PreEscaped};
 use notespace_core::model::{Profile, UserState};
 
 pub fn profile_page(profile: &Profile) -> Markup {
     let u = &profile.user;
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                link rel="icon" href="data:,";
-                title { (u.name) " — notespace" }
-                style { (IndexStyle) }
-            }
-            body {
-                (nav())
-                main {
-                    h1 { (u.name) }
-                    @match u.state {
-                        // The name stays taken; the page says why it resolves to nothing.
-                        UserState::Deleted => p class="empty" { "This account has been deleted." },
-                        UserState::Banned => p class="empty" { "This account is suspended." },
-                        UserState::Active => {
-                            p class="meta" {
-                                "member since "
-                                (crate::time::stamp(profile.created_at))
-                            }
-                            @if profile.posts.is_empty() {
-                                p class="empty" { "No posts yet." }
-                            } @else {
-                                ol class="threads" {
-                                    @for p in &profile.posts {
-                                        li {
-                                            a class="title" href={ "/p/" (p.public_id) } { (p.thread_title) }
-                                            div class="meta" {
-                                                (crate::time::stamp(p.created_at))
-                                                " in "
-                                                a href={ "/t/" (p.thread_public_id) } { "the thread" }
-                                            }
-                                            // Sanitized at write time; the one legitimate PreEscaped.
-                                            div class="post-body" { (PreEscaped(&p.body_html)) }
-                                        }
+    Shell {
+        title: &u.name,
+        crumbs: crumbs([(u.name.as_str(), None)]),
+        ..Default::default()
+    }
+    .render(html! {
+        h1 { (u.name) }
+        @match u.state {
+            // The name stays taken; the page says why it resolves to nothing.
+            UserState::Deleted => p class="empty" { "This account has been deleted." },
+            UserState::Banned => p class="empty" { "This account is suspended." },
+            UserState::Active => {
+                p class="meta" {
+                    "member since "
+                    (crate::time::stamp(profile.created_at))
+                }
+                @if profile.posts.is_empty() {
+                    p class="empty" { "No posts yet." }
+                } @else {
+                    ol class="posts" {
+                        @for p in &profile.posts {
+                            li class="post" data-depth="0" {
+                                div class="post-head meta" {
+                                    a class="author" href={ "/t/" (p.thread_public_id) } { (p.thread_title) }
+                                    " "
+                                    a class="permalink" href={ "/p/" (p.public_id) } {
+                                        (crate::time::stamp(p.created_at))
                                     }
                                 }
+                                // Sanitized at write time; the one legitimate PreEscaped.
+                                div class="post-body" { (PreEscaped(&p.body_html)) }
                             }
                         }
                     }
                 }
             }
         }
-    }
+    })
 }
 
 #[cfg(test)]

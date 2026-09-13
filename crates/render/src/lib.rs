@@ -7,6 +7,7 @@ pub mod auth;
 pub mod compose;
 pub mod feed;
 pub mod index;
+pub mod layout;
 pub mod markdown;
 pub mod moderation;
 pub mod page;
@@ -22,6 +23,9 @@ pub use page::thread_page;
 pub const BAKE_REVISION: u64 = fnv1a(
     concat!(
         include_str!("page.rs"),
+        include_str!("index.rs"),
+        include_str!("layout.rs"),
+        include_str!("../public/static/style.css"),
         include_str!("time.rs"),
         include_str!("feed.rs")
     )
@@ -41,28 +45,20 @@ const fn fnv1a(bytes: &[u8]) -> u64 {
 
 /// A plain error page with a way home, for anything that is not a 400.
 pub fn error_page(status: u16, reason: &str) -> maud::Markup {
-    use maud::{html, DOCTYPE};
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                link rel="icon" href="data:,";
-                title { (status) " " (reason) }
-                style { (auth::PreEscapedStyle) }
-            }
-            body {
-                main class="auth" {
-                    h1 { (status) " " (reason) }
-                    @match status {
-                        404 => p { "There is nothing at this address. It may have moved, or the link may be wrong." },
-                        503 => p { "This part of the site is not configured yet." },
-                        _ => p { "Something went wrong on our side. It has been logged." },
-                    }
-                    p class="muted" { a href="/" { "Back to the index" } }
-                }
-            }
-        }
+    use crate::layout::{Shell, Width};
+    use maud::html;
+    Shell {
+        title: &format!("{} {}", status, reason),
+        width: Width::Narrow,
+        ..Default::default()
     }
+    .render(html! {
+        h1 { (status) " " (reason) }
+        @match status {
+            404 => p { "There is nothing at this address. It may have moved, or the link may be wrong." },
+            503 => p { "This part of the site is not configured yet." },
+            _ => p { "Something went wrong on our side. It has been logged." },
+        }
+        p class="muted" { a href="/" { "Back to the index" } }
+    })
 }

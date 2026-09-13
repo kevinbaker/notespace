@@ -1,25 +1,13 @@
 //! The thread index and the space pages. User-agnostic like the thread page, so the nav is
 //! static links; "account" goes to a page that asks for sign-in if there is none.
 
-use maud::{html, Markup, DOCTYPE};
+use crate::layout::{crumbs, Shell, SpaceTheme, Width};
+use maud::{html, Markup};
 use notespace_core::model::{Space, ThreadSummary};
+use notespace_core::theme::Theme;
 
-/// Identical for everyone: a "signed in as …" here would make every page per-viewer.
-pub fn nav() -> Markup {
-    html! {
-        nav class="site" {
-            a class="brand" href="/" { "notespace" }
-            span class="spacer" {}
-            a href="/login" { "sign in" }
-            " · "
-            a href="/register" { "register" }
-            " · "
-            a href="/settings" { "account" }
-        }
-    }
-}
-
-/// A list of threads, shared by the index and the space page.
+/// A list of threads, shared by the index and the space page. The count sits in its own
+/// column so a page of them scans.
 pub fn thread_list(threads: &[ThreadSummary]) -> Markup {
     html! {
         @if threads.is_empty() {
@@ -29,14 +17,14 @@ pub fn thread_list(threads: &[ThreadSummary]) -> Markup {
                 @for t in threads {
                     li {
                         a class="title" href={ "/t/" (t.public_id) } { (t.title) }
+                        span class="count" title={
+                            (t.post_count) @if t.post_count == 1 { " post" } @else { " posts" }
+                        } { (t.post_count) }
                         div class="meta" {
-                            (t.post_count)
-                            @if t.post_count == 1 { " post" } @else { " posts" }
-                            " · "
                             a href={ "/s/" (t.space_path.trim_end_matches('/')) } { (t.space_name) }
-                            " · started by "
+                            " · "
                             a href={ "/u/" (t.author_name) } { (t.author_name) }
-                            " · last activity " (crate::time::stamp(t.bumped_at))
+                            " · " (crate::time::stamp(t.bumped_at))
                         }
                     }
                 }
@@ -45,7 +33,7 @@ pub fn thread_list(threads: &[ThreadSummary]) -> Markup {
     }
 }
 
-/// Spaces as a row of links; nothing if there are none.
+/// Spaces as a row of chips; nothing if there are none.
 pub fn space_list(spaces: &[Space]) -> Markup {
     html! {
         @if !spaces.is_empty() {
@@ -60,105 +48,40 @@ pub fn space_list(spaces: &[Space]) -> Markup {
 
 /// Render the index: the top-level spaces, then the most recently active threads anywhere.
 pub fn index_page(spaces: &[Space], threads: &[ThreadSummary]) -> Markup {
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                link rel="icon" href="data:,";
-                title { "notespace" }
-                style { (IndexStyle) }
-            }
-            body {
-                (nav())
-                main {
-                    (space_list(spaces))
-                    (thread_list(threads))
-                }
-            }
-        }
-    }
+    Shell::default().render(html! {
+        (space_list(spaces))
+        (thread_list(threads))
+    })
 }
 
 /// One space: where it sits, what is under it, and its threads (subspaces included).
 pub fn space_page(space: &Space, children: &[Space], threads: &[ThreadSummary]) -> Markup {
     let url = space.path.trim_end_matches('/');
-    // Every ancestor is a link, so the page is its own breadcrumb.
+    let theme = Theme::from_config(&space.config);
+    // Every ancestor is a link, so the header is the page's breadcrumb.
     let segments: Vec<&str> = url.split('/').filter(|s| !s.is_empty()).collect();
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                link rel="icon" href="data:,";
-                title { (space.name) " — notespace" }
-                style { (IndexStyle) }
-            }
-            body {
-                (nav())
-                main {
-                    p class="crumbs" {
-                        a href="/" { "notespace" }
-                        @for (i, seg) in segments.iter().enumerate() {
-                            " / "
-                            @if i + 1 == segments.len() {
-                                (seg)
-                            } @else {
-                                a href={ "/s/" (segments[..=i].join("/")) } { (seg) }
-                            }
-                        }
-                    }
-                    h1 { (space.name) }
-                    p class="actions" {
-                        a class="button" href={ "/s/" (url) "/new" } { "Start a thread" }
-                    }
-                    (space_list(children))
-                    (thread_list(threads))
-                }
-            }
+    let trail = segments.iter().enumerate().map(|(i, seg)| {
+        let href = (i + 1 < segments.len()).then(|| format!("/s/{}", segments[..=i].join("/")));
+        (*seg, href)
+    });
+    Shell {
+        title: &space.name,
+        width: Width::Normal,
+        crumbs: crumbs(trail),
+        theme: Some(SpaceTheme {
+            url: format!("/s/{url}"),
+            theme: &theme,
+        }),
+        ..Default::default()
+    }
+    .render(html! {
+        h1 { (space.name) }
+        p class="actions" {
+            a class="button" href={ "/s/" (url) "/new" } { "Start a thread" }
         }
-    }
-}
-
-pub(crate) struct IndexStyle;
-
-impl maud::Render for IndexStyle {
-    fn render_to(&self, out: &mut String) {
-        out.push_str(
-            "body{font:16px/1.5 system-ui,sans-serif;margin:0;background:#fbfbfc;color:#1a1a1a}\
-             nav.site{display:flex;align-items:center;gap:.5rem;padding:.75rem 1rem;\
-             border-bottom:1px solid #e4e4e8;font-size:.9rem}\
-             nav.site .brand{font-weight:600;text-decoration:none;color:inherit}\
-             nav.site .spacer{flex:1}\
-             nav.site a{color:#3355bb}\
-             main{max-width:44rem;margin:1.5rem auto;padding:0 1rem}\
-             ol.threads{list-style:none;margin:0;padding:0}\
-             ol.threads li{padding:.7rem 0;border-bottom:1px solid #ececed}\
-             a.title{font-size:1.05rem;text-decoration:none;color:#1a3fa0}\
-             a.title:hover{text-decoration:underline}\
-             .meta{color:#666;font-size:.85rem;margin-top:.15rem}\
-             .meta a{color:inherit}\
-             .empty,.crumbs{color:#666}\
-             .crumbs{font-size:.85rem;margin:0}.crumbs a{color:inherit}\
-             h1{font-size:1.4rem;margin:.25rem 0 .5rem}\
-             ul.spaces{list-style:none;margin:0 0 1rem;padding:0;display:flex;flex-wrap:wrap;gap:.5rem}\
-             ul.spaces a{display:inline-block;padding:.2rem .6rem;border:1px solid #d6d6db;\
-             border-radius:1rem;text-decoration:none;color:#1a3fa0;font-size:.9rem}\
-             .actions{margin:.5rem 0 1rem}\
-             a.button{display:inline-block;padding:.4rem .8rem;border-radius:4px;\
-             background:#1a1a1a;color:#fff;text-decoration:none;font-size:.9rem}\
-             .post-body{margin:.35rem 0}.post-body>*:first-child{margin-top:0}\
-             .post-body>*:last-child{margin-bottom:0}\
-             @media(prefers-color-scheme:dark){body{background:#16181c;color:#e8e8ea}\
-             nav.site{border-color:#2a2e37}nav.site a{color:#8ab0ff}\
-             ol.threads li{border-color:#23262d}a.title{color:#8ab0ff}\
-             ul.spaces a{color:#8ab0ff;border-color:#3a3f4b}\
-             a.button{background:#e8e8ea;color:#16181c}\
-             .meta,.empty,.crumbs{color:#9aa0ab}}",
-        );
-    }
+        (space_list(children))
+        (thread_list(threads))
+    })
 }
 
 #[cfg(test)]
@@ -186,6 +109,7 @@ mod tests {
             parent_id: None,
             ranking: notespace_core::model::Ranking::Bump,
             depth_cap: 8,
+            config: "{}".into(),
         }
     }
 

@@ -16,6 +16,7 @@ use crate::moderation::policy::ModerationPolicy;
 use crate::moderation::{ActorKind, NewAction};
 use crate::space_key::{SpaceKey, SpacePath};
 use crate::store::{Store, StoreError, StoreResult};
+use crate::theme::Theme;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Rejected {
@@ -292,16 +293,23 @@ pub struct SpaceForm<'a> {
     pub ranking: Ranking,
     pub depth_cap: u32,
     pub policy: ModerationPolicy,
+    pub theme: Theme,
 }
 
 impl SpaceForm<'_> {
-    /// `space.config`, with the policy under `"moderation"` and everything else preserved.
+    /// `space.config`, with the policy under `"moderation"`, the theme under `"theme"`, and
+    /// everything else preserved.
     pub fn config(&self, existing: &str) -> String {
         let mut v = serde_json::from_str::<serde_json::Value>(existing)
             .ok()
             .filter(serde_json::Value::is_object)
             .unwrap_or_else(|| serde_json::json!({}));
         v["moderation"] = serde_json::to_value(&self.policy).unwrap_or_default();
+        if self.theme.is_empty() {
+            v.as_object_mut().map(|m| m.remove("theme"));
+        } else {
+            v["theme"] = self.theme.to_json();
+        }
         v.to_string()
     }
 }
@@ -374,6 +382,7 @@ pub async fn create_space<S: Store>(
         parent_id: parent,
         ranking: new.ranking,
         depth_cap: new.depth_cap,
+        config: new.config,
     }))
 }
 
@@ -394,7 +403,7 @@ pub async fn update_space<S: Store>(
     let Some(existing) = store.space_detail(space).await? else {
         return Ok(Outcome::Rejected(Rejected::NotFound));
     };
-    let config = form.config(&existing.config);
+    let config = form.config(&existing.space.config);
     store
         .update_space(
             space,
@@ -445,10 +454,13 @@ mod tests {
                 blocklist: vec!["casino".into()],
                 ..ModerationPolicy::default()
             },
+            theme: Theme::parse_lines("accent: #c00").unwrap(),
         };
-        let out = form.config(r#"{"theme":"dark","moderation":{"new_account_hours":72}}"#);
+        let out = form.config(r#"{"preset":"hn","moderation":{"new_account_hours":72}}"#);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["theme"], "dark", "unrelated config was dropped");
+        assert_eq!(v["preset"], "hn", "unrelated config was dropped");
+        assert_eq!(v["theme"]["accent"], "#c00");
+        assert_eq!(Theme::from_config(&out).both[0].1, "#c00");
         assert_eq!(v["moderation"]["new_account_hours"], 2);
         assert_eq!(v["moderation"]["blocklist"][0], "casino");
         // And it round-trips through the reader the write path uses.

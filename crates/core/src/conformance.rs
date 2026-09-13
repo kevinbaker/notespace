@@ -397,9 +397,9 @@ async fn spaces_are_creatable_once_and_editable<S: Store>(store: &S, fx: &Fixtur
     require!(NAME, detail.space.depth_cap == 3, "depth_cap not updated");
     require!(
         NAME,
-        detail.config == r#"{"k":1}"#,
+        detail.space.config == r#"{"k":1}"#,
         "config not updated: {}",
-        detail.config
+        detail.space.config
     );
     require!(
         NAME,

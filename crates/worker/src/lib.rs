@@ -86,7 +86,6 @@ fn router(env: Env) -> Router {
         .route("/", get(index))
         .route("/healthz", get(healthz))
         .route("/favicon.ico", get(favicon))
-        .route("/static/reply.js", get(reply_script))
         .route("/t/{id}", get(thread_page))
         .route("/t/{id}/{slug}", get(thread_page_slug))
         .route("/p/{id}", get(post_permalink))
@@ -960,23 +959,6 @@ async fn reply_target(
         Ok(_) | Err(StoreError::NotFound) => Err(error(StatusCode::NOT_FOUND, "no such post")),
         Err(e) => Err(error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
     }
-}
-
-/// The reply form's enhancement, served as a file rather than inlined: the CSP is
-/// `script-src 'self'` and stays that way.
-async fn reply_script() -> Response {
-    (
-        StatusCode::OK,
-        [
-            (
-                header::CONTENT_TYPE,
-                "application/javascript; charset=utf-8",
-            ),
-            (header::CACHE_CONTROL, "public, max-age=86400"),
-        ],
-        include_str!("../static/reply.js"),
-    )
-        .into_response()
 }
 
 /// Turn `?error=` back into something to show. Only values this handler itself emits.

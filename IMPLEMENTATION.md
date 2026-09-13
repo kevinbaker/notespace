@@ -46,6 +46,28 @@ responses other than 400 are `notespace_render::error_page`; unknown routes hit 
 fallback; `/favicon.ico` is a 204 and every page declares `href="data:,"` so browsers do not
 ask.
 
+## The look, and per-space themes
+
+| what | where |
+|---|---|
+| The one stylesheet: fonts, tokens, then components | `crates/render/public/static/style.css` |
+| The font: IBM Plex Sans, variable, Latin + Latin Extended, roman and italic | `crates/render/public/static/fonts/` |
+| Static assets, served by Cloudflare in front of the Worker | `[assets]` in `wrangler.toml` → `crates/render/public`; `_headers` there marks `/static/*` immutable |
+| The page shell every page renders through | `crates/render/src/layout.rs` — `Shell`, `crumbs`, `SpaceTheme`, `theme_css` |
+| A space's theme: validated property overrides and its own CSS | `crates/core/src/theme.rs` — `Theme::from_config`, `parse_lines`, `with_css`, `version` |
+| Where a theme is stored | `space.config` under `"theme"`; carried on `Space::config` so the read path has it |
+| Where a theme is served | `/s/{path}/theme.css?v={hash}` — `posting::theme_css`; linked only by pages of a space that has one |
+| Editing it | the space form in `crates/render/src/admin.rs` — `theme_fields`; parsed in `worker::admin::space_form` |
+| Looking at every page without a database | `cargo run -p notespace-render --example preview -- target/preview` |
+
+The pages link `/static/style.css?v=BAKE_REVISION`; the sheet is part of that hash, so a change
+to it is a new URL and a deploy-time cache flush. Requests for static assets never invoke the
+Worker and are not counted against the daily cap. Everything past the sheet's token block is
+written in terms of the tokens (`the_stylesheet_uses_no_literal_colours_outside_the_token_block`
+enforces this), so a theme can reach all of it. Thread and space pages link their space's
+sheet; forms and admin pages use the site's alone. The CSP is `style-src 'self'
+'unsafe-inline'`: the inline part is for the per-post `style="--depth:n"`.
+
 ## §3.5 What the client may and may not do
 
 `SanitizedHtml` in `crates/core/src/model.rs` is the type that enforces it — the only
@@ -183,8 +205,8 @@ cookie used before a session exists is `cookie::ANON`.
 | Session → user | `current_user` in `crates/worker/src/lib.rs` |
 
 The form is a separate uncached page, not part of the baked thread. It shows the parent post
-(`Store::post_by_id`, `render::auth::ReplyTarget`); `crates/worker/static/reply.js`, served
-at `/static/reply.js`, adds the "quote selection" and "quote all" buttons, and without it
+(`Store::post_by_id`, `render::auth::ReplyTarget`); `crates/render/public/static/reply.js`, a
+static asset at `/static/reply.js`, adds the "quote selection" and "quote all" buttons, and without it
 there are none. A posted reply lands on its permalink,
 which the thread page highlights with `.post:target`.
 

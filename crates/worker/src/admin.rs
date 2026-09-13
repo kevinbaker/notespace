@@ -11,6 +11,7 @@ use notespace_core::model::{PostState, Ranking, Role, ThreadState, UserState};
 use notespace_core::moderation::policy::ModerationPolicy;
 use notespace_core::path::Path as TreePath;
 use notespace_core::store::{Page, Store, StoreError};
+use notespace_core::theme::Theme;
 use notespace_core::username::Username;
 use notespace_render::admin as page;
 use notespace_render::admin::Notice;
@@ -71,10 +72,15 @@ fn explain(code: &str) -> String {
         "yourself" => "You cannot change your own account here.".into(),
         "expired" => "That form had expired. Please try again.".into(),
         "notfound" => "That no longer exists.".into(),
-        other => match other.strip_prefix("key-") {
-            Some(why) => format!("That key will not work: {why}."),
-            None => "That did not work.".into(),
-        },
+        other => {
+            if let Some(why) = other.strip_prefix("key-") {
+                format!("That key will not work: {why}.")
+            } else if let Some(why) = other.strip_prefix("theme-") {
+                format!("The theme was not saved: {why}.")
+            } else {
+                "That did not work.".into()
+            }
+        }
     }
 }
 
@@ -90,6 +96,10 @@ fn rejected(r: Rejected) -> &'static str {
         Rejected::BadName => "name",
         Rejected::Yourself => "yourself",
     }
+}
+
+fn bad_theme(path: &str, why: &str) -> Response {
+    see_other(format!("{path}?error=theme-{}", crate::urlencoding(why)))
 }
 
 fn back(path: &str, outcome: Result<Outcome, StoreError>) -> Response {
@@ -395,8 +405,12 @@ pub async fn spaces(
     ))
 }
 
-/// The policy and layout fields, read the way the form writes them.
-fn space_form<'a>(fields: &'a std::collections::HashMap<String, String>) -> SpaceForm<'a> {
+/// The policy, layout and theme fields, read the way the form writes them. A theme that does
+/// not validate is the one thing here that is refused rather than clamped: the reason names
+/// the line, and silently dropping it would be a mystery.
+fn space_form<'a>(
+    fields: &'a std::collections::HashMap<String, String>,
+) -> Result<SpaceForm<'a>, String> {
     let field = |k: &str| fields.get(k).map(String::as_str).unwrap_or("");
     let num = |k: &str, d: i64| field(k).trim().parse::<i64>().unwrap_or(d);
     let real = |k: &str, d: f64| field(k).trim().parse::<f64>().unwrap_or(d);
@@ -420,12 +434,14 @@ fn space_form<'a>(fields: &'a std::collections::HashMap<String, String>) -> Spac
         public_modlog: field("public_modlog") == "1",
         rules: Some(field("rules").trim().to_string()).filter(|r| !r.is_empty()),
     };
-    SpaceForm {
+    let theme = Theme::parse_lines(field("theme"))?.with_css(field("theme_css"))?;
+    Ok(SpaceForm {
         name: field("name"),
         ranking: Ranking::parse(field("ranking")).unwrap_or_default(),
         depth_cap: num("depth_cap", 8).clamp(0, 64) as u32,
         policy,
-    }
+        theme,
+    })
 }
 
 #[worker::send]
@@ -444,7 +460,10 @@ pub async fn space_create(
         return see_other("/admin/spaces?error=expired".into());
     }
     let parent = field("parent").trim().parse::<i64>().ok();
-    let form = space_form(&fields);
+    let form = match space_form(&fields) {
+        Ok(f) => f,
+        Err(why) => return bad_theme("/admin/spaces", &why),
+    };
     match admin::create_space(
         &signed.store,
         &signed.user,
@@ -499,7 +518,10 @@ pub async fn space_submit(
     if !signed.verify(fields.get("csrf").map(String::as_str).unwrap_or("")) {
         return see_other(format!("{path}?error=expired"));
     }
-    let form = space_form(&fields);
+    let form = match space_form(&fields) {
+        Ok(f) => f,
+        Err(why) => return bad_theme(&path, &why),
+    };
     back(
         &path,
         admin::update_space(&signed.store, &signed.user, id, form, now_ms()).await,

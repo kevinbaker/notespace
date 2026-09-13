@@ -2,8 +2,8 @@
 //! tokens, and the modlog changes with every action. Like everything else they work without
 //! JavaScript.
 
-use crate::auth::PreEscapedStyle;
-use maud::{html, Markup, PreEscaped, DOCTYPE};
+use crate::layout::{Shell, Width};
+use maud::{html, Markup, PreEscaped};
 use notespace_core::model::PostState;
 use notespace_core::moderation::classify::Call;
 use notespace_core::moderation::{ActorKind, LogEntry, ReviewItem, ReviewReason};
@@ -47,95 +47,72 @@ fn state_label(s: PostState) -> &'static str {
 
 /// The queue, oldest first. One form per decision, so each click is one POST with a token.
 pub fn queue_page(items: &[ReviewItem], csrf: &str, notice: Option<QueueNotice>) -> Markup {
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                link rel="icon" href="data:,";
-                title { "Review queue" }
-                style { (PreEscapedStyle) (PreEscaped(QUEUE_STYLE)) }
-            }
-            body {
-                main class="auth wide" {
-                    h1 { "Review queue" }
-                    p class="muted" {
-                        (items.len()) " waiting · " a href="/admin" { "admin" } " · "
-                        a href="/modlog" { "public log" } " · " a href="/" { "home" }
-                    }
-                    @if let Some(n) = notice {
-                        p class="notice" role="status" { (n.message()) }
-                    }
-                    @if items.is_empty() {
-                        p { "Nothing to review." }
-                    }
-                    @for item in items {
-                        article class="item" id={ "r" (item.id) } {
-                            header {
-                                strong { (reason_label(item.reason)) }
-                                " · " span class="muted" { (state_label(item.post_state)) }
-                                " · in " a href={ "/t/" (item.thread_public_id) } { (item.thread_title) }
-                                " · by " a href={ "/u/" (item.author_name) } { (item.author_name) }
-                                " · " a href={ "/p/" (item.post_public_id) } { "permalink" }
-                                " · " a href={ "/admin/thread/" (item.thread_public_id) "#p" (item.post_public_id) } { "admin" }
-                            }
-                            // Sanitized at write time, like the thread page.
-                            div class="post-body" { (PreEscaped(&item.body_html)) }
-                            @if let Some(call) = item.model_verdict {
-                                p class="verdict" {
-                                    "Model: " strong { (call.as_str()) }
-                                    @if let Some(c) = item.model_confidence {
-                                        " at " (format!("{:.0}%", c * 100.0))
-                                    }
-                                    @if !item.model_categories.is_empty() {
-                                        " · "
-                                        @for (i, cat) in item.model_categories.iter().enumerate() {
-                                            @if i > 0 { ", " }
-                                            code { (cat.as_str()) }
-                                        }
-                                    }
-                                    @if call == Call::Unsure { " (asked for a human)" }
-                                }
-                            }
-                            @if let Some(text) = &item.appeal_text {
-                                blockquote class="appeal" {
-                                    strong { "Appeal: " } (text)
-                                }
-                            }
-                            div class="decide" {
-                                form method="post" action={ "/mod/review/" (item.id) } {
-                                    input type="hidden" name="csrf" value=(csrf);
-                                    input type="hidden" name="resolution" value="approve";
-                                    button type="submit" class="approve" { "Approve" }
-                                }
-                                form method="post" action={ "/mod/review/" (item.id) } {
-                                    input type="hidden" name="csrf" value=(csrf);
-                                    input type="hidden" name="resolution" value="reject";
-                                    button type="submit" class="reject" { "Reject" }
-                                }
+    Shell {
+        title: "Review queue",
+        width: Width::Wide,
+        ..Default::default()
+    }
+    .render(html! {
+        h1 { "Review queue" }
+        p class="muted" {
+            (items.len()) " waiting · " a href="/admin" { "admin" } " · "
+            a href="/modlog" { "public log" } " · " a href="/" { "home" }
+        }
+        @if let Some(n) = notice {
+            p class="notice" role="status" { (n.message()) }
+        }
+        @if items.is_empty() {
+            p { "Nothing to review." }
+        }
+        @for item in items {
+            article class="item" id={ "r" (item.id) } {
+                header {
+                    strong { (reason_label(item.reason)) }
+                    " · " span class="muted" { (state_label(item.post_state)) }
+                    " · in " a href={ "/t/" (item.thread_public_id) } { (item.thread_title) }
+                    " · by " a href={ "/u/" (item.author_name) } { (item.author_name) }
+                    " · " a href={ "/p/" (item.post_public_id) } { "permalink" }
+                    " · " a href={ "/admin/thread/" (item.thread_public_id) "#p" (item.post_public_id) } { "admin" }
+                }
+                // Sanitized at write time, like the thread page.
+                div class="post-body" { (PreEscaped(&item.body_html)) }
+                @if let Some(call) = item.model_verdict {
+                    p class="verdict" {
+                        "Model: " strong { (call.as_str()) }
+                        @if let Some(c) = item.model_confidence {
+                            " at " (format!("{:.0}%", c * 100.0))
+                        }
+                        @if !item.model_categories.is_empty() {
+                            " · "
+                            @for (i, cat) in item.model_categories.iter().enumerate() {
+                                @if i > 0 { ", " }
+                                code { (cat.as_str()) }
                             }
                         }
+                        @if call == Call::Unsure { " (asked for a human)" }
+                    }
+                }
+                @if let Some(text) = &item.appeal_text {
+                    blockquote class="appeal" {
+                        strong { "Appeal: " } (text)
+                    }
+                }
+                div class="decide" {
+                    form method="post" action={ "/mod/review/" (item.id) } {
+                        input type="hidden" name="csrf" value=(csrf);
+                        input type="hidden" name="resolution" value="approve";
+                        button type="submit" class="approve" { "Approve" }
+                    }
+                    form method="post" action={ "/mod/review/" (item.id) } {
+                        input type="hidden" name="csrf" value=(csrf);
+                        input type="hidden" name="resolution" value="reject";
+                        button type="submit" class="reject" { "Reject" }
                     }
                 }
             }
         }
-    }
+    })
 }
-
-const QUEUE_STYLE: &str = "\
-.item{border:1px solid #ddd;border-radius:6px;padding:.75rem 1rem;margin:1rem 0}\
-.item header{font-size:.9rem;margin-bottom:.5rem}\
-.post-body{margin:.5rem 0;padding:.5rem .75rem;background:rgba(128,128,128,.08);border-radius:4px}\
-.post-body>*:first-child{margin-top:0}.post-body>*:last-child{margin-bottom:0}\
-.verdict{font-size:.9rem}.appeal{margin:.5rem 0;padding-left:.75rem;border-left:3px solid #ccc}\
-.decide{display:flex;gap:.5rem}.decide form{flex:1}\
-.decide button{margin-top:.25rem}.decide .reject{background:#8b1e1e}\
-.notice{background:#e8f5e9;border:1px solid #b9dfbb;padding:.6rem .75rem;border-radius:4px}\
-.log{list-style:none;padding:0}.log li{padding:.4rem 0;border-bottom:1px solid #eee;font-size:.95rem}\
-@media(prefers-color-scheme:dark){.item{border-color:#333}.log li{border-color:#2a2a2a}\
-.notice{background:#1d3a1f;border-color:#2b6b2e}}\
-";
 
 fn actor_label(kind: ActorKind, name: &str) -> String {
     match kind {
@@ -160,46 +137,36 @@ fn action_phrase(action: &str) -> &str {
 
 /// The public log. Actions and targets only; never a rationale, never a reporter.
 pub fn modlog_page(entries: &[LogEntry]) -> Markup {
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                link rel="icon" href="data:,";
-                title { "Moderation log" }
-                style { (PreEscapedStyle) (PreEscaped(QUEUE_STYLE)) }
-            }
-            body {
-                main class="auth wide" {
-                    h1 { "Moderation log" }
-                    p class="muted" {
-                        "Every action taken on content here, by people, rules and the model. "
-                        a href="/" { "Home" }
-                    }
-                    @if entries.is_empty() { p { "Nothing yet." } }
-                    ul class="log" {
-                        @for e in entries {
-                            li {
-                                (crate::time::stamp(e.created_at))
-                                " — " (actor_label(e.actor_kind, &e.actor_name))
-                                " " (action_phrase(&e.action)) " "
-                                @match &e.target_public_id {
-                                    Some(id) if e.target_kind == "post" => {
-                                        a href={ "/p/" (id) } { "a post" }
-                                    }
-                                    Some(id) if e.target_kind == "thread" => {
-                                        a href={ "/t/" (id) } { "a thread" }
-                                    }
-                                    _ => { "a " (e.target_kind) }
-                                }
-                            }
+    Shell {
+        title: "Moderation log",
+        ..Default::default()
+    }
+    .render(html! {
+        h1 { "Moderation log" }
+        p class="muted" {
+            "Every action taken on content here, by people, rules and the model. "
+            a href="/" { "Home" }
+        }
+        @if entries.is_empty() { p { "Nothing yet." } }
+        ul class="log" {
+            @for e in entries {
+                li {
+                    (crate::time::stamp(e.created_at))
+                    " — " (actor_label(e.actor_kind, &e.actor_name))
+                    " " (action_phrase(&e.action)) " "
+                    @match &e.target_public_id {
+                        Some(id) if e.target_kind == "post" => {
+                            a href={ "/p/" (id) } { "a post" }
                         }
+                        Some(id) if e.target_kind == "thread" => {
+                            a href={ "/t/" (id) } { "a thread" }
+                        }
+                        _ => { "a " (e.target_kind) }
                     }
                 }
             }
         }
-    }
+    })
 }
 
 pub enum ReportError {
@@ -224,54 +191,45 @@ pub fn report_page(
     error: Option<ReportError>,
     done: Option<ReportDone>,
 ) -> Markup {
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                link rel="icon" href="data:,";
-                title { "Report a post" }
-                style { (PreEscapedStyle) }
+    Shell {
+        title: "Report a post",
+        width: Width::Narrow,
+        ..Default::default()
+    }
+    .render(html! {
+        h1 { "Report a post" }
+        @if let Some(d) = done {
+            p role="status" {
+                @match d {
+                    ReportDone::Recorded => "Thanks. A moderator will take a look.",
+                    ReportDone::AlreadyReported => "You had already reported this post.",
+                    ReportDone::Held => "Thanks. The post has been taken down pending review.",
+                }
             }
-            body {
-                main class="auth" {
-                    h1 { "Report a post" }
-                    @if let Some(d) = done {
-                        p role="status" {
-                            @match d {
-                                ReportDone::Recorded => "Thanks. A moderator will take a look.",
-                                ReportDone::AlreadyReported => "You had already reported this post.",
-                                ReportDone::Held => "Thanks. The post has been taken down pending review.",
-                            }
-                        }
-                        p class="muted" { a href={ "/p/" (post) } { "Back to the post" } }
-                    } @else {
-                        @if let Some(e) = error {
-                            p class="error" role="alert" {
-                                @match e {
-                                    ReportError::Expired => "That form had expired. Please try again.",
-                                    ReportError::OwnPost => "You cannot report your own post. Delete it instead.",
-                                    ReportError::Gone => "That post is no longer available.",
-                                }
-                            }
-                        }
-                        form method="post" action={ "/p/" (post) "/report" } {
-                            input type="hidden" name="csrf" value=(csrf);
-                            label for="reason" { "What is wrong with it? (optional)" }
-                            textarea id="reason" name="reason" rows="4" maxlength="500"
-                                placeholder="Spam, harassment, off topic…" {}
-                            button type="submit" { "Report" }
-                        }
-                        p class="muted" {
-                            "Reports are private. Enough of them take a post out of sight until a moderator has looked. "
-                            a href={ "/p/" (post) } { "Back to the post" }
-                        }
+            p class="muted" { a href={ "/p/" (post) } { "Back to the post" } }
+        } @else {
+            @if let Some(e) = error {
+                p class="error" role="alert" {
+                    @match e {
+                        ReportError::Expired => "That form had expired. Please try again.",
+                        ReportError::OwnPost => "You cannot report your own post. Delete it instead.",
+                        ReportError::Gone => "That post is no longer available.",
                     }
                 }
             }
+            form method="post" action={ "/p/" (post) "/report" } {
+                input type="hidden" name="csrf" value=(csrf);
+                label for="reason" { "What is wrong with it? (optional)" }
+                textarea id="reason" name="reason" rows="4" maxlength="500"
+                    placeholder="Spam, harassment, off topic…" {}
+                button type="submit" { "Report" }
+            }
+            p class="muted" {
+                "Reports are private. Enough of them take a post out of sight until a moderator has looked. "
+                a href={ "/p/" (post) } { "Back to the post" }
+            }
         }
-    }
+    })
 }
 
 pub enum AppealError {
@@ -284,46 +242,36 @@ pub enum AppealError {
 
 /// The appeal form for the author of a hidden post, or the confirmation.
 pub fn appeal_page(csrf: &str, post: &str, error: Option<AppealError>, filed: bool) -> Markup {
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                link rel="icon" href="data:,";
-                title { "Appeal" }
-                style { (PreEscapedStyle) }
-            }
-            body {
-                main class="auth wide" {
-                    h1 { "Appeal a removal" }
-                    @if filed {
-                        p role="status" { "Your appeal is in the queue. A moderator will look at it." }
-                        p class="muted" { a href={ "/p/" (post) } { "Back to the post" } }
-                    } @else {
-                        @if let Some(e) = error {
-                            p class="error" role="alert" {
-                                @match e {
-                                    AppealError::Expired => "That form had expired. Please try again.",
-                                    AppealError::Empty => "Say why the post should be restored.",
-                                    AppealError::TooLong { max } => { "Keep it under " (max) " characters." }
-                                    AppealError::NotYours => "Only the author of a post can appeal its removal.",
-                                    AppealError::NotHidden => "This post is not hidden, so there is nothing to appeal.",
-                                }
-                            }
-                        }
-                        form method="post" action={ "/p/" (post) "/appeal" } {
-                            input type="hidden" name="csrf" value=(csrf);
-                            label for="text" { "Why should this post be restored?" }
-                            textarea id="text" name="text" rows="6" required maxlength="2000" {}
-                            button type="submit" { "Send appeal" }
-                        }
-                        p class="muted" { a href={ "/p/" (post) } { "Back to the post" } }
+    Shell {
+        title: "Appeal",
+        ..Default::default()
+    }
+    .render(html! {
+        h1 { "Appeal a removal" }
+        @if filed {
+            p role="status" { "Your appeal is in the queue. A moderator will look at it." }
+            p class="muted" { a href={ "/p/" (post) } { "Back to the post" } }
+        } @else {
+            @if let Some(e) = error {
+                p class="error" role="alert" {
+                    @match e {
+                        AppealError::Expired => "That form had expired. Please try again.",
+                        AppealError::Empty => "Say why the post should be restored.",
+                        AppealError::TooLong { max } => { "Keep it under " (max) " characters." }
+                        AppealError::NotYours => "Only the author of a post can appeal its removal.",
+                        AppealError::NotHidden => "This post is not hidden, so there is nothing to appeal.",
                     }
                 }
             }
+            form method="post" action={ "/p/" (post) "/appeal" } {
+                input type="hidden" name="csrf" value=(csrf);
+                label for="text" { "Why should this post be restored?" }
+                textarea id="text" name="text" rows="6" required maxlength="2000" {}
+                button type="submit" { "Send appeal" }
+            }
+            p class="muted" { a href={ "/p/" (post) } { "Back to the post" } }
         }
-    }
+    })
 }
 
 #[cfg(test)]

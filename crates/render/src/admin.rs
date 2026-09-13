@@ -1,15 +1,16 @@
 //! The admin pages. Capability-gated and uncached; every form carries a token. Like the rest
 //! of the site they work without JavaScript, so each action is its own small form.
 
-use crate::auth::PreEscapedStyle;
+use crate::layout::{crumbs, Shell, Width};
 use crate::time::stamp;
-use maud::{html, Markup, PreEscaped, DOCTYPE};
+use maud::{html, Markup, PreEscaped};
 use notespace_core::model::{
     PostState, Ranking, Role, SiteStats, Space, SpaceDetail, Thread, ThreadPage, ThreadState,
     ThreadSummary, UserRow, UserState,
 };
 use notespace_core::moderation::policy::ModerationPolicy;
 use notespace_core::moderation::LogDetail;
+use notespace_core::theme::Theme;
 
 /// Something the page says at the top after an action.
 pub enum Notice {
@@ -18,37 +19,27 @@ pub enum Notice {
 }
 
 fn shell(title: &str, notice: Option<&Notice>, body: Markup) -> Markup {
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                link rel="icon" href="data:,";
-                title { (title) " — admin" }
-                style { (PreEscapedStyle) (PreEscaped(ADMIN_STYLE)) }
-            }
-            body {
-                main class="auth wide admin" {
-                    nav class="admin-nav" {
-                        a href="/admin" { "admin" }
-                        " · " a href="/mod/queue" { "queue" }
-                        " · " a href="/admin/users" { "users" }
-                        " · " a href="/admin/spaces" { "spaces" }
-                        " · " a href="/admin/log" { "log" }
-                        " · " a href="/" { "site" }
-                    }
-                    h1 { (title) }
-                    @match notice {
-                        Some(Notice::Saved) => p class="notice" role="status" { "Saved." },
-                        Some(Notice::Error(e)) => p class="error" role="alert" { (e) },
-                        None => {}
-                    }
-                    (body)
-                }
-            }
-        }
+    Shell {
+        title,
+        width: Width::Wide,
+        crumbs: crumbs([("admin", Some("/admin".into()))]),
+        links: html! {
+            a href="/mod/queue" { "queue" }
+            a href="/admin/users" { "users" }
+            a href="/admin/spaces" { "spaces" }
+            a href="/admin/log" { "log" }
+        },
+        ..Default::default()
     }
+    .render(html! {
+        h1 { (title) }
+        @match notice {
+            Some(Notice::Saved) => p class="notice" role="status" { "Saved." },
+            Some(Notice::Error(e)) => p class="error" role="alert" { (e) },
+            None => {}
+        }
+        (body)
+    })
 }
 
 pub fn dashboard(stats: &SiteStats, recent: &[ThreadSummary], notice: Option<Notice>) -> Markup {
@@ -276,7 +267,7 @@ pub fn spaces_page(
                 thead { tr { th { "Path" } th { "Name" } th { "Threads" } th { "Depth" } th { "Hold new accounts" } th {} } }
                 tbody {
                     @for s in spaces {
-                        @let policy = ModerationPolicy::from_config(&s.config);
+                        @let policy = ModerationPolicy::from_config(&s.space.config);
                         tr {
                             td { a href={ "/s/" (s.space.path.trim_end_matches('/')) } { (s.space.path.trim_end_matches('/')) } }
                             td { (s.space.name) }
@@ -305,6 +296,7 @@ pub fn spaces_page(
                     label for="name" { "Name" }
                     input id="name" name="name" required placeholder="Ice Hockey";
                     (policy_fields(&ModerationPolicy::default(), Ranking::Bump, 8))
+                    (theme_fields(&Theme::default()))
                     button type="submit" { "Create space" }
                 }
             }
@@ -313,7 +305,8 @@ pub fn spaces_page(
 }
 
 pub fn space_page(csrf: &str, s: &SpaceDetail, notice: Option<Notice>) -> Markup {
-    let policy = ModerationPolicy::from_config(&s.config);
+    let policy = ModerationPolicy::from_config(&s.space.config);
+    let theme = Theme::from_config(&s.space.config);
     let url = s.space.path.trim_end_matches('/');
     shell(
         &format!("Space: {}", s.space.name),
@@ -327,6 +320,7 @@ pub fn space_page(csrf: &str, s: &SpaceDetail, notice: Option<Notice>) -> Markup
                 label for="name" { "Name" }
                 input id="name" name="name" value=(s.space.name) required;
                 (policy_fields(&policy, s.space.ranking, s.space.depth_cap))
+                (theme_fields(&theme))
                 button type="submit" { "Save space" }
             }
         },
@@ -374,6 +368,31 @@ fn policy_fields(p: &ModerationPolicy, ranking: Ranking, depth_cap: u32) -> Mark
     }
 }
 
+/// The space's look: the stylesheet's custom properties, one per line, as
+/// [`Theme::parse_lines`] reads them. The names are listed so nobody has to open the sheet.
+fn theme_fields(t: &Theme) -> Markup {
+    html! {
+        h2 { "Theme" }
+        p class="muted" {
+            "One " code { "name: value" } " per line. Properties: "
+            code { "bg bg-2 fg fg-2 line accent on-accent danger warn font mono size lh radius measure indent" }
+            ". Prefix a name with " code { "light." } " or " code { "dark." }
+            " to set it for one colour scheme only. Colours, lengths and font stacks; no URLs."
+        }
+        label for="theme" { "Overrides" }
+        textarea id="theme" name="theme" rows="5" spellcheck="false"
+            placeholder="accent: #0a7a45\ndark.accent: #3fbf7f\nfont: Georgia, serif" { (t.to_lines()) }
+        label for="theme_css" { "Stylesheet" }
+        p class="muted" {
+            "The space's own CSS, applied after the site's. Write it against the site's class names "
+            "and tokens (" code { "var(--accent)" } "); backgrounds may use " code { "url()" }
+            ". Served as its own file, so a reader downloads it once per change."
+        }
+        textarea id="theme_css" name="theme_css" rows="8" spellcheck="false"
+            placeholder=".site{border-bottom:3px solid var(--accent)}" { (t.css) }
+    }
+}
+
 pub fn log_page(entries: &[LogDetail]) -> Markup {
     shell(
         "Action log",
@@ -409,32 +428,6 @@ pub fn space_option_label(s: &Space) -> String {
     format!("{} — {}", s.path.trim_end_matches('/'), s.name)
 }
 
-const ADMIN_STYLE: &str = "\
-.admin{max-width:60rem}\
-.admin-nav{font-size:.9rem;margin-bottom:.5rem}.admin-nav a{color:#3355bb}\
-dl.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(9rem,1fr));gap:.5rem;margin:1rem 0}\
-dl.stats dt{font-size:.8rem;color:#666}dl.stats dd{margin:0;font-size:1.4rem}\
-table{width:100%;border-collapse:collapse;font-size:.9rem;margin:.5rem 0}\
-th,td{text-align:left;padding:.35rem .5rem;border-bottom:1px solid #e4e4e8;vertical-align:top}\
-th{font-weight:600;font-size:.8rem;color:#666}\
-tr.user-banned td,tr.user-deleted td{color:#999}\
-tr.private td{color:#777}\
-table.log code{font-size:.75rem;word-break:break-all}\
-.item{border:1px solid #e4e4e8;border-radius:4px;padding:.6rem .75rem;margin:.6rem 0}\
-.item header{font-size:.85rem;color:#666}\
-.state{font-weight:600}.state-hidden,.state-deleted{color:#a12a2a}.state-pending{color:#b26a00}\
-.post-body.dim{opacity:.6}\
-.actions{display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.4rem}\
-form.inline{display:inline}\
-button.small{width:auto;margin:0;padding:.25rem .6rem;font-size:.85rem}\
-button.small:disabled{opacity:.4;cursor:default}\
-form.search{display:flex;gap:.5rem;align-items:center}form.search input{width:auto;flex:1}\
-select{width:100%;padding:.5rem;font-size:1rem;border:1px solid #ccc;border-radius:4px}\
-label input[type=checkbox]{width:auto;margin-right:.4rem}\
-@media(prefers-color-scheme:dark){th,td,.item{border-color:#2a2e37}th,dl.stats dt,.item header{color:#9aa0ab}\
-select{background:#1f2229;border-color:#3a3f4b;color:inherit}}\
-";
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn the_space_form_round_trips_the_policy() {
+    fn the_space_form_round_trips_the_policy_and_the_theme() {
         let s = SpaceDetail {
             space: Space {
                 id: 1,
@@ -478,13 +471,17 @@ mod tests {
                 parent_id: None,
                 ranking: Ranking::Gravity,
                 depth_cap: 3,
-            },
-            config:
-                r#"{"moderation":{"new_account_hours":2,"blocklist":["a","b"],"enabled":false}}"#
+                config: r##"{"moderation":{"new_account_hours":2,"blocklist":["a","b"],"enabled":false},"theme":{"accent":"#c00","dark":{"bg":"#000"}}}"##
                     .into(),
+            },
             thread_count: 0,
         };
         let html = space_page("tok", &s, None).into_string();
+        assert!(
+            html.contains("accent: #c00\ndark.bg: #000\n</textarea>"),
+            "{html}"
+        );
+        assert!(html.contains(r#"name="theme_css""#));
         assert!(html.contains(r#"name="new_account_hours" type="number" min="0" value="2""#));
         assert!(html.contains("a\nb</textarea>"));
         assert!(!html.contains(r#"name="enabled" value="1" checked"#));

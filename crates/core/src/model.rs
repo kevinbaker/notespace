@@ -80,6 +80,15 @@ pub struct Space {
     pub ranking: Ranking,
     /// 0 means a flat board, which is what the classic-bulletin-board preset selects.
     pub depth_cap: u32,
+    /// Raw JSON, `{}` when nothing is set: the moderation policy under `"moderation"`, the
+    /// look under `"theme"` (see [`crate::theme::Theme`]). Read by the pages, so it rides
+    /// along with the space rather than needing a second query.
+    #[serde(default = "empty_config")]
+    pub config: String,
+}
+
+fn empty_config() -> String {
+    "{}".into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -297,8 +306,6 @@ pub struct UserRow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpaceDetail {
     pub space: Space,
-    /// Raw JSON, `{}` when nothing is set.
-    pub config: String,
     pub thread_count: u32,
 }
 

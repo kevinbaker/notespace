@@ -66,6 +66,7 @@ struct ThreadRow {
     space_name: String,
     space_ranking: String,
     space_depth_cap: i64,
+    space_config: String,
 }
 
 fn thread_from_row(tr: ThreadRow) -> StoreResult<(Space, Thread)> {
@@ -76,6 +77,7 @@ fn thread_from_row(tr: ThreadRow) -> StoreResult<(Space, Thread)> {
         parent_id: None,
         ranking: ranking(&tr.space_ranking),
         depth_cap: tr.space_depth_cap.clamp(0, i64::from(u32::MAX)) as u32,
+        config: tr.space_config,
     };
     let t = Thread {
         id: tr.id,
@@ -120,6 +122,7 @@ struct SpaceRow {
     parent_id: Option<i64>,
     ranking: String,
     depth_cap: i64,
+    config: String,
 }
 
 #[derive(Deserialize)]
@@ -332,6 +335,7 @@ fn space_from_row(r: SpaceRow) -> Space {
         parent_id: r.parent_id,
         ranking: ranking(&r.ranking),
         depth_cap: r.depth_cap.clamp(0, i64::from(u32::MAX)) as u32,
+        config: r.config,
     }
 }
 
@@ -388,8 +392,8 @@ fn space_detail_from_row(r: SpaceDetailRow) -> SpaceDetail {
             parent_id: r.parent_id,
             ranking: ranking(&r.ranking),
             depth_cap: r.depth_cap.clamp(0, i64::from(u32::MAX)) as u32,
+            config: r.config,
         },
-        config: r.config,
         thread_count: r.thread_count.max(0) as u32,
     }
 }

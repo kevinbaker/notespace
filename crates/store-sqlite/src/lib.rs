@@ -64,6 +64,7 @@ fn thread_from_row(row: &Row<'_>) -> rusqlite::Result<(Space, Thread)> {
         parent_id: None,
         ranking: parse_enum(&row.get::<_, String>("space_ranking")?),
         depth_cap: row.get::<_, i64>("space_depth_cap")? as u32,
+        config: row.get("space_config")?,
     };
     let thread = Thread {
         id: row.get("id")?,
@@ -1269,6 +1270,7 @@ fn space_from_row(r: &Row<'_>) -> rusqlite::Result<Space> {
         parent_id: r.get("parent_id")?,
         ranking: parse_enum(&r.get::<_, String>("ranking")?),
         depth_cap: r.get::<_, i64>("depth_cap")? as u32,
+        config: r.get("config")?,
     })
 }
 
@@ -1287,7 +1289,6 @@ fn user_row_from_row(r: &Row<'_>) -> rusqlite::Result<UserRow> {
 fn space_detail_from_row(r: &Row<'_>) -> rusqlite::Result<SpaceDetail> {
     Ok(SpaceDetail {
         space: space_from_row(r)?,
-        config: r.get("config")?,
         thread_count: r.get::<_, i64>("thread_count")? as u32,
     })
 }

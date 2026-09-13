@@ -19,7 +19,7 @@ pub const PAGE_HEADERS: [(&str, &str); 5] = [
     ("cache-control", "public, max-age=0, s-maxage=3600"),
     (
         "content-security-policy",
-        "default-src 'self'; img-src https: data:; style-src 'unsafe-inline'; script-src 'self'; \
+        "default-src 'self'; img-src https: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; \
          frame-ancestors 'none'; base-uri 'none'",
     ),
     ("x-content-type-options", "nosniff"),

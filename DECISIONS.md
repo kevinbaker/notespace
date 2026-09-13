@@ -668,6 +668,62 @@ the site, and it is only loaded on a page that has a parent to quote.
 to the right page of the thread with the reply as the fragment, and `.post:target` highlights
 it. Held replies land on the held notice instead, as before.
 
+## One stylesheet, a face of its own, and themes as tokens plus CSS
+
+**Every page renders through one shell and one stylesheet.** Before this there were five
+inline style blobs across the render crate, each with its own palette, its own dark mode and
+its own idea of what a button was; the thread page was the only one with tokens. Now
+`crates/render/public/static/style.css` is the sheet, `layout::Shell` is the page, and each
+template is a body.
+
+**The sheet, the fonts and `reply.js` are static assets, not Worker bytes.** The first cut
+inlined the sheet into every page on the theory that on the free plan a request is dearer than
+a kilobyte. That theory was wrong for assets: Cloudflare serves a Worker's `[assets]` directory
+itself, in front of the script, and "requests to static assets are free and unlimited" -- they
+neither invoke the Worker nor count against the 100k/day. So the sheet is linked, held for a
+year by a `_headers` rule, and cache-busted with `?v=BAKE_REVISION`, which it is part of. The
+assets live under the render crate (`crates/render/public`), because they are the templates'
+other half; `wrangler.toml` only points at them. It also took 172 KB of font out of the
+question of wasm size.
+
+**The face is IBM Plex Sans.** A humanist grotesk drawn for interfaces and dense text, with
+enough of its own character in the `a`, `g` and `t` not to read as the system default, and
+tabular figures for the counts. It is OFL, so it is self-hosted -- the CSP is `default-src
+'self'` and stays that way -- as Google's variable woff2 subsets: Latin and Latin Extended,
+roman and italic, 160 KB in all, of which a Latin-only reader loads 46 KB once. Other scripts
+fall back to the system stack. `font-display: swap` and a `preload` of the roman Latin file,
+so the first paint is either the face or a brief fallback, never blank.
+
+**The default is small type, one accent, and no colour otherwise.** 14px, 1.45 line height, a
+46rem measure. Text is near-black and one mid grey; the green (`#0a7a45`, 5.4:1 on white;
+`#3fbf7f` in dark) is for links inside post bodies, the one primary button on a form, the focus
+ring, and the highlight on a `:target` post. Links in chrome -- authors, timestamps, titles,
+nav -- inherit the text colour and underline on hover, because a page that is mostly links
+should not be mostly green. Thread lists put the post count in its own right-hand column so a
+page of them scans as a table.
+
+**A space's theme is tokens, then its own stylesheet.** The subreddit model. The sheet declares
+its tokens once (`--bg`, `--fg`, `--accent`, `--font`, `--size`, `--measure`, `--indent`, ...);
+everything past that block is written in terms of them, and a test refuses a literal colour
+anywhere else, so a theme that sets the tokens reaches every component. For what tokens cannot
+say -- a banner, a different post layout -- a space also has CSS of its own, written against
+the site's class names. `core::theme::Theme` validates both: token values are colours, lengths,
+keywords, quoted font stacks and the CSS functions that cannot fetch; the stylesheet is capped
+at 16 KB, may not contain `<`, `@import` or `expression(`, and *may* use `url()`, because a
+background is the first thing anyone skins and the CSP (`img-src https:`) already decides where
+it can point. A theme can scope token values to one colour scheme (`dark.accent`).
+
+**The theme is a file, not a block.** Tokens and CSS together are served as
+`/s/{path}/theme.css?v={hash of the theme}`, immutable, linked only by pages of a space that
+has one. It is built from one indexed row and is not put in the edge cache: a reader fetches it
+once per change. Serving it as its own `text/css` response is also what makes the CSS safe to
+carry -- there is no `<style>` to break out of. It lives in `space.config` under `"theme"`,
+next to `"moderation"`, and `Space` now carries `config` so the baked thread page has it without
+a second query. The admin form edits tokens as `name: value` lines and the stylesheet as a
+textarea; a theme that does not validate is refused with the reason, the one place the space
+form refuses rather than clamps. Spaces are edited by site admins only, which is the trust the
+`url()` allowance rests on; if space-level moderators ever edit themes, revisit it.
+
 ## `crates/core/src/sql.rs` -- space listings
 
 `SPACE_THREADS` is the subtree range scan the 0003 migration was designed for, and that

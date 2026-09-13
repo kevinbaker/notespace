@@ -285,7 +285,7 @@ fn main() {
     if json_mode {
         println!(
             "{{\"space\":{{\"id\":1,\"path\":\"general/\",\"name\":\"General\",\
-             \"parent_id\":null,\"ranking\":\"bump\",\"depth_cap\":8}},\
+             \"parent_id\":null,\"ranking\":\"bump\",\"depth_cap\":8,\"config\":\"{{}}\"}},\
              \"thread\":{{\"id\":1,\"public_id\":\"{}\",\"space_id\":1,\"kind\":\"discussion\",\
              \"title\":\"Is a Rust forum on a free Cloudflare account actually viable?\",\
              \"url\":null,\"author_id\":1,\"author_name\":\"alice\",\"created_at\":{},\

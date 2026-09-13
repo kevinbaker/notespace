@@ -37,6 +37,14 @@ workers_dev = false
 command = 'PATH="$HOME/.cargo/bin:$PATH" worker-build --release -- --features "${NOTESPACE_FEATURES:-}"'
 cwd = "crates/worker"
 
+# The stylesheet, the fonts and reply.js. Cloudflare serves these in front of the Worker: a
+# request for one never invokes it and is not counted against the daily request cap, which is
+# why they are files here and not bytes inside the wasm. `public/_headers` marks /static/*
+# immutable; the pages link the sheet with ?v=BAKE_REVISION so a change is a new URL. Anything
+# not found here falls through to the Worker as before.
+[assets]
+directory = "crates/render/public"
+
 [[d1_databases]]
 # `binding` must match DB_BINDING in crates/worker/src/lib.rs. A mismatch fails at runtime with
 # "no D1 binding", not at build time.

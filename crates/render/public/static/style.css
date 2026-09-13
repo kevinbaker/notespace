@@ -1,0 +1,148 @@
+/* notespace: the one stylesheet, served from /static/ and cached for a year; the page links it
+   with ?v=BAKE_REVISION, so a change here is a new URL.
+
+   Type is IBM Plex Sans (OFL), self-hosted: the CSP is default-src 'self'. Latin and Latin
+   Extended only; other scripts fall back to the system stack. Rename a font file to change it.
+*/
+@font-face{font-family:"IBM Plex Sans";font-style:normal;font-weight:400 700;font-display:swap;
+  src:url(fonts/plex-sans-roman-latin.woff2) format("woff2");
+  unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
+@font-face{font-family:"IBM Plex Sans";font-style:normal;font-weight:400 700;font-display:swap;
+  src:url(fonts/plex-sans-roman-latin-ext.woff2) format("woff2");
+  unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF}
+@font-face{font-family:"IBM Plex Sans";font-style:italic;font-weight:400 700;font-display:swap;
+  src:url(fonts/plex-sans-italic-latin.woff2) format("woff2");
+  unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
+@font-face{font-family:"IBM Plex Sans";font-style:italic;font-weight:400 700;font-display:swap;
+  src:url(fonts/plex-sans-italic-latin-ext.woff2) format("woff2");
+  unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF}
+
+/* Tokens. A space's theme (core::theme) overrides these and nothing else, so everything below
+   is written in terms of them: no literal colours, sizes or fonts past this block. */
+:root{
+  --bg:#fff;--bg-2:#f4f5f4;--fg:#1b1f1d;--fg-2:#626865;--line:#e1e4e2;
+  --accent:#0a7a45;--on-accent:#fff;--danger:#b3261e;--warn:#8a6100;
+  --font:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --size:14px;--lh:1.45;--radius:4px;--measure:46rem;--wide:66rem;--indent:1.25rem
+}
+@media(prefers-color-scheme:dark){:root{
+  --bg:#131515;--bg-2:#1d2120;--fg:#e6e8e6;--fg-2:#969c98;--line:#2b302e;
+  --accent:#3fbf7f;--on-accent:#0b1a12;--danger:#f0857c;--warn:#e0b25a
+}}
+
+/* Base */
+*{box-sizing:border-box}
+html{font:var(--size)/var(--lh) var(--font);-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--fg)}
+a{color:inherit;text-decoration:none}
+a:hover{text-decoration:underline}
+h1,h2,h3{margin:0 0 .5rem;line-height:1.25;font-weight:600}
+h1{font-size:1.25rem}h2{font-size:1rem;margin-top:1.5rem}
+p{margin:.5rem 0}
+code,pre,kbd{font-family:var(--mono);font-size:.9em}
+pre{overflow-x:auto;padding:.5rem .65rem;background:var(--bg-2);border-radius:var(--radius)}
+blockquote{margin:.5rem 0;padding:0 0 0 .7rem;border-left:2px solid var(--line);color:var(--fg-2)}
+img{max-width:100%;height:auto}
+hr{border:0;border-top:1px solid var(--line);margin:1rem 0}
+table{width:100%;border-collapse:collapse}
+th,td{padding:.3rem .5rem;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{font-size:.85rem;font-weight:600;color:var(--fg-2)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+
+/* Shell: header row, then a measured column */
+.site{display:flex;flex-wrap:wrap;align-items:center;gap:.25rem .6rem;padding:.5rem 1rem;
+  border-bottom:1px solid var(--line);font-size:.9rem;color:var(--fg-2)}
+.site .brand{font-weight:600;color:var(--fg)}
+.site .crumbs{display:flex;flex-wrap:wrap;gap:.4rem;flex:1}
+.site .links{display:flex;flex-wrap:wrap;gap:.6rem}
+main{max-width:var(--measure);margin:0 auto;padding:1rem 1rem 3rem}
+main.narrow{max-width:22rem;padding-top:2.5rem}
+main.wide{max-width:var(--wide)}
+
+/* Text */
+.muted,.meta,.empty{color:var(--fg-2)}
+.meta,.small{font-size:.85rem}
+.dim{opacity:.6}
+
+/* Lists of threads, and chips for spaces */
+.threads{list-style:none;margin:0;padding:0}
+.threads li{display:grid;grid-template-columns:1fr auto;column-gap:1rem;padding:.4rem 0;
+  border-bottom:1px solid var(--line)}
+.threads .title{font-weight:500}
+.threads .count{grid-area:1/2/3/3;align-self:center;min-width:2ch;text-align:right;
+  font-variant-numeric:tabular-nums;color:var(--fg-2)}
+.spaces{list-style:none;margin:0 0 .75rem;padding:0;display:flex;flex-wrap:wrap;gap:.35rem}
+.spaces a{display:inline-block;padding:.1rem .6rem;border:1px solid var(--line);
+  border-radius:1rem;font-size:.85rem}
+.spaces a:hover,.provider:hover{border-color:var(--fg-2);text-decoration:none}
+
+/* A thread: title block, then the tree. --depth is set per post by the template. */
+.thread-title{font-size:1.25rem;margin:.5rem 0 .1rem}
+.thread-url{margin:0;word-break:break-all}
+.posts{list-style:none;margin:1rem 0;padding:0}
+.post{margin:.25rem 0 .25rem calc(var(--depth,0)*var(--indent));padding:.3rem 0 .3rem .7rem;
+  border-left:2px solid var(--line)}
+.post[data-depth="0"]{margin-top:.9rem;padding-left:0;border-left:0}
+.post:target{border-left:2px solid var(--accent);padding-left:.7rem;
+  background:color-mix(in srgb,var(--accent) 7%,transparent)}
+.post-head .author{font-weight:500;color:var(--fg)}
+.post-body{margin:.15rem 0}
+.post-body>:first-child{margin-top:0}.post-body>:last-child{margin-bottom:0}
+.post-body a{color:var(--accent)}
+.post-body th,.post-body td{border:1px solid var(--line)}
+.post-actions{font-size:.8rem;color:var(--fg-2)}
+.pager{margin:1.5rem 0}
+@media(max-width:34rem){.post{margin-left:calc(min(var(--depth,0),4)*.6rem)}}
+
+/* Forms and buttons. The accent is for the one primary action on a page. */
+label{display:block;margin:.75rem 0 .2rem;font-size:.85rem;font-weight:500}
+input,textarea,select{width:100%;padding:.4rem .5rem;font:inherit;color:inherit;
+  background:var(--bg);border:1px solid var(--line);border-radius:var(--radius)}
+textarea{resize:vertical}
+input[type=checkbox]{width:auto;margin:0 .4rem 0 0;vertical-align:middle}
+button,.button{display:inline-block;padding:.4rem .8rem;font:inherit;font-weight:500;
+  border:1px solid transparent;border-radius:var(--radius);
+  background:var(--accent);color:var(--on-accent);cursor:pointer}
+button:hover,.button:hover{filter:brightness(1.1);text-decoration:none}
+button:disabled{opacity:.45;cursor:default;filter:none}
+button.secondary{background:transparent;color:inherit;border-color:var(--line)}
+button.danger,.danger button{background:var(--danger);color:var(--on-accent)}
+button.link{padding:0;border:0;background:none;color:inherit;font-weight:inherit;
+  text-decoration:underline}
+button.small{padding:.15rem .5rem;font-size:.85rem}
+form>button{margin-top:1rem}
+form.inline{display:inline}form.inline>button{margin:0}
+form.search{display:flex;gap:.5rem}form.search>*{margin:0}form.search input{flex:1}
+.actions{display:flex;flex-wrap:wrap;align-items:center;gap:.4rem;margin:.6rem 0}
+.actions button{margin:0}
+.providers{display:flex;flex-direction:column;gap:.4rem;margin:.75rem 0}
+.provider{display:block;padding:.45rem;text-align:center;font-weight:500;
+  border:1px solid var(--line);border-radius:var(--radius)}
+.or{text-align:center}
+.parent{margin:.75rem 0;padding:.5rem .75rem;background:var(--bg-2);color:inherit;
+  border-radius:0 var(--radius) var(--radius) 0}
+.parent .quote{margin:0 0 0 .5rem;padding:.1rem .5rem;font-size:.85rem;background:transparent;color:inherit;
+  border-color:var(--line)}
+
+/* Notices */
+.notice,.error{margin:.75rem 0;padding:.5rem .7rem;border:1px solid;border-radius:var(--radius);
+  font-size:.9rem}
+.notice{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent)}
+.error{border-color:var(--danger);color:var(--danger);
+  background:color-mix(in srgb,var(--danger) 7%,transparent)}
+
+/* Admin and moderation */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(8rem,1fr));gap:.5rem;margin:.75rem 0}
+.stats dt{font-size:.8rem;color:var(--fg-2)}
+.stats dd{margin:0;font-size:1.3rem;font-variant-numeric:tabular-nums}
+.item{margin:.6rem 0;padding:.5rem .75rem;border:1px solid var(--line);border-radius:var(--radius)}
+.item header{font-size:.85rem;color:var(--fg-2)}
+.item .post-body{margin:.4rem 0}
+.state-hidden,.state-deleted{color:var(--danger)}.state-pending{color:var(--warn)}
+tr.user-banned td,tr.user-deleted td,tr.private td{color:var(--fg-2)}
+.log{list-style:none;margin:0;padding:0}
+.log li{padding:.35rem 0;border-bottom:1px solid var(--line)}
+.log code{font-size:.75rem;word-break:break-all}
+.decide{display:flex;gap:.5rem}.decide form{flex:1}.decide button{width:100%;margin:.25rem 0 0}
+.appeal{margin:.5rem 0;padding-left:.7rem;border-left:2px solid var(--line)}

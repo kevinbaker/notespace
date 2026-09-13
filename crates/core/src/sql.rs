@@ -7,7 +7,7 @@ pub const THREAD: &str = "\
 SELECT t.id, t.public_id, t.space_id, t.kind, t.title, t.url, t.author_id, u.name AS author_name, \
 t.created_at, t.bumped_at, t.post_count, t.state, t.cache_version, \
 s.path AS space_path, s.name AS space_name, s.ranking AS space_ranking, \
-s.depth_cap AS space_depth_cap \
+s.depth_cap AS space_depth_cap, s.config AS space_config \
 FROM thread t \
 JOIN user u ON u.id = t.author_id \
 JOIN space s ON s.id = t.space_id \
@@ -342,13 +342,13 @@ WHERE space_id = ?1 AND state = 'resolved' AND model_verdict IS NOT NULL";
 ///
 /// Binds: `?1` = space path.
 pub const SPACE_BY_PATH: &str = "\
-SELECT id, path, name, parent_id, ranking, depth_cap FROM space WHERE path = ?1";
+SELECT id, path, name, parent_id, ranking, depth_cap, config FROM space WHERE path = ?1";
 
 /// `?1 IS NULL` selects the top level: SQLite's `=` never matches NULL.
 ///
 /// Binds: `?1` = parent space id, or NULL.
 pub const SPACES_UNDER: &str = "\
-SELECT id, path, name, parent_id, ranking, depth_cap FROM space \
+SELECT id, path, name, parent_id, ranking, depth_cap, config FROM space \
 WHERE (?1 IS NULL AND parent_id IS NULL) OR parent_id = ?1 \
 ORDER BY path";
 

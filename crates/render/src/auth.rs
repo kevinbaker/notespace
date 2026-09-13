@@ -1,6 +1,7 @@
 //! Auth and write forms. Server-rendered and working without JavaScript, like every other page.
 
-use maud::{html, Markup, DOCTYPE};
+use crate::layout::{Shell, Width};
+use maud::{html, Markup};
 
 /// Coarse on purpose: separating "no such user" from "wrong password" hands over the account list.
 pub enum LoginError {
@@ -91,102 +92,47 @@ pub fn login_page(
     options: &SignInOptions<'_>,
 ) -> Markup {
     let prefill = notice.as_ref().and_then(|n| n.username()).unwrap_or("");
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                link rel="icon" href="data:,";
-                title { "Sign in" }
-                style { (PreEscapedStyle) }
-            }
-            body {
-                main class="auth" {
-                    h1 { "Sign in" }
-                    @if let Some(n) = &notice {
-                        p class="notice" role="status" { (n.message()) }
-                    }
-                    @if let Some(e) = &error {
-                        p class="error" role="alert" { (e.message()) }
-                    }
-                    (provider_buttons(options.providers, if options.password_form { "" } else { "Sign in with an account you already have." }))
-                    @if options.password_form {
-                        @if !options.providers.is_empty() { p class="muted or" { "or with a password" } }
-                        form method="post" action="/login" {
-                            input type="hidden" name="csrf" value=(csrf);
-                            @if let Some(n) = next {
-                                input type="hidden" name="next" value=(n);
-                            }
-                            label for="username" { "Username" }
-                            input id="username" name="username" type="text" value=(prefill)
-                                  autocomplete="username" required autofocus[prefill.is_empty()];
-                            label for="password" { "Password" }
-                            input id="password" name="password" type="password"
-                                  autocomplete="current-password" required
-                                  autofocus[!prefill.is_empty()];
-                            button type="submit" { "Sign in" }
-                        }
-                        p class="muted" {
-                            a href="/forgot" { "Forgot your password?" }
-                            " · "
-                            "New here? " a href="/register" { "Create an account" }
-                        }
-                    } @else if options.providers.is_empty() {
-                        p class="error" role="alert" {
-                            "Signing in is not set up on this site yet."
-                        }
-                    }
+    Shell {
+        title: "Sign in",
+        width: Width::Narrow,
+        ..Default::default()
+    }
+    .render(html! {
+        h1 { "Sign in" }
+        @if let Some(n) = &notice {
+            p class="notice" role="status" { (n.message()) }
+        }
+        @if let Some(e) = &error {
+            p class="error" role="alert" { (e.message()) }
+        }
+        (provider_buttons(options.providers, if options.password_form { "" } else { "Sign in with an account you already have." }))
+        @if options.password_form {
+            @if !options.providers.is_empty() { p class="muted or" { "or with a password" } }
+            form method="post" action="/login" {
+                input type="hidden" name="csrf" value=(csrf);
+                @if let Some(n) = next {
+                    input type="hidden" name="next" value=(n);
                 }
+                label for="username" { "Username" }
+                input id="username" name="username" type="text" value=(prefill)
+                      autocomplete="username" required autofocus[prefill.is_empty()];
+                label for="password" { "Password" }
+                input id="password" name="password" type="password"
+                      autocomplete="current-password" required
+                      autofocus[!prefill.is_empty()];
+                button type="submit" { "Sign in" }
+            }
+            p class="muted" {
+                a href="/forgot" { "Forgot your password?" }
+                " · "
+                "New here? " a href="/register" { "Create an account" }
+            }
+        } @else if options.providers.is_empty() {
+            p class="error" role="alert" {
+                "Signing in is not set up on this site yet."
             }
         }
-    }
-}
-
-/// Inlined, to avoid a second request on the one page a visitor sees before caching anything.
-pub(crate) struct PreEscapedStyle;
-
-impl maud::Render for PreEscapedStyle {
-    fn render_to(&self, out: &mut String) {
-        out.push_str(
-            "body{font:16px/1.5 system-ui,sans-serif;margin:0;background:#fbfbfc;color:#1a1a1a}\
-             .auth{max-width:22rem;margin:4rem auto;padding:0 1rem}\
-             .auth.wide{max-width:44rem}\
-             h1{font-size:1.5rem;margin:0 0 1rem}\
-             label{display:block;margin:.75rem 0 .25rem;font-size:.9rem}\
-             input{width:100%;padding:.5rem;font-size:1rem;border:1px solid #ccc;border-radius:4px}\
-             textarea{width:100%;padding:.5rem;font:inherit;border:1px solid #ccc;\
-             border-radius:4px;resize:vertical}\
-             .muted{color:#666;font-size:.9rem}\
-             .providers{display:flex;flex-direction:column;gap:.5rem;margin:.75rem 0}\
-             a.provider{display:block;text-align:center;padding:.6rem;border:1px solid #ccc;\
-             border-radius:4px;text-decoration:none;color:inherit;font-weight:500}\
-             .or{text-align:center;margin:1rem 0 0}\
-             blockquote.parent{margin:1rem 0;padding:.5rem .9rem;border-left:3px solid #ccc;\
-             background:rgba(128,128,128,.08);border-radius:0 4px 4px 0}\
-             blockquote.parent .post-body{margin:.25rem 0}\
-             .parent-actions{margin:.25rem 0 0}\
-             button.quote{width:auto;margin:0 0 0 .5rem;padding:.15rem .5rem;font-size:.85rem;\
-             background:none;color:inherit;border:1px solid #ccc}\
-             button{margin-top:1.25rem;width:100%;padding:.6rem;font-size:1rem;border:0;\
-             border-radius:4px;background:#1a1a1a;color:#fff;cursor:pointer}\
-             .error{background:#fdecea;border:1px solid #f5c2c0;padding:.6rem .75rem;\
-             border-radius:4px;font-size:.9rem}\
-             .notice{background:#e8f5ec;border:1px solid #bfe3c8;padding:.6rem .75rem;\
-             border-radius:4px;font-size:.9rem}\
-             h2{font-size:1.1rem;margin:1.75rem 0 .25rem}\
-             form.inline{display:inline}button.link{width:auto;margin:0;padding:0;border:0;\
-             background:none;color:#3355bb;text-decoration:underline;font-size:inherit}\
-             button.secondary{background:none;color:inherit;border:1px solid #ccc}\
-             form.danger button{background:#a12a2a}\
-             @media(prefers-color-scheme:dark){body{background:#16181c;color:#e8e8ea}\
-             input{background:#1f2229;border-color:#3a3f4b;color:inherit}\
-             button{background:#e8e8ea;color:#16181c}\
-             .error{background:#3a1d1d;border-color:#6b2b2b}\
-             .notice{background:#1d3a25;border-color:#2b6b3a}button.link{color:#8ab0ff}\
-             button.secondary{border-color:#3a3f4b}}",
-        );
-    }
+    })
 }
 
 /// Why a reply was refused, in words a person can act on.
@@ -261,58 +207,50 @@ pub fn reply_page(
     error: Option<ReplyError>,
 ) -> Markup {
     let parent = target.parent.as_ref();
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                link rel="icon" href="data:,";
-                title { "Reply" }
-                style { (PreEscapedStyle) }
-            }
-            body {
-                main class="auth wide" {
-                    h1 {
-                        @match parent {
-                            Some(p) => { "Reply to " (p.author_name) },
-                            None => "Reply to the thread",
-                        }
-                    }
-                    p class="muted" {
-                        "in " a href={ "/t/" (thread) } { (target.thread_title) }
-                    }
-                    @if let Some(p) = parent {
-                        blockquote class="parent" id="parent" {
-                            div class="post-body" { (maud::PreEscaped(p.body_html)) }
-                            p class="muted parent-actions" {
-                                a href={ "/p/" (p.public_id) } { "permalink" }
+    Shell {
+        title: "Reply",
+        tail: html! {
+            @if parent.is_some() {
+                                script defer src="/static/reply.js" {}
                             }
-                        }
-                    }
-                    @if let Some(e) = error {
-                        p class="error" role="alert" { (e.message()) }
-                    }
-                    form method="post" action={ "/t/" (thread) "/reply" } {
-                        input type="hidden" name="csrf" value=(csrf);
-                        @if let Some(p) = parent {
-                            input type="hidden" name="parent" value=(p.public_id);
-                        }
-                        label for="body" { "Your reply" }
-                        textarea id="body" name="body" rows="10" required
-                            autofocus placeholder="Markdown is supported." { (draft) }
-                        button type="submit" { "Post reply" }
-                    }
-                    p class="muted" {
-                        a href={ "/t/" (thread) } { "Back to the thread" }
-                    }
-                }
-                @if parent.is_some() {
-                    script defer src="/static/reply.js" {}
+        },
+        ..Default::default()
+    }
+    .render(html! {
+        h1 {
+            @match parent {
+                Some(p) => { "Reply to " (p.author_name) },
+                None => "Reply to the thread",
+            }
+        }
+        p class="muted" {
+            "in " a href={ "/t/" (thread) } { (target.thread_title) }
+        }
+        @if let Some(p) = parent {
+            blockquote class="parent" id="parent" {
+                div class="post-body" { (maud::PreEscaped(p.body_html)) }
+                p class="muted parent-actions" {
+                    a href={ "/p/" (p.public_id) } { "permalink" }
                 }
             }
         }
-    }
+        @if let Some(e) = error {
+            p class="error" role="alert" { (e.message()) }
+        }
+        form method="post" action={ "/t/" (thread) "/reply" } {
+            input type="hidden" name="csrf" value=(csrf);
+            @if let Some(p) = parent {
+                input type="hidden" name="parent" value=(p.public_id);
+            }
+            label for="body" { "Your reply" }
+            textarea id="body" name="body" rows="10" required
+                autofocus placeholder="Markdown is supported." { (draft) }
+            button type="submit" { "Post reply" }
+        }
+        p class="muted" {
+            a href={ "/t/" (thread) } { "Back to the thread" }
+        }
+    })
 }
 
 /// Why a signup was refused.
@@ -367,85 +305,66 @@ pub fn register_page(
     error: Option<RegisterError>,
     providers: &[ProviderButton<'_>],
 ) -> Markup {
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                link rel="icon" href="data:,";
-                title { "Create an account" }
-                style { (PreEscapedStyle) }
-            }
-            body {
-                main class="auth" {
-                    h1 { "Create an account" }
-                    @if let Some(e) = error {
-                        p class="error" role="alert" { (e.message()) }
-                    }
-                    (provider_buttons(providers, ""))
-                    @if !providers.is_empty() { p class="muted or" { "or with a password" } }
-                    form method="post" action="/register" {
-                        input type="hidden" name="csrf" value=(csrf);
-                        label for="username" { "Username" }
-                        input id="username" name="username" value=(name) required
-                            autocomplete="username" autocapitalize="none" autofocus;
-                        label for="password" { "Password" }
-                        input id="password" name="password" type="password" required
-                            autocomplete="new-password";
-                        p class="muted" { "At least 12 characters. Usernames are permanent." }
-                        label for="email" {
-                            @if require_email { "Email" } @else { "Email (optional)" }
-                        }
-                        input id="email" name="email" type="email" value=(email)
-                            autocomplete="email" required[require_email];
-                        p class="muted" {
-                            "Used to reset a forgotten password, and for nothing else."
-                        }
-                        @if invite_required {
-                            label for="invite" { "Invite code" }
-                            input id="invite" name="invite" required autocomplete="off";
-                        }
-                        button type="submit" { "Create account" }
-                    }
-                    p class="muted" {
-                        "Already have one? " a href="/login" { "Sign in" } "."
-                    }
-                }
-            }
-        }
+    Shell {
+        title: "Create an account",
+        width: Width::Narrow,
+        ..Default::default()
     }
+    .render(html! {
+        h1 { "Create an account" }
+        @if let Some(e) = error {
+            p class="error" role="alert" { (e.message()) }
+        }
+        (provider_buttons(providers, ""))
+        @if !providers.is_empty() { p class="muted or" { "or with a password" } }
+        form method="post" action="/register" {
+            input type="hidden" name="csrf" value=(csrf);
+            label for="username" { "Username" }
+            input id="username" name="username" value=(name) required
+                autocomplete="username" autocapitalize="none" autofocus;
+            label for="password" { "Password" }
+            input id="password" name="password" type="password" required
+                autocomplete="new-password";
+            p class="muted" { "At least 12 characters. Usernames are permanent." }
+            label for="email" {
+                @if require_email { "Email" } @else { "Email (optional)" }
+            }
+            input id="email" name="email" type="email" value=(email)
+                autocomplete="email" required[require_email];
+            p class="muted" {
+                "Used to reset a forgotten password, and for nothing else."
+            }
+            @if invite_required {
+                label for="invite" { "Invite code" }
+                input id="invite" name="invite" required autocomplete="off";
+            }
+            button type="submit" { "Create account" }
+        }
+        p class="muted" {
+            "Already have one? " a href="/login" { "Sign in" } "."
+        }
+    })
 }
 
 /// Shown after a reply was held for moderation. The post exists and has a permalink, but the
 /// thread page shows it as awaiting review, which would read as a failure without this.
 pub fn held_page(thread: &str, post: &str) -> Markup {
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                link rel="icon" href="data:,";
-                title { "Reply received" }
-                style { (PreEscapedStyle) }
-            }
-            body {
-                main class="auth wide" {
-                    h1 { "Reply received" }
-                    p {
-                        "Your reply is waiting for a quick check before it appears. New accounts and \
-                         posts with several links go through this; it usually takes a minute, and \
-                         sometimes a moderator has to look."
-                    }
-                    p class="muted" {
-                        a href={ "/p/" (post) } { "Your reply" } " · "
-                        a href={ "/t/" (thread) } { "Back to the thread" }
-                    }
-                }
-            }
-        }
+    Shell {
+        title: "Reply received",
+        ..Default::default()
     }
+    .render(html! {
+        h1 { "Reply received" }
+        p {
+            "Your reply is waiting for a quick check before it appears. New accounts and \
+             posts with several links go through this; it usually takes a minute, and \
+             sometimes a moderator has to look."
+        }
+        p class="muted" {
+            a href={ "/p/" (post) } { "Your reply" } " · "
+            a href={ "/t/" (thread) } { "Back to the thread" }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -520,36 +439,27 @@ pub fn finish_page(
     email: Option<&str>,
     error: Option<FinishError>,
 ) -> Markup {
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                link rel="icon" href="data:,";
-                title { "Choose a username" }
-                style { (PreEscapedStyle) }
-            }
-            body {
-                main class="auth" {
-                    h1 { "Choose a username" }
-                    p class="muted" {
-                        "Signed in with " (provider_label)
-                        @if let Some(e) = email { " as " (e) }
-                        ". This is the name you will post under; it cannot be changed later."
-                    }
-                    @if let Some(e) = error {
-                        p class="error" role="alert" { (e.message()) }
-                    }
-                    form method="post" action="/auth/finish" {
-                        input type="hidden" name="csrf" value=(csrf);
-                        label for="username" { "Username" }
-                        input id="username" name="username" value=(suggested) required
-                            autocomplete="username" autocapitalize="none" autofocus;
-                        button type="submit" { "Create account" }
-                    }
-                }
-            }
-        }
+    Shell {
+        title: "Choose a username",
+        width: Width::Narrow,
+        ..Default::default()
     }
+    .render(html! {
+        h1 { "Choose a username" }
+        p class="muted" {
+            "Signed in with " (provider_label)
+            @if let Some(e) = email { " as " (e) }
+            ". This is the name you will post under; it cannot be changed later."
+        }
+        @if let Some(e) = error {
+            p class="error" role="alert" { (e.message()) }
+        }
+        form method="post" action="/auth/finish" {
+            input type="hidden" name="csrf" value=(csrf);
+            label for="username" { "Username" }
+            input id="username" name="username" value=(suggested) required
+                autocomplete="username" autocapitalize="none" autofocus;
+            button type="submit" { "Create account" }
+        }
+    })
 }
