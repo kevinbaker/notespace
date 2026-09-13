@@ -14,7 +14,7 @@ use notespace_core::theme::Theme;
 pub const STYLE: &str = include_str!("../public/static/style.css");
 
 /// The one font file worth preloading: roman, Latin. The rest load as the text needs them.
-pub const PRELOAD_FONT: &str = "/static/fonts/plex-sans-roman-latin.woff2";
+pub const PRELOAD_FONT: &str = "/static/fonts/noto-sans-roman-latin.woff2";
 
 /// A space's look, for the page that belongs to it.
 pub struct SpaceTheme<'a> {
@@ -237,7 +237,7 @@ mod tests {
         // Everything past the tokens is written in terms of them, or a theme cannot reach it.
         let body = STYLE.split("/* Base */").nth(1).expect("a Base section");
         assert!(
-            STYLE.contains("--font:\"IBM Plex Sans\""),
+            STYLE.contains("--font:\"Noto Sans\""),
             "the face is a token"
         );
         for line in body.lines() {

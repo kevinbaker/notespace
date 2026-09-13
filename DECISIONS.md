@@ -686,13 +686,19 @@ assets live under the render crate (`crates/render/public`), because they are th
 other half; `wrangler.toml` only points at them. It also took 172 KB of font out of the
 question of wasm size.
 
-**The face is IBM Plex Sans.** A humanist grotesk drawn for interfaces and dense text, with
-enough of its own character in the `a`, `g` and `t` not to read as the system default, and
-tabular figures for the counts. It is OFL, so it is self-hosted -- the CSP is `default-src
-'self'` and stays that way -- as Google's variable woff2 subsets: Latin and Latin Extended,
-roman and italic, 160 KB in all, of which a Latin-only reader loads 46 KB once. Other scripts
-fall back to the system stack. `font-display: swap` and a `preload` of the roman Latin file,
-so the first paint is either the face or a brief fallback, never blank.
+**The face is Noto Sans, with IBM Plex Sans in the box.** Compared side by side at 14px on a
+phone against Plex, Roboto and a condensed light Noto: Plex has the most character, Roboto is
+Android's own face and so reads as nothing at all there, and Noto is the quiet, legible one.
+Noto won on a reason that outlasts taste: it is the one family with a matching face for every
+script, drawn to the same metrics, so a space that grows a Japanese or Arabic readership is
+another `@font-face` with a `unicode-range`, not another typeface. It is OFL and self-hosted --
+the CSP is `default-src 'self'` and stays that way -- as Google's variable woff2 subsets: Latin
+(36 KB, what nearly every page loads) and Latin Extended (168 KB, fetched only when a page has a
+character in it), roman and italic. Plex's four files ship too and are declared in the sheet
+but referenced by nothing; a declared face costs no request until a rule uses the family, so a
+theme can say `font: "IBM Plex Sans", sans-serif` and have it. `font-display: swap` and a
+`preload` of the roman Latin file, so the first paint is either the face or a brief fallback,
+never blank.
 
 **The default is small type, one accent, and no colour otherwise.** 14px, 1.45 line height, a
 46rem measure. Text is near-black and one mid grey; the green (`#0a7a45`, 5.4:1 on white;

@@ -162,7 +162,8 @@ fn main() {
     // A space with a theme: token overrides plus a stylesheet of its own, the way a subreddit
     // has one. The sheet is written against the site's class names and tokens.
     let hockey_theme = notespace_core::theme::Theme::parse_lines(
-        "accent: #1d4ed8\nmeasure: 52rem\nradius: 0\ndark.accent: #7aa2ff",
+        "accent: #1d4ed8\nmeasure: 52rem\nradius: 0\ndark.accent: #7aa2ff\n\
+         font: \"IBM Plex Sans\", system-ui, sans-serif",
     )
     .unwrap()
     .with_css(

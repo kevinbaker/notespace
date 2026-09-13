@@ -51,7 +51,7 @@ ask.
 | what | where |
 |---|---|
 | The one stylesheet: fonts, tokens, then components | `crates/render/public/static/style.css` |
-| The font: IBM Plex Sans, variable, Latin + Latin Extended, roman and italic | `crates/render/public/static/fonts/` |
+| The face: Noto Sans, variable, Latin + Latin Extended, roman and italic; IBM Plex Sans alongside for themes | `crates/render/public/static/fonts/` |
 | Static assets, served by Cloudflare in front of the Worker | `[assets]` in `wrangler.toml` → `crates/render/public`; `_headers` there marks `/static/*` immutable |
 | The page shell every page renders through | `crates/render/src/layout.rs` — `Shell`, `crumbs`, `SpaceTheme`, `theme_css` |
 | A space's theme: validated property overrides and its own CSS | `crates/core/src/theme.rs` — `Theme::from_config`, `parse_lines`, `with_css`, `version` |
