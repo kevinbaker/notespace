@@ -166,9 +166,9 @@ cookie used before a session exists is `cookie::ANON`.
 | Session → user | `current_user` in `crates/worker/src/lib.rs` |
 
 The form is a separate uncached page, not part of the baked thread. It shows the parent post
-(`Store::post_by_id`, `render::auth::ReplyTarget`) with a no-JS "quote it all" link
-(`?quote=1`, prefilled by `auth::quoted`); `crates/worker/static/reply.js`, served at
-`/static/reply.js`, adds a "quote selection" button. A posted reply lands on its permalink,
+(`Store::post_by_id`, `render::auth::ReplyTarget`); `crates/worker/static/reply.js`, served
+at `/static/reply.js`, adds the "quote selection" and "quote all" buttons, and without it
+there are none. A posted reply lands on its permalink,
 which the thread page highlights with `.post:target`.
 
 | Starting a thread | `crates/core/src/compose.rs` — `create`, `check`; `Store::create_thread`, `Store::space_context` |

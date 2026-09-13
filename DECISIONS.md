@@ -618,11 +618,12 @@ answers in view is a worse reply, and the thread page cannot open a form in plac
 statement (`post_by_id`), and the parent must be in the thread named in the URL, or one
 thread's post would sit above a reply into another.
 
-**Quoting is two features that degrade into one.** Without JavaScript, "quote it all" is a link
-back to the same form with `?quote=1`, and the server prefills the textarea with the parent's
-markdown as a `>` block. With JavaScript, a "quote selection" button quotes whatever is
-selected inside the parent -- and with nothing selected, the whole post, which is exactly what
-the link does. The script is a file at `/static/reply.js`, not inline, because the site's CSP
+**Quoting is the script's, and nothing is rendered for it without one.** "Quote selection"
+and "quote all" are buttons `/static/reply.js` adds to the parent block; both insert a `>`
+block at the cursor with no round trip. A first cut also had a no-JS "quote it all" link that
+reloaded the form with the parent prefilled, and it was cut: a reload to insert text is a
+worse experience than no button, and the no-JS form is still complete -- the parent is there
+to read and the textarea to type in. The script is a file, not inline, because the site's CSP
 is `script-src 'self'` and that does not get relaxed for a button. It is the first script on
 the site, and it is only loaded on a page that has a parent to quote.
 

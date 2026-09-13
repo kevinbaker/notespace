@@ -206,22 +206,10 @@ pub struct ParentPost<'a> {
     pub body_html: &'a str,
 }
 
-/// `body_md` as a markdown quote, for prefilling a reply.
-pub fn quoted(body_md: &str) -> String {
-    let mut out = String::with_capacity(body_md.len() + 64);
-    for line in body_md.trim().lines() {
-        out.push_str("> ");
-        out.push_str(line);
-        out.push('\n');
-    }
-    out.push('\n');
-    out
-}
-
 /// On its own page, because the baked thread page is shared byte-for-byte and cannot carry a
 /// per-visitor CSRF token. `draft` is echoed back so a rejected reply is not lost. The parent
-/// is shown above the form, with a no-JS "quote it all" link; `/static/reply.js` adds a
-/// "quote selection" button when it runs.
+/// is shown above the form; `/static/reply.js` adds the quote buttons when it runs, and
+/// without it the parent is simply there to read.
 pub fn reply_page(
     csrf: &str,
     thread: &str,
@@ -256,8 +244,6 @@ pub fn reply_page(
                             div class="post-body" { (maud::PreEscaped(p.body_html)) }
                             p class="muted parent-actions" {
                                 a href={ "/p/" (p.public_id) } { "permalink" }
-                                " · "
-                                a href={ "/t/" (thread) "/reply?parent=" (p.public_id) "&quote=1" } { "quote it all" }
                             }
                         }
                     }
@@ -421,12 +407,6 @@ mod reply_tests {
     use super::*;
 
     #[test]
-    fn a_quote_prefixes_every_line_and_ends_with_a_blank_one() {
-        assert_eq!(quoted("one\ntwo"), "> one\n> two\n\n");
-        assert_eq!(quoted("  padded  \n"), "> padded\n\n");
-    }
-
-    #[test]
     fn the_parent_is_shown_and_the_script_loads_only_with_one() {
         let with = reply_page(
             "tok",
@@ -445,8 +425,11 @@ mod reply_tests {
         .into_string();
         assert!(with.contains("Reply to alice"));
         assert!(with.contains("<p>hi</p>"));
-        assert!(with.contains("quote=1"));
         assert!(with.contains("/static/reply.js"));
+        assert!(
+            !with.contains("class=\"quote\""),
+            "quoting is the script's; no dead controls without it"
+        );
         let without = reply_page(
             "tok",
             "abc",

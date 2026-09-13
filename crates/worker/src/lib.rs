@@ -793,8 +793,6 @@ struct ReplyQuery {
     /// Public id of the post being replied to. Absent posts at top level.
     parent: Option<String>,
     error: Option<String>,
-    /// Prefill the draft with the parent quoted: the no-JS half of "quote".
-    quote: Option<String>,
 }
 
 /// `None` covers every way of not being signed in, without distinguishing them.
@@ -882,10 +880,6 @@ async fn reply_form(
         Ok(t) => t,
         Err(r) => return r,
     };
-    let draft = match (&parent_post, q.quote.is_some()) {
-        (Some(p), true) => notespace_render::auth::quoted(p.body_md.as_deref().unwrap_or("")),
-        _ => String::new(),
-    };
     let target = notespace_render::auth::ReplyTarget {
         thread_title: &title,
         parent: parent_post
@@ -900,7 +894,7 @@ async fn reply_form(
         token.as_str(),
         &canonical,
         &target,
-        &draft,
+        "",
         q.error.and_then(parse_reply_error),
     ))
 }

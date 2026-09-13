@@ -1,21 +1,21 @@
-// Progressive enhancement for the reply form: a "quote selection" button next to the
-// no-JS "quote it all" link. With no selection inside the parent it quotes the whole post,
-// which is what the link does; so the link is only ever a fallback, never a different feature.
+// The reply form's quote buttons. Without this script the parent post is there to read and
+// the textarea is there to type in; nothing is rendered that only works with it.
 (function () {
   var parent = document.getElementById('parent');
   var body = document.getElementById('body');
   var actions = parent && parent.querySelector('.parent-actions');
-  if (!parent || !body || !actions) return;
+  var content = parent && parent.querySelector('.post-body');
+  if (!parent || !body || !actions || !content) return;
 
   function selectedInParent() {
     var sel = window.getSelection();
     if (!sel || sel.isCollapsed || sel.rangeCount === 0) return '';
     var range = sel.getRangeAt(0);
-    var content = parent.querySelector('.post-body');
-    if (!content || !content.contains(range.commonAncestorContainer)) return '';
+    if (!content.contains(range.commonAncestorContainer)) return '';
     return sel.toString();
   }
 
+  // Inserts at the cursor, on its own paragraph, and leaves the cursor after it.
   function quote(text) {
     var lines = text.replace(/\s+$/, '').split(/\r?\n/);
     var q = lines.map(function (l) { return '> ' + l; }).join('\n') + '\n\n';
@@ -28,14 +28,25 @@
     body.setSelectionRange(at, at);
   }
 
-  var button = document.createElement('button');
-  button.type = 'button';
-  button.className = 'quote';
-  button.textContent = 'quote selection';
-  button.addEventListener('click', function () {
-    var text = selectedInParent() || parent.querySelector('.post-body').innerText;
-    quote(text);
+  function button(label, onClick) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'quote';
+    b.textContent = label;
+    b.addEventListener('click', onClick);
+    actions.appendChild(document.createTextNode(' · '));
+    actions.appendChild(b);
+    return b;
+  }
+
+  var selection = button('quote selection', function () {
+    var text = selectedInParent();
+    if (text) quote(text);
   });
-  actions.appendChild(document.createTextNode(' · '));
-  actions.appendChild(button);
+  button('quote all', function () { quote(content.innerText); });
+
+  // The selection button only lights up while something in the parent is selected.
+  function refresh() { selection.disabled = !selectedInParent(); }
+  document.addEventListener('selectionchange', refresh);
+  refresh();
 })();
