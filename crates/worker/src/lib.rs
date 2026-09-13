@@ -237,23 +237,26 @@ async fn login_form(
     anon_page(body, set_anon)
 }
 
-/// A CSRF token for a visitor with no session, bound to a short-lived anonymous cookie. Reuses
-/// an existing cookie, so a reload does not invalidate an open form. The cookie to set, if any,
-/// comes back alongside.
+/// How long the anonymous cookie lives: past the token it binds, with an hour to spare. The
+/// cookie used to live an hour to the token's four and was set only when missing, so a form
+/// loaded near the cookie's end -- or a tab left open past it -- failed on submit as "expired"
+/// while looking perfectly fresh.
+const ANON_COOKIE_SECS: i64 = csrf::DEFAULT_LIFETIME_MS / 1000 + 60 * 60;
+
+/// A CSRF token for a visitor with no session, bound to an anonymous cookie. Reuses an
+/// existing cookie's value, so a reload does not invalidate an open form, and re-sets it
+/// either way so its clock restarts with the token's. The cookie to set comes back alongside.
 pub(crate) fn anon_token(
     key: &csrf::CsrfKey,
     headers: &axum::http::HeaderMap,
 ) -> Result<(String, Option<String>), String> {
-    let (anon, set_anon) = match cookie::get(cookie_header(headers), cookie::ANON) {
-        Some(existing) => (existing, None),
-        None => {
-            let v = ids::random_hex()?;
-            let c = cookie::set(cookie::ANON, &v, 60 * 60);
-            (v, Some(c))
-        }
+    let anon = match cookie::get(cookie_header(headers), cookie::ANON) {
+        Some(existing) => existing,
+        None => ids::random_hex()?,
     };
+    let set_anon = cookie::set(cookie::ANON, &anon, ANON_COOKIE_SECS);
     let token = key.mint(&anon, now_ms(), csrf::DEFAULT_LIFETIME_MS);
-    Ok((token.as_str().to_string(), set_anon))
+    Ok((token.as_str().to_string(), Some(set_anon)))
 }
 
 /// The anonymous cookie's value, for verifying a token minted by [`anon_token`].
