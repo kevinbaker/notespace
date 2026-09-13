@@ -146,6 +146,23 @@ verification does not. The names are checked against `wrangler.toml` by
 `Scheme::CLIENT_ARGON` has no browser client. The server half is complete and tested; nothing in
 the tree performs the client-side derivation.
 
+## §4.10 Signing in through a provider (OIDC / OAuth 2.0)
+
+| what | where |
+|---|---|
+| Provider table, authorize URL, token and user-info parsing, ID token claim checks, JWKS selection, the username step | `crates/core/src/oidc.rs` |
+| RS256 over `crypto.subtle` | `crates/worker/src/subtle.rs` — `Rs256` |
+| Sealed cookies for the handshake and the pending identity | `CsrfKey::seal` / `open` in `crates/core/src/csrf.rs`; `cookie::OAUTH`, `cookie::PENDING` |
+| Handlers and provider configuration | `crates/worker/src/oauth.rs` — `/auth/{provider}`, `/auth/{provider}/callback`, `/auth/finish` |
+| Store | `Store::identity_user`, `link_identity`, `touch_identity`, `user_identities` |
+| Schema | `migrations/0010_external_identity.sql` |
+| Pages | `login_page` and `register_page` take `ProviderButton`s; `finish_page` is the username step |
+| Flow tests | `crates/store-sqlite/tests/oidc.rs` |
+
+Configured per provider by `OIDC_<PROVIDER>_CLIENT_ID` (var) and `OIDC_<PROVIDER>_CLIENT_SECRET`
+(secret); Google and GitHub exist. The build without `--features password` serves the
+provider buttons alone at `/login` and `/register`.
+
 ## §4.11 CSRF
 
 `crates/core/src/csrf.rs` — `CsrfKey::mint`, `mint_for_session`, `verify`. The anonymous binding

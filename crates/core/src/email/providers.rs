@@ -8,6 +8,7 @@
 //! the binding is the target's business.
 
 use super::{EmailAddress, EmailError, MailError, Message};
+use crate::encoding::base64;
 
 /// `"Name <address>"` or a bare address, as the operator configures it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,26 +237,6 @@ impl Provider {
     }
 }
 
-/// Standard base64, no dependency: this is the only place `core` needs it.
-fn base64(bytes: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = chunk
-            .iter()
-            .enumerate()
-            .fold(0u32, |acc, (i, b)| acc | (u32::from(*b) << (16 - 8 * i)));
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,14 +446,5 @@ mod tests {
             Err(MailError::Rejected(w)) => assert!(w.contains("sender not valid")),
             other => panic!("{other:?}"),
         }
-    }
-
-    #[test]
-    fn base64_matches_the_standard_alphabet_and_padding() {
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foo"), "Zm9v");
-        assert_eq!(base64(b"api:key-1"), "YXBpOmtleS0x");
     }
 }

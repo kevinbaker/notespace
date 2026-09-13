@@ -49,7 +49,12 @@ rather than in a response header.
 
 ## Accounts, posting, email
 
-Registration takes a username, a password, and an optional email address; the address is stored
+Sign in with Google or GitHub (`OIDC_<PROVIDER>_CLIENT_ID` plus a secret; the first sign-in
+picks a username, and the account has no password), or with a local password when the Worker
+is built with `NOTESPACE_FEATURES=password`. A build without that feature is the free-plan
+shape: no password hashing, no reset mail, sign-in is the provider buttons alone.
+
+With local passwords, registration takes a username, a password, and an optional email address; the address is stored
 unconfirmed and a link is mailed. Following the link lands on a page with a button, because mail
 scanners follow links. An address becomes unique only once confirmed, so nobody can squat on
 yours by typing it into the form. `/settings` changes the address or the password (ending every

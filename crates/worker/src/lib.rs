@@ -8,9 +8,11 @@ mod cache;
 mod ids;
 mod mail;
 mod moderation;
+mod oauth;
 mod posting;
 mod startup;
 mod store;
+mod subtle;
 #[cfg(feature = "kdf-subtle")]
 mod subtle_kdf;
 
@@ -102,6 +104,13 @@ fn router(env: Env) -> Router {
         )
         .route("/p/{id}/delete", post(posting::delete_submit))
         // Account self-service.
+        // Sign-in through a provider.
+        .route(
+            "/auth/finish",
+            get(oauth::finish_form).post(oauth::finish_submit),
+        )
+        .route("/auth/{provider}", get(oauth::start))
+        .route("/auth/{provider}/callback", get(oauth::callback))
         .route("/settings", get(account::settings))
         .route("/settings/email", post(account::change_email))
         .route("/settings/password", post(account::change_password))
@@ -215,8 +224,17 @@ async fn login_form(
         }),
         _ => None,
     });
-    let body =
-        notespace_render::auth::login_page(&token, next, q.error.and_then(parse_error), notice);
+    let buttons = oauth::buttons(&env, host(&headers), next);
+    let body = notespace_render::auth::login_page(
+        &token,
+        next,
+        q.error.and_then(parse_error),
+        notice,
+        &notespace_render::auth::SignInOptions {
+            password_form: true,
+            providers: &buttons,
+        },
+    );
     anon_page(body, set_anon)
 }
 
@@ -263,6 +281,7 @@ fn parse_error(code: String) -> Option<notespace_render::auth::LoginError> {
     match code.as_str() {
         "rejected" => Some(LoginError::Rejected),
         "expired" => Some(LoginError::Expired),
+        "provider" => Some(LoginError::Provider),
         other => other
             .strip_prefix("wait-")
             .and_then(|s| s.parse().ok())
@@ -414,10 +433,32 @@ struct LoginQuery {
     name: Option<String>,
 }
 
-/// Password login compiled out: the endpoints do not exist.
+/// Password login compiled out: sign-in is through a provider, and the page says so.
 #[cfg(not(feature = "password"))]
-async fn login_form() -> Response {
-    external_auth()
+#[derive(Deserialize, Default)]
+struct LoginQuery {
+    next: Option<String>,
+    error: Option<String>,
+}
+
+#[cfg(not(feature = "password"))]
+#[worker::send]
+async fn login_form(
+    State(env): State<Env>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<LoginQuery>,
+) -> Response {
+    let error = q.error.as_deref().and_then(|e| match e {
+        "provider" => Some(notespace_render::auth::LoginError::Provider),
+        "expired" => Some(notespace_render::auth::LoginError::Expired),
+        _ => None,
+    });
+    oauth::providers_only_page(
+        &env,
+        &headers,
+        q.next.as_deref().and_then(cookie::safe_next),
+        error,
+    )
 }
 #[cfg(not(feature = "password"))]
 async fn login_submit() -> Response {
@@ -427,7 +468,7 @@ async fn login_submit() -> Response {
 fn external_auth() -> Response {
     (
         StatusCode::NOT_FOUND,
-        "local password login is disabled on this instance; authentication is external\n",
+        "local password login is disabled on this instance; sign in through a provider\n",
     )
         .into_response()
 }
@@ -1150,6 +1191,7 @@ async fn register_form(
         Ok(t) => t,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
     };
+    let buttons = oauth::buttons(&env, host(&headers), None);
     let body = notespace_render::auth::register_page(
         &token,
         q.name.as_deref().unwrap_or(""),
@@ -1157,6 +1199,7 @@ async fn register_form(
         mail::require_email(&env),
         signup_code(&env).is_some(),
         q.error.and_then(parse_register_error),
+        &buttons,
     );
     anon_page(body, set_anon)
 }
@@ -1357,10 +1400,11 @@ pub(crate) fn host(headers: &axum::http::HeaderMap) -> Option<&str> {
     headers.get(header::HOST).and_then(|h| h.to_str().ok())
 }
 
-/// Local accounts compiled out: the endpoints do not exist.
+/// Local accounts compiled out: registering is signing in through a provider.
 #[cfg(not(feature = "password"))]
-async fn register_form() -> Response {
-    external_auth()
+#[worker::send]
+async fn register_form(State(env): State<Env>, headers: axum::http::HeaderMap) -> Response {
+    oauth::providers_only_page(&env, &headers, None, None)
 }
 #[cfg(not(feature = "password"))]
 async fn register_submit() -> Response {

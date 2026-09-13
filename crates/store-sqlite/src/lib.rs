@@ -371,6 +371,64 @@ impl Store for SqliteStore {
             .map_err(backend)
     }
 
+    // -- External identities ---------------------------------------------------
+
+    async fn identity_user(&self, provider: &str, subject: &str) -> StoreResult<Option<User>> {
+        self.conn
+            .query_row(sql::IDENTITY_USER, [provider, subject], user_from_row)
+            .optional()
+            .map_err(backend)
+    }
+
+    async fn link_identity(
+        &self,
+        provider: &str,
+        subject: &str,
+        user: UserId,
+        email: Option<&str>,
+        now: Timestamp,
+    ) -> StoreResult<()> {
+        match self.conn.execute(
+            sql::INSERT_IDENTITY,
+            rusqlite::params![provider, subject, user, email, now],
+        ) {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                    || e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+            {
+                Err(StoreError::Conflict)
+            }
+            Err(e) => Err(backend(e)),
+        }
+    }
+
+    async fn touch_identity(
+        &self,
+        provider: &str,
+        subject: &str,
+        now: Timestamp,
+    ) -> StoreResult<()> {
+        self.conn
+            .execute(
+                sql::TOUCH_IDENTITY,
+                rusqlite::params![provider, subject, now],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn user_identities(&self, user: UserId) -> StoreResult<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(sql::USER_IDENTITIES)
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map([user], |r| r.get("provider"))
+            .map_err(backend)?;
+        collect(rows, "identity row")
+    }
+
     // -- Administration -------------------------------------------------------
 
     async fn thread_head(&self, thread: &PublicId) -> StoreResult<(Space, Thread)> {

@@ -72,10 +72,16 @@ pub async fn settings(
         Ok(None) => return error(StatusCode::NOT_FOUND, "no such account"),
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
+    let providers = signed
+        .store
+        .user_identities(signed.user.id)
+        .await
+        .unwrap_or_default();
     uncached_html(notespace_render::account::settings_page(
         &signed.mint(),
         &signed.user,
         &account,
+        &providers,
         settings_notice(&q),
     ))
 }

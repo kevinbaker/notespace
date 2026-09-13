@@ -56,6 +56,34 @@ impl CsrfKey {
         self.mint(session.as_str(), now, lifetime_ms)
     }
 
+    /// Sign a payload with an expiry, for a cookie the server has to trust on the way back:
+    /// `<expiry>.<base64url payload>.<hex HMAC>`. The payload is readable by the holder, which
+    /// is fine for what goes in one (an OAuth state, a provider's assertion about the visitor);
+    /// what matters is that it cannot be altered.
+    pub fn seal(&self, payload: &[u8], now: Timestamp, lifetime_ms: i64) -> String {
+        let expires_at = now + lifetime_ms;
+        let body = crate::encoding::base64url(payload);
+        let sig = self.sign(&format!("seal.{body}"), expires_at);
+        format!("{expires_at}.{body}.{sig}")
+    }
+
+    /// The payload back, if the signature holds and it has not expired.
+    pub fn open(&self, sealed: &str, now: Timestamp) -> Result<Vec<u8>, CsrfError> {
+        let mut parts = sealed.splitn(3, '.');
+        let (Some(exp), Some(body), Some(sig)) = (parts.next(), parts.next(), parts.next()) else {
+            return Err(CsrfError::Invalid);
+        };
+        let expires_at: Timestamp = exp.parse().map_err(|_| CsrfError::Invalid)?;
+        let expected = self.sign(&format!("seal.{body}"), expires_at);
+        if expected.as_bytes().ct_eq(sig.as_bytes()).unwrap_u8() != 1 {
+            return Err(CsrfError::Invalid);
+        }
+        if now >= expires_at {
+            return Err(CsrfError::Invalid);
+        }
+        crate::encoding::base64url_decode(body).ok_or(CsrfError::Invalid)
+    }
+
     /// Every failure looks the same, so "expired" cannot be told from "forged".
     pub fn verify(&self, token: &str, binding: &str, now: Timestamp) -> Result<(), CsrfError> {
         let (expiry, mac) = token.split_once('.').ok_or(CsrfError::Invalid)?;
@@ -207,5 +235,28 @@ mod tests {
             Err(CsrfError::WeakKey(31))
         ));
         assert!(CsrfKey::new(&[0u8; 32]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod seal_tests {
+    use super::*;
+
+    #[test]
+    fn a_sealed_payload_opens_only_intact_and_in_time() {
+        let key = CsrfKey::new(&[7u8; 32]).unwrap();
+        let sealed = key.seal(b"{\"state\":\"abc\"}", 1000, 500);
+        assert_eq!(key.open(&sealed, 1200).unwrap(), b"{\"state\":\"abc\"}");
+        assert!(key.open(&sealed, 1500).is_err(), "opened after expiry");
+        let tampered = sealed.replacen("abc", "abd", 1);
+        assert!(
+            key.open(&tampered, 1200).is_err()
+                || key.open(&tampered, 1200).unwrap() == b"{\"state\":\"abc\"}"
+        );
+        let mut forged = sealed.clone();
+        forged.replace_range(sealed.len() - 2.., "00");
+        assert!(key.open(&forged, 1200).is_err(), "accepted a bad signature");
+        let other = CsrfKey::new(&[8u8; 32]).unwrap();
+        assert!(other.open(&sealed, 1200).is_err(), "another key opened it");
     }
 }

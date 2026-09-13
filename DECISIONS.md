@@ -584,6 +584,43 @@ refused, which is harmless.
 **`/login` while signed in goes to `/settings`.** The nav cannot say who you are (baked
 pages), so "sign in" is the link people press to find out; the account page is the answer.
 
+## `crates/core/src/oidc.rs` and signing in through a provider
+
+**The provider's stable id is the key, never the email.** An address can change hands at the
+provider; a `sub` cannot. `external_identity` is keyed on `(provider, subject)` and the email
+is copied onto the account only as a convenience, verified if the provider vouched for it.
+
+**Google is OpenID Connect; GitHub is not.** GitHub issues an access token and a user-info
+endpoint, no ID token, so the same `Provider` table carries two shapes: parse and verify an
+ID token, or make two user-info calls (the profile, and the email list, because the
+profile's `email` is only the public one). Apple and Facebook are the next entries; Apple
+needs a client secret minted as a signed JWT, which is why the secret is a field the provider
+reads rather than a string the transport appends.
+
+**Everything checkable without a network is checked in `core`.** Issuer, audience (string or
+array), expiry with a minute of skew, nonce, `alg` pinned to RS256, the key selected by `kid`.
+The one thing `core` cannot do is the RSA arithmetic; that is `SignatureCheck`, implemented on
+the Worker over `crypto.subtle` by reflection (`subtle.rs`), where it costs nothing to bundle
+and well under a millisecond to run. The claim checks are the part that is easy to get wrong
+and cheap to test, so they are the part with tests.
+
+**State and the pending identity travel in sealed cookies**, not in D1: `CsrfKey::seal` is an
+HMAC over an expiry and a payload, and the OAuth handshake (state, nonce, `next`) and the
+provider's assertion (between the callback and the username step) are both short-lived and
+both fine for the visitor to read. A row per attempt would be a write per click on a
+button, against a store where writes are the budgeted thing.
+
+**A first sign-in asks for a username, once.** The provider's name or email local part is
+offered as a suggestion, run through the username rules; the visitor can change it, and
+cannot change it afterwards, like everyone else's. The account has no password. The build
+without `--features password` serves `/login` and `/register` as the provider buttons alone,
+which makes it a complete deployment for the first time -- the free-plan shape §4.10 wanted.
+
+**Every failure lands on the sign-in page with the same words.** Cancelled at the provider,
+a bad state, a refused code, a bad signature: the visitor sees "that sign-in did not
+complete", and the log has the reason. There is nothing a visitor can do differently with
+the details, and some of them describe our checks.
+
 ## `crates/core/src/admin.rs` and the admin pages
 
 **Two tiers, and the line between them is "who decides who moderates".** A moderator acts on

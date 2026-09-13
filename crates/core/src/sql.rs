@@ -555,3 +555,28 @@ WHEN 'thread' THEN (SELECT public_id FROM thread WHERE id = a.target_id) \
 END AS target_public_id \
 FROM action_log a \
 ORDER BY a.created_at DESC, a.id DESC LIMIT ?1";
+
+// ---------------------------------------------------------------------------
+// External identities
+// ---------------------------------------------------------------------------
+
+/// Binds: `?1` = provider, `?2` = subject.
+pub const IDENTITY_USER: &str = "\
+SELECT u.id, u.name, u.state, u.role \
+FROM external_identity i JOIN user u ON u.id = i.user_id \
+WHERE i.provider = ?1 AND i.subject = ?2";
+
+/// The primary key is `(provider, subject)`; a repeat trips it, reported as `Conflict`.
+///
+/// Binds: `?1` provider, `?2` subject, `?3` user_id, `?4` email, `?5` now.
+pub const INSERT_IDENTITY: &str = "\
+INSERT INTO external_identity (provider, subject, user_id, email, created_at, last_login_at) \
+VALUES (?1, ?2, ?3, ?4, ?5, ?5)";
+
+/// Binds: `?1` = provider, `?2` = subject, `?3` = now.
+pub const TOUCH_IDENTITY: &str = "\
+UPDATE external_identity SET last_login_at = ?3 WHERE provider = ?1 AND subject = ?2";
+
+/// Binds: `?1` = user id.
+pub const USER_IDENTITIES: &str = "\
+SELECT provider FROM external_identity WHERE user_id = ?1 ORDER BY provider";

@@ -10,12 +10,17 @@ pub enum LoginError {
     RateLimited { retry_after_secs: i64 },
     /// Stale form — a back button, or a page left open past the token's life.
     Expired,
+    /// A sign-in through a provider did not complete: cancelled, refused, or a bad token.
+    Provider,
 }
 
 impl LoginError {
     fn message(&self) -> String {
         match self {
             LoginError::Rejected => "Incorrect username or password.".into(),
+            LoginError::Provider => {
+                "That sign-in did not complete. Try again, or use another way in.".into()
+            }
             LoginError::RateLimited { retry_after_secs } => {
                 let mins = (retry_after_secs + 59) / 60;
                 format!(
@@ -52,12 +57,38 @@ impl LoginNotice {
     }
 }
 
+/// One "sign in with …" button. `href` is `/auth/{provider}`, with `next` already on it.
+pub struct ProviderButton<'a> {
+    pub label: &'a str,
+    pub href: String,
+}
+
+/// What the sign-in page offers: a password form, provider buttons, or both.
+pub struct SignInOptions<'a> {
+    pub password_form: bool,
+    pub providers: &'a [ProviderButton<'a>],
+}
+
+fn provider_buttons(providers: &[ProviderButton<'_>], lead: &str) -> Markup {
+    html! {
+        @if !providers.is_empty() {
+            p class="muted providers-lead" { (lead) }
+            div class="providers" {
+                @for p in providers {
+                    a class="provider" href=(p.href) { "Continue with " (p.label) }
+                }
+            }
+        }
+    }
+}
+
 /// `next` has to have been validated as a local path by the caller; unchecked, it is an open redirect.
 pub fn login_page(
     csrf: &str,
     next: Option<&str>,
     error: Option<LoginError>,
     notice: Option<LoginNotice>,
+    options: &SignInOptions<'_>,
 ) -> Markup {
     let prefill = notice.as_ref().and_then(|n| n.username()).unwrap_or("");
     html! {
@@ -79,24 +110,32 @@ pub fn login_page(
                     @if let Some(e) = &error {
                         p class="error" role="alert" { (e.message()) }
                     }
-                    form method="post" action="/login" {
-                        input type="hidden" name="csrf" value=(csrf);
-                        @if let Some(n) = next {
-                            input type="hidden" name="next" value=(n);
+                    (provider_buttons(options.providers, if options.password_form { "" } else { "Sign in with an account you already have." }))
+                    @if options.password_form {
+                        @if !options.providers.is_empty() { p class="muted or" { "or with a password" } }
+                        form method="post" action="/login" {
+                            input type="hidden" name="csrf" value=(csrf);
+                            @if let Some(n) = next {
+                                input type="hidden" name="next" value=(n);
+                            }
+                            label for="username" { "Username" }
+                            input id="username" name="username" type="text" value=(prefill)
+                                  autocomplete="username" required autofocus[prefill.is_empty()];
+                            label for="password" { "Password" }
+                            input id="password" name="password" type="password"
+                                  autocomplete="current-password" required
+                                  autofocus[!prefill.is_empty()];
+                            button type="submit" { "Sign in" }
                         }
-                        label for="username" { "Username" }
-                        input id="username" name="username" type="text" value=(prefill)
-                              autocomplete="username" required autofocus[prefill.is_empty()];
-                        label for="password" { "Password" }
-                        input id="password" name="password" type="password"
-                              autocomplete="current-password" required
-                              autofocus[!prefill.is_empty()];
-                        button type="submit" { "Sign in" }
-                    }
-                    p class="muted" {
-                        a href="/forgot" { "Forgot your password?" }
-                        " · "
-                        "New here? " a href="/register" { "Create an account" }
+                        p class="muted" {
+                            a href="/forgot" { "Forgot your password?" }
+                            " · "
+                            "New here? " a href="/register" { "Create an account" }
+                        }
+                    } @else if options.providers.is_empty() {
+                        p class="error" role="alert" {
+                            "Signing in is not set up on this site yet."
+                        }
                     }
                 }
             }
@@ -119,6 +158,10 @@ impl maud::Render for PreEscapedStyle {
              textarea{width:100%;padding:.5rem;font:inherit;border:1px solid #ccc;\
              border-radius:4px;resize:vertical}\
              .muted{color:#666;font-size:.9rem}\
+             .providers{display:flex;flex-direction:column;gap:.5rem;margin:.75rem 0}\
+             a.provider{display:block;text-align:center;padding:.6rem;border:1px solid #ccc;\
+             border-radius:4px;text-decoration:none;color:inherit;font-weight:500}\
+             .or{text-align:center;margin:1rem 0 0}\
              blockquote.parent{margin:1rem 0;padding:.5rem .9rem;border-left:3px solid #ccc;\
              background:rgba(128,128,128,.08);border-radius:0 4px 4px 0}\
              blockquote.parent .post-body{margin:.25rem 0}\
@@ -322,6 +365,7 @@ pub fn register_page(
     require_email: bool,
     invite_required: bool,
     error: Option<RegisterError>,
+    providers: &[ProviderButton<'_>],
 ) -> Markup {
     html! {
         (DOCTYPE)
@@ -339,6 +383,8 @@ pub fn register_page(
                     @if let Some(e) = error {
                         p class="error" role="alert" { (e.message()) }
                     }
+                    (provider_buttons(providers, ""))
+                    @if !providers.is_empty() { p class="muted or" { "or with a password" } }
                     form method="post" action="/register" {
                         input type="hidden" name="csrf" value=(csrf);
                         label for="username" { "Username" }
@@ -443,5 +489,67 @@ mod reply_tests {
         .into_string();
         assert!(without.contains("Reply to the thread"));
         assert!(!without.contains("reply.js"));
+    }
+}
+
+/// Why the username step was refused.
+pub enum FinishError {
+    BadName(String),
+    Taken,
+    Expired,
+}
+
+impl FinishError {
+    fn message(&self) -> String {
+        match self {
+            FinishError::BadName(why) => format!("That name will not work: {why}."),
+            FinishError::Taken => "That name is already taken.".into(),
+            FinishError::Expired => {
+                "That sign-in had expired. Start again from the sign-in page.".into()
+            }
+        }
+    }
+}
+
+/// The one-time step after a first sign-in through a provider: pick a username. The provider's
+/// name is shown so the visitor knows which account this is.
+pub fn finish_page(
+    csrf: &str,
+    provider_label: &str,
+    suggested: &str,
+    email: Option<&str>,
+    error: Option<FinishError>,
+) -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                link rel="icon" href="data:,";
+                title { "Choose a username" }
+                style { (PreEscapedStyle) }
+            }
+            body {
+                main class="auth" {
+                    h1 { "Choose a username" }
+                    p class="muted" {
+                        "Signed in with " (provider_label)
+                        @if let Some(e) = email { " as " (e) }
+                        ". This is the name you will post under; it cannot be changed later."
+                    }
+                    @if let Some(e) = error {
+                        p class="error" role="alert" { (e.message()) }
+                    }
+                    form method="post" action="/auth/finish" {
+                        input type="hidden" name="csrf" value=(csrf);
+                        label for="username" { "Username" }
+                        input id="username" name="username" value=(suggested) required
+                            autocomplete="username" autocapitalize="none" autofocus;
+                        button type="submit" { "Create account" }
+                    }
+                }
+            }
+        }
     }
 }

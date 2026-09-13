@@ -25,7 +25,6 @@ pub fn random_hex() -> Result<String, String> {
 }
 
 /// A fresh session token.
-#[cfg(feature = "password")]
 pub fn random_session_token() -> Result<notespace_core::session::SessionToken, String> {
     let mut buf = [0u8; notespace_core::session::TOKEN_BYTES];
     getrandom::getrandom(&mut buf).map_err(|e| format!("csprng: {e}"))?;

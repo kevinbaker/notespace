@@ -140,12 +140,71 @@ async fn write_checks<S: Store>(store: &S, fx: &Fixture) -> Vec<Check> {
         // Email.
         email_tokens_are_spent_exactly_once_and_only_as_their_kind(store, fx).await,
         a_verified_address_belongs_to_one_account(store, fx).await,
+        // External identities.
+        an_identity_links_once_and_resolves_to_its_user(store, fx).await,
         // Administration.
         a_thread_edit_rewrites_the_row_and_bumps_the_version(store, fx).await,
         users_are_listable_and_their_role_and_state_settable(store, fx).await,
         spaces_are_creatable_once_and_editable(store, fx).await,
         stats_and_the_full_log_read_back(store, fx).await,
     ]
+}
+
+// ---------------------------------------------------------------------------
+// External identities
+// ---------------------------------------------------------------------------
+
+async fn an_identity_links_once_and_resolves_to_its_user<S: Store>(
+    store: &S,
+    fx: &Fixture,
+) -> Check {
+    const NAME: &str = "an external identity links to one account, once, and lists on it";
+    let subject = format!("conf-{}", fx.thread);
+    match store.identity_user("google", &subject).await {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            // A rerun: the link is already there, so only the lookups can be checked.
+            return match store.user_identities(fx.author_id).await {
+                Ok(v) if v.iter().any(|p| p == "google") => Check::pass(NAME),
+                other => Check::fail(NAME, format!("rerun listing: {other:?}")),
+            };
+        }
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    }
+    if let Err(e) = store
+        .link_identity(
+            "google",
+            &subject,
+            fx.author_id,
+            Some("conf@example.com"),
+            NOW,
+        )
+        .await
+    {
+        return Check::fail(NAME, format!("link: {e}"));
+    }
+    match store
+        .link_identity("google", &subject, fx.author_id, None, NOW)
+        .await
+    {
+        Err(StoreError::Conflict) => {}
+        other => return Check::fail(NAME, format!("second link: {other:?}")),
+    }
+    match store.identity_user("google", &subject).await {
+        Ok(Some(u)) => require!(NAME, u.id == fx.author_id, "resolved to the wrong user"),
+        other => return Check::fail(NAME, format!("lookup: {other:?}")),
+    }
+    match store.identity_user("github", &subject).await {
+        Ok(None) => {}
+        other => return Check::fail(NAME, format!("another provider resolved: {other:?}")),
+    }
+    if let Err(e) = store.touch_identity("google", &subject, NOW + 1).await {
+        return Check::fail(NAME, format!("touch: {e}"));
+    }
+    match store.user_identities(fx.author_id).await {
+        Ok(v) if v.iter().any(|p| p == "google") => Check::pass(NAME),
+        other => Check::fail(NAME, format!("listing: {other:?}")),
+    }
 }
 
 // ---------------------------------------------------------------------------

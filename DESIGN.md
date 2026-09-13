@@ -682,7 +682,8 @@ property, not a code one, and the design should say so rather than quietly pick 
 
 What follows:
 
-- **OIDC is the answer for the Workers deployment.** Verifying a signed assertion is a signature
+- **OIDC is the answer for the Workers deployment** *(built: Google and GitHub, see
+  `docs/DEPLOY.md`; a first sign-in picks a username and the account has no password)*. Verifying a signed assertion is a signature
   check — sub-millisecond — and the problem disappears. Already the intended direction.
 - **The self-hosted target has no 10 ms limit** and uses `Params::OWASP` unchanged. The
   dual-target design turns out to matter here for a reason nobody planned.

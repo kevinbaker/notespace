@@ -83,6 +83,41 @@ deployed code until a successful deploy replaces it.
 Building in CI is possible (install Rust, then `wrangler deploy`), and is the right answer once
 this is worth automating. It is not worth automating yet.
 
+## Signing in through Google or GitHub
+
+Works with or without password login, and is the whole of sign-in when the Worker is built
+without it. Register an OAuth client with each provider you want:
+
+- **Google**: https://console.cloud.google.com/apis/credentials → Create credentials → OAuth
+  client ID → Web application. Authorised redirect URI: `https://dev.notespace.org/auth/google/callback`.
+  (The consent screen needs configuring once; "External" with the `email`, `profile` and
+  `openid` scopes, no verification needed for those.)
+- **GitHub**: https://github.com/settings/developers → OAuth Apps → New OAuth App.
+  Authorization callback URL: `https://dev.notespace.org/auth/github/callback`.
+
+Then:
+
+```toml
+OIDC_GOOGLE_CLIENT_ID = "1234-abc.apps.googleusercontent.com"
+OIDC_GITHUB_CLIENT_ID = "Iv1.abcdef"
+```
+
+```bash
+wrangler secret put OIDC_GOOGLE_CLIENT_SECRET
+wrangler secret put OIDC_GITHUB_CLIENT_SECRET
+wrangler deploy
+```
+
+A provider with a client id but no secret (or the reverse) is logged at request time and not
+offered. The redirect URI is derived from the request's host, or from `BASE_URL`; it must
+match what the provider has on file to the character. For local `wrangler dev` the callback is
+`https://127.0.0.1:8788/auth/<provider>/callback`, which Google accepts for a test client and
+GitHub does too; put the ids and secrets in `.dev.vars`.
+
+The first sign-in through a provider asks for a username and creates an account with no
+password; a verified address from the provider is stored as verified. Password reset does not
+apply to such accounts, so mail is not needed for them.
+
 ## Enabling password login (optional)
 
 Off by default: authentication is expected to be external (OIDC), because OWASP-grade password

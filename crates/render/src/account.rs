@@ -65,6 +65,7 @@ pub fn settings_page(
     csrf: &str,
     user: &User,
     account: &Account,
+    providers: &[String],
     notice: Option<SettingsNotice>,
 ) -> Markup {
     html! {
@@ -117,6 +118,17 @@ pub fn settings_page(
                         button type="submit" { "Save and send confirmation" }
                     }
 
+                    @if !providers.is_empty() {
+                        h2 { "Sign-in" }
+                        p class="muted" {
+                            "This account signs in with "
+                            @for (i, p) in providers.iter().enumerate() {
+                                @if i > 0 { ", " }
+                                (p)
+                            }
+                            "."
+                        }
+                    }
                     @if account.has_password {
                         h2 { "Password" }
                         form method="post" action="/settings/password" {
@@ -364,7 +376,7 @@ mod tests {
             email_verified_at: None,
             has_password: true,
         };
-        let html = settings_page("tok", &user(), &account, None).into_string();
+        let html = settings_page("tok", &user(), &account, &[], None).into_string();
         assert!(html.contains("a@example.com"));
         assert!(html.contains("unconfirmed"));
         assert!(html.contains("resend"));
@@ -373,7 +385,7 @@ mod tests {
             email_verified_at: Some(1),
             ..account
         };
-        let html = settings_page("tok", &user(), &verified, None).into_string();
+        let html = settings_page("tok", &user(), &verified, &[], None).into_string();
         assert!(html.contains("(confirmed)"));
         assert!(!html.contains("resend"));
     }
@@ -385,7 +397,7 @@ mod tests {
             email_verified_at: None,
             has_password: false,
         };
-        let html = settings_page("tok", &user(), &account, None).into_string();
+        let html = settings_page("tok", &user(), &account, &[], None).into_string();
         assert!(!html.contains("/settings/password"));
     }
 

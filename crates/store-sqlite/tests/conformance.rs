@@ -7,7 +7,7 @@ use notespace_core::path::Path;
 use notespace_store_sqlite::SqliteStore;
 
 /// `include_str!` needs literal paths; `migration_list_is_complete` guards the hand maintenance.
-const MIGRATIONS: [&str; 9] = [
+const MIGRATIONS: [&str; 10] = [
     include_str!("../../../migrations/0001_init.sql"),
     include_str!("../../../migrations/0002_thread_public_id.sql"),
     include_str!("../../../migrations/0003_space_paths_and_names.sql"),
@@ -17,6 +17,7 @@ const MIGRATIONS: [&str; 9] = [
     include_str!("../../../migrations/0007_user_password.sql"),
     include_str!("../../../migrations/0008_moderation.sql"),
     include_str!("../../../migrations/0009_email_and_spaces.sql"),
+    include_str!("../../../migrations/0010_external_identity.sql"),
 ];
 
 const MIGRATIONS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations");
@@ -1056,6 +1057,21 @@ fn the_mail_names_match_wrangler_toml() {
             toml.lines()
                 .any(|l| l.trim_start_matches('#').trim().starts_with(name)),
             "wrangler.toml does not document MAIL_PROVIDER = {name}"
+        );
+    }
+}
+
+/// A provider's client id var is named from its kind; the file has to declare each so an
+/// operator sees where it goes.
+#[test]
+fn every_provider_has_its_client_id_declared_in_wrangler_toml() {
+    let toml = include_str!("../../../wrangler.toml");
+    for kind in notespace_core::oidc::ProviderKind::ALL {
+        let var = format!("OIDC_{}_CLIENT_ID", kind.as_str().to_uppercase());
+        assert!(
+            toml.lines()
+                .any(|l| l.trim().starts_with(&format!("{var} ="))),
+            "{var} is not declared under [vars] in wrangler.toml"
         );
     }
 }

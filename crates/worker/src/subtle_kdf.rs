@@ -4,9 +4,9 @@
 //! Unused by default: workerd caps PBKDF2 at 100,000 iterations against OWASP's 600,000, and even
 //! the capped version exceeds the 10 ms budget. Kept for a paid-plan deployment.
 
-use worker::js_sys::{global, Array, Object, Promise, Reflect, Uint8Array};
-use worker::wasm_bindgen::{JsCast, JsValue};
-use worker::wasm_bindgen_futures::JsFuture;
+use crate::subtle::{call, set, subtle};
+use worker::js_sys::{Array, Object, Uint8Array};
+use worker::wasm_bindgen::JsValue;
 
 /// workerd refuses more than this, to bound the DoS a single request can cause.
 pub const MAX_ITERATIONS: u32 = 100_000;
@@ -18,11 +18,7 @@ pub async fn derive(password: &str, salt: &[u8], iterations: u32) -> Result<Vec<
             "workerd caps PBKDF2 at {MAX_ITERATIONS} iterations, asked for {iterations}"
         ));
     }
-    // No `window` in a Worker; reflection rather than web-sys keeps this to a few hundred bytes.
-    let crypto = Reflect::get(&global(), &JsValue::from_str("crypto"))
-        .map_err(|e| format!("global.crypto: {e:?}"))?;
-    let subtle = Reflect::get(&crypto, &JsValue::from_str("subtle"))
-        .map_err(|e| format!("crypto.subtle: {e:?}"))?;
+    let subtle = subtle()?;
 
     let usages = Array::of1(&JsValue::from_str("deriveBits"));
     let imported = call(
@@ -52,27 +48,4 @@ pub async fn derive(password: &str, salt: &[u8], iterations: u32) -> Result<Vec<
     .await?;
 
     Ok(Uint8Array::new(&bits).to_vec())
-}
-
-/// Call an async method on a JS object and await the promise it returns.
-async fn call(obj: &JsValue, method: &str, args: &[JsValue]) -> Result<JsValue, String> {
-    let f: worker::js_sys::Function = Reflect::get(obj, &JsValue::from_str(method))
-        .map_err(|e| format!("{method}: {e:?}"))?
-        .unchecked_into();
-    let arr = Array::new();
-    for a in args {
-        arr.push(a);
-    }
-    let promise: Promise = Reflect::apply(&f, obj, &arr)
-        .map_err(|e| format!("{method} apply: {e:?}"))?
-        .unchecked_into();
-    JsFuture::from(promise)
-        .await
-        .map_err(|e| format!("{method} await: {e:?}"))
-}
-
-fn set(o: &Object, k: &str, v: &JsValue) -> Result<(), String> {
-    Reflect::set(o, &JsValue::from_str(k), v)
-        .map(|_| ())
-        .map_err(|e| format!("set {k}: {e:?}"))
 }

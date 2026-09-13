@@ -135,6 +135,16 @@ SITE_NAME = "notespace"
 REQUIRE_EMAIL = "false"
 # Closed registration: `wrangler secret put SIGNUP_CODE` makes /register ask for the code (a
 # secret, so it stays out of version control); unset or empty means anyone may register.
+
+# Sign-in through a provider (OpenID Connect / OAuth 2.0). A provider is offered when its
+# client id is set here AND its secret is set with `wrangler secret put OIDC_<PROVIDER>_CLIENT_SECRET`;
+# with only one of the two it is logged and not offered. The redirect URI to register with the
+# provider is https://<host>/auth/<provider>/callback (BASE_URL's host if set). Accounts made
+# this way have no password; on the first sign-in the visitor picks a username.
+#   google  https://console.cloud.google.com/apis/credentials -> OAuth client ID, Web application
+#   github  https://github.com/settings/developers -> OAuth Apps -> New OAuth App
+OIDC_GOOGLE_CLIENT_ID = ""
+OIDC_GITHUB_CLIENT_ID = ""
 # Where links in mail point. Empty means the request's own host, which is right when there is
 # one hostname; set it when the Worker is reached through several.
 BASE_URL = ""

@@ -10,7 +10,7 @@ use notespace_core::space_key::SpacePath;
 use notespace_core::store::{Page, Store};
 use notespace_store_sqlite::SqliteStore;
 
-const MIGRATIONS: [&str; 9] = [
+const MIGRATIONS: [&str; 10] = [
     include_str!("../../../migrations/0001_init.sql"),
     include_str!("../../../migrations/0002_thread_public_id.sql"),
     include_str!("../../../migrations/0003_space_paths_and_names.sql"),
@@ -20,6 +20,7 @@ const MIGRATIONS: [&str; 9] = [
     include_str!("../../../migrations/0007_user_password.sql"),
     include_str!("../../../migrations/0008_moderation.sql"),
     include_str!("../../../migrations/0009_email_and_spaces.sql"),
+    include_str!("../../../migrations/0010_external_identity.sql"),
 ];
 
 const NOW: i64 = 1_800_000_000_000;

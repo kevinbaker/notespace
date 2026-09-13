@@ -318,6 +318,33 @@ pub trait Store {
         now: Timestamp,
     ) -> StoreResult<u32>;
 
+    // -- External identities ---------------------------------------------------
+
+    /// The account an external identity is linked to. **Budget: 1 statement.**
+    async fn identity_user(&self, provider: &str, subject: &str) -> StoreResult<Option<User>>;
+
+    /// Link an identity to an account. A second link of the same identity is a
+    /// [`StoreError::Conflict`]. **Budget: 1 statement.**
+    async fn link_identity(
+        &self,
+        provider: &str,
+        subject: &str,
+        user: UserId,
+        email: Option<&str>,
+        now: Timestamp,
+    ) -> StoreResult<()>;
+
+    /// Record a sign-in. **Budget: 1 statement.**
+    async fn touch_identity(
+        &self,
+        provider: &str,
+        subject: &str,
+        now: Timestamp,
+    ) -> StoreResult<()>;
+
+    /// The providers linked to an account, for the settings page. **Budget: 1 statement.**
+    async fn user_identities(&self, user: UserId) -> StoreResult<Vec<String>>;
+
     // -- Administration -------------------------------------------------------
 
     /// The thread and its space, no posts. **Budget: 1 statement.**

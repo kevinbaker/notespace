@@ -1204,6 +1204,64 @@ impl Store for D1Store {
         Ok(rows.into_iter().next().map(|r| r.name))
     }
 
+    // -- External identities ---------------------------------------------------
+
+    async fn identity_user(&self, provider: &str, subject: &str) -> StoreResult<Option<User>> {
+        let rows: Vec<PlainUserRow> = self
+            .query(sql::IDENTITY_USER, vec![provider.into(), subject.into()])
+            .await?;
+        Ok(rows.into_iter().next().map(user_from_row))
+    }
+
+    async fn link_identity(
+        &self,
+        provider: &str,
+        subject: &str,
+        user: UserId,
+        email: Option<&str>,
+        now: Timestamp,
+    ) -> StoreResult<()> {
+        let res = self
+            .db
+            .prepare(sql::INSERT_IDENTITY)
+            .bind(&[
+                provider.into(),
+                subject.into(),
+                num(user),
+                opt_str(email),
+                num(now),
+            ])
+            .map_err(backend)?
+            .run()
+            .await
+            .map_err(write_error)?;
+        self.last_stats.set(collect_stats(&[&res]));
+        Ok(())
+    }
+
+    async fn touch_identity(
+        &self,
+        provider: &str,
+        subject: &str,
+        now: Timestamp,
+    ) -> StoreResult<()> {
+        self.run(
+            sql::TOUCH_IDENTITY,
+            vec![provider.into(), subject.into(), num(now)],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn user_identities(&self, user: UserId) -> StoreResult<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Row {
+            provider: String,
+        }
+        let rows: Vec<Row> = self.query(sql::USER_IDENTITIES, vec![num(user)]).await?;
+        Ok(rows.into_iter().map(|r| r.provider).collect())
+    }
+
     // -- Administration -------------------------------------------------------
 
     async fn thread_head(&self, thread: &PublicId) -> StoreResult<(Space, Thread)> {

@@ -13,12 +13,14 @@ pub mod cookie;
 pub mod csrf;
 pub mod edit;
 pub mod email;
+pub mod encoding;
 pub mod id;
 #[cfg(feature = "password")]
 pub mod login;
 pub mod model;
 pub mod moderation;
 pub(crate) mod naming;
+pub mod oidc;
 #[cfg(feature = "password")]
 pub mod password;
 pub mod path;

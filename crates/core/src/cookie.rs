@@ -7,6 +7,12 @@ pub const SESSION: &str = "__Host-ns_session";
 /// Binds a CSRF token before there is a session to bind it to.
 pub const ANON: &str = "__Host-ns_anon";
 
+/// The sealed state and nonce of a sign-in through a provider, between redirect and callback.
+pub const OAUTH: &str = "__Host-ns_oauth";
+
+/// The sealed identity a provider vouched for, between the callback and the username step.
+pub const PENDING: &str = "__Host-ns_pending";
+
 /// Takes the raw header rather than a request type, so both targets share it and it is testable.
 pub fn get(header: Option<&str>, name: &str) -> Option<String> {
     header?
