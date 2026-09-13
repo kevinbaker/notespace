@@ -159,7 +159,8 @@ pub async fn post<S: Store, Q: ModerationQueue>(
         Err(StoreError::NotFound) => return Ok(Outcome::Rejected(Rejected::NotFound)),
         Err(e) => return Err(e),
     };
-    if ctx.thread_state == ThreadState::Locked {
+    // Hidden and deleted threads take no replies either; to a writer that is a lock.
+    if !matches!(ctx.thread_state, ThreadState::Visible | ThreadState::Pinned) {
         return Ok(Outcome::Rejected(Rejected::Locked));
     }
     let reasons = match triage(store, &ctx, r.author, r.body_md, Some(r.body_md), r.now).await? {

@@ -1,6 +1,7 @@
 //! Cloudflare Workers entrypoint for notespace.
 
 mod account;
+mod admin;
 #[cfg(feature = "password")]
 mod auth_config;
 mod cache;
@@ -24,6 +25,7 @@ use notespace_core::csrf;
 use notespace_core::id::PublicId;
 #[cfg(feature = "password")]
 use notespace_core::login;
+use notespace_core::model::ThreadState;
 use notespace_core::path::Path as TreePath;
 use notespace_core::session::SessionToken;
 use notespace_core::store::{Page, Store, StoreError, StoreResult};
@@ -82,6 +84,7 @@ fn router(env: Env) -> Router {
         .route("/", get(index))
         .route("/healthz", get(healthz))
         .route("/favicon.ico", get(favicon))
+        .route("/static/reply.js", get(reply_script))
         .route("/t/{id}", get(thread_page))
         .route("/t/{id}/{slug}", get(thread_page_slug))
         .route("/p/{id}", get(post_permalink))
@@ -118,6 +121,25 @@ fn router(env: Env) -> Router {
         // Moderation. Forms are separate uncached pages for the same reason the reply form is.
         .route("/p/{id}/report", get(report_form).post(report_submit))
         .route("/p/{id}/appeal", get(appeal_form).post(appeal_submit))
+        .route("/admin", get(admin::dashboard))
+        .route(
+            "/admin/thread/{id}",
+            get(admin::thread_form).post(admin::thread_submit),
+        )
+        .route("/admin/post/{id}/state", post(admin::post_state))
+        .route("/admin/users", get(admin::users))
+        .route("/admin/user/{name}", get(admin::user))
+        .route("/admin/user/{name}/state", post(admin::user_state))
+        .route("/admin/user/{name}/role", post(admin::user_role))
+        .route(
+            "/admin/spaces",
+            get(admin::spaces).post(admin::space_create),
+        )
+        .route(
+            "/admin/space/{id}",
+            get(admin::space_form_page).post(admin::space_submit),
+        )
+        .route("/admin/log", get(admin::log))
         .route("/mod/queue", get(mod_queue))
         .route("/mod/review/{id}", post(mod_review))
         .route("/modlog", get(modlog))
@@ -681,6 +703,15 @@ async fn render_thread(
     };
 
     match fetch_page::<D1Store>(&store, &thread_id, &page).await {
+        // Not cached either: the 404 must lift the moment the thread is restored.
+        Ok(page)
+            if matches!(
+                page.thread.state,
+                ThreadState::Hidden | ThreadState::Deleted
+            ) =>
+        {
+            error(StatusCode::NOT_FOUND, "thread is hidden")
+        }
         Ok(page) => {
             let html = notespace_render::thread_page(&page).into_string();
             let stats = store.last_stats();
@@ -762,6 +793,8 @@ struct ReplyQuery {
     /// Public id of the post being replied to. Absent posts at top level.
     parent: Option<String>,
     error: Option<String>,
+    /// Prefill the draft with the parent quoted: the no-JS half of "quote".
+    quote: Option<String>,
 }
 
 /// `None` covers every way of not being signed in, without distinguishing them.
@@ -838,21 +871,75 @@ async fn reply_form(
         csrf::DEFAULT_LIFETIME_MS,
     );
 
-    let body = notespace_render::auth::reply_page(
+    let parent = match q.parent.as_deref().filter(|p| !p.is_empty()) {
+        Some(raw) => match PublicId::parse(raw) {
+            Ok(p) => Some(p),
+            Err(_) => return error(StatusCode::BAD_REQUEST, "bad parent id"),
+        },
+        None => None,
+    };
+    let (title, parent_post) = match reply_target(&store, &thread_id, parent.as_ref()).await {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    let draft = match (&parent_post, q.quote.is_some()) {
+        (Some(p), true) => notespace_render::auth::quoted(p.body_md.as_deref().unwrap_or("")),
+        _ => String::new(),
+    };
+    let target = notespace_render::auth::ReplyTarget {
+        thread_title: &title,
+        parent: parent_post
+            .as_ref()
+            .map(|p| notespace_render::auth::ParentPost {
+                public_id: p.public_id.as_str(),
+                author_name: &p.author_name,
+                body_html: &p.body_html,
+            }),
+    };
+    uncached_html(notespace_render::auth::reply_page(
         token.as_str(),
         &canonical,
-        q.parent.as_deref(),
-        "",
+        &target,
+        &draft,
         q.error.and_then(parse_reply_error),
-    );
+    ))
+}
+
+/// The thread's title and, for a nested reply, the parent post -- which has to be in this
+/// thread, or the form would show one thread's post above a reply into another.
+async fn reply_target(
+    store: &D1Store,
+    thread: &PublicId,
+    parent: Option<&PublicId>,
+) -> Result<(String, Option<notespace_core::model::Post>), Response> {
+    let (_, head) = match store.thread_head(thread).await {
+        Ok(t) => t,
+        Err(StoreError::NotFound) => return Err(error(StatusCode::NOT_FOUND, "no such thread")),
+        Err(e) => return Err(error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+    };
+    let Some(parent) = parent else {
+        return Ok((head.title, None));
+    };
+    match store.post_by_id(parent).await {
+        Ok((post, in_thread)) if &in_thread == thread => Ok((head.title, Some(post))),
+        Ok(_) | Err(StoreError::NotFound) => Err(error(StatusCode::NOT_FOUND, "no such post")),
+        Err(e) => Err(error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+    }
+}
+
+/// The reply form's enhancement, served as a file rather than inlined: the CSP is
+/// `script-src 'self'` and stays that way.
+async fn reply_script() -> Response {
     (
         StatusCode::OK,
         [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            // Carries a token bound to one visitor.
-            (header::CACHE_CONTROL, "no-store"),
+            (
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
         ],
-        Html(body.into_string()),
+        include_str!("../static/reply.js"),
     )
         .into_response()
 }
@@ -928,22 +1015,6 @@ async fn reply_submit(
     };
     let session = cookie::get(cookie_header(&headers), cookie::SESSION).unwrap_or_default();
     let now = worker::Date::now().as_millis() as i64;
-    // A rejection re-renders the form with the draft in it, under a fresh token, rather than
-    // redirecting and losing what was typed.
-    let back = |e: &str| -> Response {
-        let fresh = key.mint(&session, now, csrf::DEFAULT_LIFETIME_MS);
-        uncached_html(notespace_render::auth::reply_page(
-            fresh.as_str(),
-            &canonical,
-            (!form_parent.is_empty()).then_some(form_parent.as_str()),
-            &form_body,
-            parse_reply_error(e.to_string()),
-        ))
-    };
-    if key.verify(&form_csrf, &session, now).is_err() {
-        return back("expired");
-    }
-
     let parent = match form_parent.as_str() {
         "" => None,
         raw => match PublicId::parse(raw) {
@@ -951,6 +1022,35 @@ async fn reply_submit(
             Err(_) => return error(StatusCode::BAD_REQUEST, "bad parent id"),
         },
     };
+    let (title, parent_post) = match reply_target(&store, &thread_id, parent.as_ref()).await {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    // A rejection re-renders the form with the draft in it, under a fresh token, rather than
+    // redirecting and losing what was typed.
+    let back = |e: &str| -> Response {
+        let fresh = key.mint(&session, now, csrf::DEFAULT_LIFETIME_MS);
+        let target = notespace_render::auth::ReplyTarget {
+            thread_title: &title,
+            parent: parent_post
+                .as_ref()
+                .map(|p| notespace_render::auth::ParentPost {
+                    public_id: p.public_id.as_str(),
+                    author_name: &p.author_name,
+                    body_html: &p.body_html,
+                }),
+        };
+        uncached_html(notespace_render::auth::reply_page(
+            fresh.as_str(),
+            &canonical,
+            &target,
+            &form_body,
+            parse_reply_error(e.to_string()),
+        ))
+    };
+    if key.verify(&form_csrf, &session, now).is_err() {
+        return back("expired");
+    }
 
     // The read path never renders, so an unrenderable body has to fail here.
     let html = notespace_core::model::SanitizedHtml::assert_sanitized(
@@ -1624,7 +1724,7 @@ async fn mod_review(
     // role on the user record, so lift a listed user to moderator for this call.
     let mut reviewer = signed.user.clone();
     if !reviewer.role.can_moderate() {
-        reviewer.role = notespace_core::model::Role::Moderator;
+        reviewer.role = notespace_core::model::Role::Admin;
     }
     match pipeline::review(&signed.store, id, &reviewer, resolution, now_ms()).await {
         Ok(ReviewOutcome::Resolved { .. }) => {

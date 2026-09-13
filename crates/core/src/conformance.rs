@@ -13,7 +13,10 @@ const PAGE_SIZE: u32 = 200;
 use crate::email::{
     EmailAddress, EmailToken, StoredToken, TokenKind, TOKEN_BYTES as EMAIL_TOKEN_BYTES,
 };
-use crate::model::{NewPost, NewThread, PostState, SanitizedHtml, ThreadKind};
+use crate::model::{
+    NewPost, NewSpace, NewThread, PostState, Ranking, Role, SanitizedHtml, ThreadEdit, ThreadKind,
+    ThreadState, UserState,
+};
 use crate::moderation::classify::{Call, Verdict};
 use crate::moderation::{
     ActorKind, NewAction, NewReview, NewSignal, Resolution, ReviewReason, SIGNAL_REPORT,
@@ -137,7 +140,280 @@ async fn write_checks<S: Store>(store: &S, fx: &Fixture) -> Vec<Check> {
         // Email.
         email_tokens_are_spent_exactly_once_and_only_as_their_kind(store, fx).await,
         a_verified_address_belongs_to_one_account(store, fx).await,
+        // Administration.
+        a_thread_edit_rewrites_the_row_and_bumps_the_version(store, fx).await,
+        users_are_listable_and_their_role_and_state_settable(store, fx).await,
+        spaces_are_creatable_once_and_editable(store, fx).await,
+        stats_and_the_full_log_read_back(store, fx).await,
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Administration
+// ---------------------------------------------------------------------------
+
+async fn a_thread_edit_rewrites_the_row_and_bumps_the_version<S: Store>(
+    store: &S,
+    fx: &Fixture,
+) -> Check {
+    const NAME: &str = "update_thread rewrites title, url, state and space, and bumps the version";
+    let thread = &fx.writable[4]; // created by the compose check
+    let (space, before) = match store.thread_head(thread).await {
+        Ok(t) => t,
+        Err(e) => return Check::fail(NAME, format!("thread_head: {e}")),
+    };
+    require!(
+        NAME,
+        before.public_id == *thread,
+        "thread_head returned the wrong thread"
+    );
+    require!(
+        NAME,
+        space.id == before.space_id,
+        "thread_head's space does not match"
+    );
+    let edit = ThreadEdit {
+        title: "Conformance thread, retitled".into(),
+        url: None,
+        state: ThreadState::Locked,
+        space_id: space.id,
+        space_path: space.path.clone(),
+    };
+    if let Err(e) = store.update_thread(thread, &edit).await {
+        return Check::fail(NAME, format!("update: {e}"));
+    }
+    let (_, after) = match store.thread_head(thread).await {
+        Ok(t) => t,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    require!(NAME, after.title == edit.title, "title not rewritten");
+    require!(NAME, after.url.is_none(), "url not cleared");
+    require!(
+        NAME,
+        after.state == ThreadState::Locked,
+        "state not changed"
+    );
+    require!(
+        NAME,
+        after.cache_version > before.cache_version,
+        "cache_version went {} -> {}",
+        before.cache_version,
+        after.cache_version
+    );
+    match store.update_thread(&fx.absent, &edit).await {
+        Err(StoreError::NotFound) => Check::pass(NAME),
+        other => Check::fail(NAME, format!("absent thread: {other:?}")),
+    }
+}
+
+async fn users_are_listable_and_their_role_and_state_settable<S: Store>(
+    store: &S,
+    fx: &Fixture,
+) -> Check {
+    const NAME: &str = "list_users, user_row, set_user_role and set_user_state agree";
+    let name = "conformance-admin-subject";
+    let id = match store.create_user(name, NOW, None).await {
+        Ok(id) => id,
+        Err(StoreError::Conflict) => match store.user_by_name(name).await {
+            Ok(Some(c)) => c.user.id,
+            other => return Check::fail(NAME, format!("lookup: {other:?}")),
+        },
+        Err(e) => return Check::fail(NAME, format!("create: {e}")),
+    };
+    // Back to a known starting point, for reruns.
+    if let Err(e) = store.set_user_role(id, Role::Member).await {
+        return Check::fail(NAME, format!("{e}"));
+    }
+    if let Err(e) = store.set_user_state(id, UserState::Active).await {
+        return Check::fail(NAME, format!("{e}"));
+    }
+    let listed = match store.list_users("conformance-admin", 100).await {
+        Ok(v) => v,
+        Err(e) => return Check::fail(NAME, format!("list: {e}")),
+    };
+    let Some(row) = listed.iter().find(|r| r.user.id == id) else {
+        return Check::fail(NAME, "the user is not listed by prefix");
+    };
+    require!(NAME, row.user.role == Role::Member, "role not read");
+    require!(NAME, row.created_at == NOW, "created_at not read");
+    let everyone = match store.list_users("", 1000).await {
+        Ok(v) => v,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    require!(
+        NAME,
+        everyone.iter().any(|r| r.user.id == id),
+        "an empty prefix does not list everyone"
+    );
+    require!(
+        NAME,
+        everyone.windows(2).all(|w| w[0].user.id >= w[1].user.id),
+        "not newest first"
+    );
+    if let Err(e) = store.set_user_role(id, Role::Moderator).await {
+        return Check::fail(NAME, format!("role: {e}"));
+    }
+    if let Err(e) = store.set_user_state(id, UserState::Banned).await {
+        return Check::fail(NAME, format!("state: {e}"));
+    }
+    match store.user_row(name).await {
+        Ok(Some(r)) => {
+            require!(
+                NAME,
+                r.user.role == Role::Moderator,
+                "role change not read back"
+            );
+            require!(
+                NAME,
+                r.user.state == UserState::Banned,
+                "state change not read back"
+            );
+        }
+        other => return Check::fail(NAME, format!("user_row: {other:?}")),
+    }
+    let _ = fx;
+    match store.user_row("no-such-user-anywhere").await {
+        Ok(None) => Check::pass(NAME),
+        other => Check::fail(NAME, format!("unknown user: {other:?}")),
+    }
+}
+
+async fn spaces_are_creatable_once_and_editable<S: Store>(store: &S, fx: &Fixture) -> Check {
+    const NAME: &str = "create_space is unique by path; space_detail and update_space round-trip";
+    let page = match store.thread_page(&fx.thread, &Page::first(1)).await {
+        Ok(p) => p,
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    };
+    let path = format!("{}conformance-sub/", page.space.path);
+    let new = NewSpace {
+        name: "Conformance sub".into(),
+        path: path.clone(),
+        parent_id: Some(page.space.id),
+        ranking: Ranking::Bump,
+        depth_cap: 4,
+        config: "{}".into(),
+    };
+    let id = match store.create_space(&new).await {
+        Ok(id) => id,
+        // Left over from an earlier run.
+        Err(StoreError::Conflict) => match store.all_spaces().await {
+            Ok(all) => match all.iter().find(|s| s.space.path == path) {
+                Some(s) => s.space.id,
+                None => return Check::fail(NAME, "conflict, but the path is not listed"),
+            },
+            Err(e) => return Check::fail(NAME, format!("{e}")),
+        },
+        Err(e) => return Check::fail(NAME, format!("create: {e}")),
+    };
+    match store.create_space(&new).await {
+        Err(StoreError::Conflict) => {}
+        other => return Check::fail(NAME, format!("duplicate path: {other:?}")),
+    }
+    if let Err(e) = store
+        .update_space(
+            id,
+            "Conformance sub, renamed",
+            Ranking::Gravity,
+            3,
+            r#"{"k":1}"#,
+        )
+        .await
+    {
+        return Check::fail(NAME, format!("update: {e}"));
+    }
+    let detail = match store.space_detail(id).await {
+        Ok(Some(d)) => d,
+        other => return Check::fail(NAME, format!("space_detail: {other:?}")),
+    };
+    require!(
+        NAME,
+        detail.space.name == "Conformance sub, renamed",
+        "name not updated"
+    );
+    require!(
+        NAME,
+        detail.space.ranking == Ranking::Gravity,
+        "ranking not updated"
+    );
+    require!(NAME, detail.space.depth_cap == 3, "depth_cap not updated");
+    require!(
+        NAME,
+        detail.config == r#"{"k":1}"#,
+        "config not updated: {}",
+        detail.config
+    );
+    require!(
+        NAME,
+        detail.space.parent_id == Some(page.space.id),
+        "parent not read"
+    );
+    require!(
+        NAME,
+        detail.space.path == path,
+        "path changed: {}",
+        detail.space.path
+    );
+    match store.all_spaces().await {
+        Ok(all) => {
+            require!(
+                NAME,
+                all.iter().any(|s| s.space.id == id),
+                "not in all_spaces"
+            );
+            require!(
+                NAME,
+                all.windows(2).all(|w| w[0].space.path <= w[1].space.path),
+                "not in path order"
+            );
+            let Some(parent) = all.iter().find(|s| s.space.id == page.space.id) else {
+                return Check::fail(NAME, "the fixture's space is missing from all_spaces");
+            };
+            require!(NAME, parent.thread_count >= 1, "thread_count not counted");
+        }
+        Err(e) => return Check::fail(NAME, format!("{e}")),
+    }
+    match store.space_detail(i64::MAX - 11).await {
+        Ok(None) => Check::pass(NAME),
+        other => Check::fail(NAME, format!("absent space: {other:?}")),
+    }
+}
+
+async fn stats_and_the_full_log_read_back<S: Store>(store: &S, fx: &Fixture) -> Check {
+    const NAME: &str = "site_stats counts, and full_log includes private rows with detail";
+    let stats = match store.site_stats().await {
+        Ok(s) => s,
+        Err(e) => return Check::fail(NAME, format!("stats: {e}")),
+    };
+    require!(NAME, stats.users >= 1, "no users counted");
+    require!(NAME, stats.threads >= 1, "no threads counted");
+    require!(
+        NAME,
+        stats.posts >= fx.post_count,
+        "posts {} < fixture's {}",
+        stats.posts,
+        fx.post_count
+    );
+    let log = match store.full_log(200).await {
+        Ok(l) => l,
+        Err(e) => return Check::fail(NAME, format!("log: {e}")),
+    };
+    // `the_public_log_omits_private_rows...` wrote one private row; here it must show.
+    let Some(private) = log.iter().find(|e| e.entry.action == "conf_private") else {
+        return Check::fail(NAME, "the private row is missing from the full log");
+    };
+    require!(NAME, !private.public, "private row marked public");
+    require!(
+        NAME,
+        private.detail.contains("suite"),
+        "detail not read: {}",
+        private.detail
+    );
+    require!(
+        NAME,
+        private.entry.target_public_id.as_ref() == Some(&fx.writable[0]),
+        "target not resolved"
+    );
+    Check::pass(NAME)
 }
 
 // ---------------------------------------------------------------------------
@@ -1733,11 +2009,25 @@ async fn locate_post_finds_its_thread<S: Store>(store: &S, fx: &Fixture) -> Chec
 }
 
 async fn absent_post_is_not_found<S: Store>(store: &S, fx: &Fixture) -> Check {
-    const NAME: &str = "absent post is NotFound";
+    const NAME: &str = "absent post is NotFound, and post_by_id carries the source";
     match store.locate_post(&fx.absent, PAGE_SIZE).await {
-        Err(StoreError::NotFound) => Check::pass(NAME),
-        Err(e) => Check::fail(NAME, format!("wrong error: {e}")),
-        Ok(_) => Check::fail(NAME, "located a post that does not exist"),
+        Err(StoreError::NotFound) => {}
+        Err(e) => return Check::fail(NAME, format!("wrong error: {e}")),
+        Ok(_) => return Check::fail(NAME, "located a post that does not exist"),
+    }
+    match store.post_by_id(&fx.absent).await {
+        Err(StoreError::NotFound) => {}
+        other => return Check::fail(NAME, format!("post_by_id of absent: {other:?}")),
+    }
+    match store.post_by_id(&fx.known_post).await {
+        Ok((post, thread)) => {
+            require!(NAME, post.public_id == fx.known_post, "wrong post");
+            require!(NAME, thread == fx.thread, "wrong thread");
+            require!(NAME, post.body_md.is_some(), "post_by_id must load body_md");
+            require!(NAME, !post.author_name.is_empty(), "author not joined");
+            Check::pass(NAME)
+        }
+        Err(e) => Check::fail(NAME, format!("{e}")),
     }
 }
 

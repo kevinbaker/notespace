@@ -165,7 +165,11 @@ cookie used before a session exists is `cookie::ANON`.
 | Form | `crates/render/src/auth.rs` — `reply_page` |
 | Session → user | `current_user` in `crates/worker/src/lib.rs` |
 
-The form is a separate uncached page, not part of the baked thread.
+The form is a separate uncached page, not part of the baked thread. It shows the parent post
+(`Store::post_by_id`, `render::auth::ReplyTarget`) with a no-JS "quote it all" link
+(`?quote=1`, prefilled by `auth::quoted`); `crates/worker/static/reply.js`, served at
+`/static/reply.js`, adds a "quote selection" button. A posted reply lands on its permalink,
+which the thread page highlights with `.post:target`.
 
 | Starting a thread | `crates/core/src/compose.rs` — `create`, `check`; `Store::create_thread`, `Store::space_context` |
 | Editing and deleting | `crates/core/src/edit.rs` — `edit`, `delete`; `Store::update_post_body` |
@@ -231,6 +235,25 @@ Not built: a general rule engine (the heuristics are fixed code with policy-supp
 reporter accuracy weighting, per-user notification that a post was held or hidden, the
 author's view of their own pending post -- the baked page shows everyone the same tombstone --
 and a pending state for a *thread*: a held first post leaves its title visible.
+
+## Administration
+
+| what | where |
+|---|---|
+| The rules: who may do what, and the log row each change leaves | `crates/core/src/admin.rs` — `update_thread`, `set_post_state`, `set_user_state`, `set_user_role`, `create_space`, `update_space` |
+| Store methods | `Store::thread_head` through `Store::full_log` |
+| Handlers, and the `MODERATORS` bootstrap (which grants admin) | `crates/worker/src/admin.rs` — `moderator` |
+| Pages | `crates/render/src/admin.rs` |
+| Routes | `/admin`, `/admin/thread/{id}`, `/admin/post/{id}/state`, `/admin/users`, `/admin/user/{name}`, `/admin/user/{name}/{state,role}`, `/admin/spaces`, `/admin/space/{id}`, `/admin/log` |
+
+Two tiers: a moderator (`Role::can_moderate`) acts on threads, posts and accounts; an admin
+(`Role::is_admin`) also changes roles and spaces. Nobody changes their own account. The space
+form edits the moderation policy field by field and writes it back under `config.moderation`
+(`admin::SpaceForm::config`), preserving anything else in the JSON.
+
+Threads have states now that the read path honours: `pinned` lists first, `locked` refuses
+replies and edits, `hidden` and `deleted` 404 and are unlisted (`sql::RECENT_THREADS`,
+`reply::post`, `render_thread`).
 
 ## §6 Presets
 

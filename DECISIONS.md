@@ -584,6 +584,52 @@ refused, which is harmless.
 **`/login` while signed in goes to `/settings`.** The nav cannot say who you are (baked
 pages), so "sign in" is the link people press to find out; the account page is the answer.
 
+## `crates/core/src/admin.rs` and the admin pages
+
+**Two tiers, and the line between them is "who decides who moderates".** A moderator acts on
+content and accounts: threads, posts, bans. An admin also changes roles and spaces, because a
+role change or a space's moderation policy decides everything a moderator will do afterwards.
+A moderator may not act against another moderator; an admin may. Nobody may change their own
+account: an admin who demotes themselves leaves an instance with no admin and no way back but
+SQL, and that is a footgun with no use.
+
+**`MODERATORS` bootstraps admin, not moderator.** The variable exists so the first person can
+exist; the first person has to be able to make the second, so it grants the higher tier. Once
+a role is in the database the variable is redundant for that name.
+
+**Every change is a log row with a name on it**, and the public ones are the ones a reader
+would want to know about: a lock, a hide, a ban, a move. Retitles and role changes are
+private. The full log at `/admin/log` shows both and the detail column; the public log keeps
+its shape.
+
+**Thread states are now honoured by the read path.** They were columns before this: a
+`locked` thread was listed nowhere, because the lists selected `visible` only, and a `hidden`
+thread rendered. Now pinned lists first, locked is listed and readable but refuses writes,
+hidden and deleted 404 -- uncached, so a restore lifts the 404 at once.
+
+**The space form edits the policy field by field** rather than as JSON, and writes it back
+under `config.moderation` while preserving whatever else the JSON holds. Checkbox semantics
+apply: an unchecked box is `false`, which is why the form always carries every field.
+
+## The reply form's parent, and `/static/reply.js`
+
+**The parent post is on the reply page**, because a reply written without the thing it
+answers in view is a worse reply, and the thread page cannot open a form in place (§7.1). One
+statement (`post_by_id`), and the parent must be in the thread named in the URL, or one
+thread's post would sit above a reply into another.
+
+**Quoting is two features that degrade into one.** Without JavaScript, "quote it all" is a link
+back to the same form with `?quote=1`, and the server prefills the textarea with the parent's
+markdown as a `>` block. With JavaScript, a "quote selection" button quotes whatever is
+selected inside the parent -- and with nothing selected, the whole post, which is exactly what
+the link does. The script is a file at `/static/reply.js`, not inline, because the site's CSP
+is `script-src 'self'` and that does not get relaxed for a button. It is the first script on
+the site, and it is only loaded on a page that has a parent to quote.
+
+**A posted reply lands on itself.** The redirect goes to the reply's permalink, which resolves
+to the right page of the thread with the reply as the fragment, and `.post:target` highlights
+it. Held replies land on the held notice instead, as before.
+
 ## `crates/core/src/sql.rs` -- space listings
 
 `SPACE_THREADS` is the subtree range scan the 0003 migration was designed for, and that

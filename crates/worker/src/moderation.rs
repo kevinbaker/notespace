@@ -2,7 +2,7 @@
 //! consumer. Request and response shapes come from `core`; this file only carries bytes.
 
 use notespace_core::id::PublicId;
-use notespace_core::moderation::classify::{ClassifyError, ClassifyInput, Classifier, Verdict};
+use notespace_core::moderation::classify::{Classifier, ClassifyError, ClassifyInput, Verdict};
 use notespace_core::moderation::heuristics::Reason;
 use notespace_core::moderation::layers::Layered;
 use notespace_core::moderation::pipeline::ModerationQueue;
@@ -70,7 +70,9 @@ pub fn resolve(env: &Env) -> Result<Option<AnyClassifier>, String> {
     if let Some((front, back)) = provider.split_once('+') {
         let (Some(front), Some(back)) = (single(env, front.trim())?, single(env, back.trim())?)
         else {
-            return Err(format!("{PROVIDER_VAR}={provider:?}: both layers must be providers"));
+            return Err(format!(
+                "{PROVIDER_VAR}={provider:?}: both layers must be providers"
+            ));
         };
         return Ok(Some(AnyClassifier::Layered(Box::new(Layered::new(
             front, back,
@@ -88,7 +90,9 @@ fn single(env: &Env, provider: &str) -> Result<Option<AnyClassifier>, String> {
             let key = env
                 .secret(OPENROUTER_KEY_SECRET)
                 .map(|s| s.to_string())
-                .map_err(|_| format!("{PROVIDER_VAR}={provider} needs the {OPENROUTER_KEY_SECRET} secret"))?;
+                .map_err(|_| {
+                    format!("{PROVIDER_VAR}={provider} needs the {OPENROUTER_KEY_SECRET} secret")
+                })?;
             let guard = provider == "openrouter_guard";
             Ok(Some(AnyClassifier::OpenAiCompatible(OpenAiCompatible {
                 url: providers::OPENROUTER_URL.into(),
@@ -105,14 +109,18 @@ fn single(env: &Env, provider: &str) -> Result<Option<AnyClassifier>, String> {
             let key = env
                 .secret(ANTHROPIC_KEY_SECRET)
                 .map(|s| s.to_string())
-                .map_err(|_| format!("{PROVIDER_VAR}=anthropic needs the {ANTHROPIC_KEY_SECRET} secret"))?;
+                .map_err(|_| {
+                    format!("{PROVIDER_VAR}=anthropic needs the {ANTHROPIC_KEY_SECRET} secret")
+                })?;
             Ok(Some(AnyClassifier::Anthropic(Anthropic {
                 key,
                 model: model.unwrap_or_else(|| providers::ANTHROPIC_DEFAULT_MODEL.to_string()),
             })))
         }
         "llama_guard" => {
-            let ai = env.ai(AI_BINDING).map_err(|e| format!("no {AI_BINDING} binding: {e}"))?;
+            let ai = env
+                .ai(AI_BINDING)
+                .map_err(|e| format!("no {AI_BINDING} binding: {e}"))?;
             Ok(Some(AnyClassifier::WorkersAi(WorkersAi {
                 ai,
                 model: guard_model.unwrap_or_else(|| providers::LLAMA_GUARD_MODEL.to_string()),
@@ -161,11 +169,8 @@ impl Classifier for WorkersAi {
         } else {
             providers::workers_ai_request(input)
         };
-        let output: serde_json::Value = self
-            .ai
-            .run(&self.model, request)
-            .await
-            .map_err(transport)?;
+        let output: serde_json::Value =
+            self.ai.run(&self.model, request).await.map_err(transport)?;
         if self.guard {
             providers::llama_guard_parse(&output, &self.model)
         } else {

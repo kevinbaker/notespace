@@ -65,7 +65,7 @@ pub async fn edit<S: Store, Q: ModerationQueue>(
         return Ok(EditOutcome::Rejected(Rejected::NotEditable));
     }
     let ctx = store.write_context(&rp.thread_public_id, user.id).await?;
-    if ctx.thread_state == ThreadState::Locked {
+    if !matches!(ctx.thread_state, ThreadState::Visible | ThreadState::Pinned) {
         return Ok(EditOutcome::Rejected(Rejected::Locked));
     }
     // An unchanged body is not a duplicate of itself, so the duplicate check is skipped.

@@ -30,6 +30,18 @@ WHERE p.thread_id = (SELECT id FROM thread WHERE public_id = ?1) AND p.path > ?2
 ORDER BY p.path \
 LIMIT ?3";
 
+/// One post with its markdown, for the reply form's parent context and quoting.
+///
+/// Binds: `?1` = post public id.
+pub const POST_BY_ID: &str = "\
+SELECT p.id, p.public_id, p.thread_id, p.parent_id, p.path, p.depth, p.author_id, \
+u.name AS author_name, p.body_md, p.body_html, p.created_at, p.edited_at, p.score, p.state, \
+t.public_id AS thread_public_id \
+FROM post p \
+JOIN user u ON u.id = p.author_id \
+JOIN thread t ON t.id = p.thread_id \
+WHERE p.public_id = ?1";
+
 /// Binds: `?1` = post public id.
 pub const LOCATE_POST: &str = "\
 SELECT t.public_id AS thread_public_id, t.id AS thread_row_id, p.path AS post_path \
@@ -68,6 +80,8 @@ pub const POST_RANK: &str = "SELECT COUNT(*) AS rank FROM post WHERE thread_id =
 pub const PATH_AT_OFFSET: &str =
     "SELECT path FROM post WHERE thread_id = ?1 ORDER BY path LIMIT 1 OFFSET ?2";
 
+/// Pinned first, then most recently bumped. Locked threads are still listed: they can be read.
+///
 /// Binds: `?1` = limit.
 pub const RECENT_THREADS: &str = "\
 SELECT t.public_id, t.title, t.post_count, t.bumped_at, u.name AS author_name, \
@@ -75,8 +89,8 @@ s.name AS space_name, s.path AS space_path \
 FROM thread t \
 JOIN user u ON u.id = t.author_id \
 JOIN space s ON s.id = t.space_id \
-WHERE t.state = 'visible' \
-ORDER BY t.bumped_at DESC \
+WHERE t.state IN ('visible', 'pinned', 'locked') \
+ORDER BY (t.state = 'pinned') DESC, t.bumped_at DESC \
 LIMIT ?1";
 
 /// Thread-scoped, so a cross-thread parent is `NotFound` rather than a cross-thread path.
@@ -347,8 +361,8 @@ s.name AS space_name, s.path AS space_path \
 FROM thread t \
 JOIN user u ON u.id = t.author_id \
 JOIN space s ON s.id = t.space_id \
-WHERE t.space_path >= ?1 AND t.space_path < ?2 AND t.state = 'visible' \
-ORDER BY t.bumped_at DESC \
+WHERE t.space_path >= ?1 AND t.space_path < ?2 AND t.state IN ('visible', 'pinned', 'locked') \
+ORDER BY (t.state = 'pinned') DESC, t.bumped_at DESC \
 LIMIT ?3";
 
 /// Like `WRITE_CONTEXT` for a thread that does not exist yet: the space and the author.
@@ -453,3 +467,91 @@ WHERE t.token_hash = ?1 AND t.kind = ?2 AND t.used_at IS NULL AND t.expires_at >
 /// Binds: `?1` = user id, `?2` = kind, `?3` = now.
 pub const RETIRE_EMAIL_TOKENS: &str = "\
 UPDATE email_token SET used_at = ?3 WHERE user_id = ?1 AND kind = ?2 AND used_at IS NULL";
+
+// ---------------------------------------------------------------------------
+// Administration
+// ---------------------------------------------------------------------------
+
+/// The thread and its space, without posts; the `THREAD` select, reused by name.
+pub const THREAD_HEAD: &str = THREAD;
+
+/// Everything an admin may change, in one statement, with the page version bumped by the
+/// same statement so a retitle turns the cached page over.
+///
+/// Binds: `?1` public_id, `?2` title, `?3` url, `?4` state, `?5` space_id, `?6` space_path.
+pub const UPDATE_THREAD: &str = "\
+UPDATE thread SET title = ?2, url = ?3, state = ?4, space_id = ?5, space_path = ?6, \
+cache_version = cache_version + 1 \
+WHERE public_id = ?1";
+
+/// Binds: `?1` = user id, `?2` = role.
+pub const SET_USER_ROLE: &str = "UPDATE user SET role = ?2 WHERE id = ?1";
+
+/// Binds: `?1` = user id, `?2` = state.
+pub const SET_USER_STATE: &str = "UPDATE user SET state = ?2 WHERE id = ?1";
+
+/// Newest accounts first, optionally by name prefix. `?1 = ''` matches everyone.
+///
+/// Binds: `?1` = name prefix (already lowercase), `?2` = limit.
+pub const LIST_USERS: &str = "\
+SELECT u.id, u.name, u.state, u.role, u.created_at, u.email, \
+u.email_verified_at IS NOT NULL AS email_verified, \
+(SELECT COUNT(*) FROM post p WHERE p.author_id = u.id) AS post_count \
+FROM user u \
+WHERE ?1 = '' OR u.name LIKE ?1 || '%' \
+ORDER BY u.id DESC LIMIT ?2";
+
+/// Binds: `?1` = username, lowercase.
+pub const USER_ROW: &str = "\
+SELECT u.id, u.name, u.state, u.role, u.created_at, u.email, \
+u.email_verified_at IS NOT NULL AS email_verified, \
+(SELECT COUNT(*) FROM post p WHERE p.author_id = u.id) AS post_count \
+FROM user u WHERE u.name = ?1";
+
+/// Binds: `?1` = space id.
+pub const SPACE_DETAIL: &str = "\
+SELECT s.id, s.path, s.name, s.parent_id, s.ranking, s.depth_cap, s.config, \
+(SELECT COUNT(*) FROM thread t WHERE t.space_id = s.id) AS thread_count \
+FROM space s WHERE s.id = ?1";
+
+/// Every space, for the admin list and the move-thread menu.
+pub const ALL_SPACES: &str = "\
+SELECT s.id, s.path, s.name, s.parent_id, s.ranking, s.depth_cap, s.config, \
+(SELECT COUNT(*) FROM thread t WHERE t.space_id = s.id) AS thread_count \
+FROM space s ORDER BY s.path";
+
+/// A taken path trips `idx_space_path`, which adapters report as `Conflict`.
+///
+/// Binds: `?1` name, `?2` path, `?3` parent_id, `?4` ranking, `?5` depth_cap, `?6` config.
+pub const INSERT_SPACE: &str = "\
+INSERT INTO space (name, path, parent_id, ranking, depth_cap, config) \
+VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
+
+/// The key and parent are not editable here: they are the path, and threads carry it.
+///
+/// Binds: `?1` id, `?2` name, `?3` ranking, `?4` depth_cap, `?5` config.
+pub const UPDATE_SPACE: &str = "\
+UPDATE space SET name = ?2, ranking = ?3, depth_cap = ?4, config = ?5 WHERE id = ?1";
+
+/// One statement of subselects, so the dashboard costs one round trip.
+pub const SITE_STATS: &str = "\
+SELECT \
+(SELECT COUNT(*) FROM user) AS users, \
+(SELECT COUNT(*) FROM thread) AS threads, \
+(SELECT COUNT(*) FROM post) AS posts, \
+(SELECT COUNT(*) FROM post WHERE state = 'pending') AS pending_posts, \
+(SELECT COUNT(*) FROM review_item WHERE state = 'open') AS open_reviews, \
+(SELECT COUNT(*) FROM user WHERE state = 'banned') AS banned_users";
+
+/// The log with nothing held back, newest first.
+///
+/// Binds: `?1` = limit.
+pub const FULL_LOG: &str = "\
+SELECT a.id, a.actor_kind, a.actor_name, a.target_kind, a.target_id, a.action, a.created_at, \
+a.public, a.detail, \
+CASE a.target_kind \
+WHEN 'post' THEN (SELECT public_id FROM post WHERE id = a.target_id) \
+WHEN 'thread' THEN (SELECT public_id FROM thread WHERE id = a.target_id) \
+END AS target_public_id \
+FROM action_log a \
+ORDER BY a.created_at DESC, a.id DESC LIMIT ?1";

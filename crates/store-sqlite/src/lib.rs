@@ -10,8 +10,8 @@ use notespace_core::email::{ConsumedToken, EmailAddress, StoredToken, TokenKind}
 use notespace_core::id::PublicId;
 use notespace_core::model::*;
 use notespace_core::moderation::{
-    classify::Call, ActorKind, AgreementStats, Category, LogEntry, NewAction, NewReview, NewSignal,
-    ReportTally, Resolution, ReviewItem, ReviewPost, ReviewReason, WriteContext,
+    classify::Call, ActorKind, AgreementStats, Category, LogDetail, LogEntry, NewAction, NewReview,
+    NewSignal, ReportTally, Resolution, ReviewItem, ReviewPost, ReviewReason, WriteContext,
 };
 use notespace_core::path::Path;
 use notespace_core::ratelimit::{AttemptKeys, Attempts};
@@ -371,6 +371,156 @@ impl Store for SqliteStore {
             .map_err(backend)
     }
 
+    // -- Administration -------------------------------------------------------
+
+    async fn thread_head(&self, thread: &PublicId) -> StoreResult<(Space, Thread)> {
+        self.conn
+            .query_row(sql::THREAD_HEAD, [thread.as_str()], thread_from_row)
+            .optional()
+            .map_err(backend)?
+            .ok_or(StoreError::NotFound)
+    }
+
+    async fn update_thread(&self, thread: &PublicId, e: &ThreadEdit) -> StoreResult<()> {
+        let changed = self
+            .conn
+            .execute(
+                sql::UPDATE_THREAD,
+                rusqlite::params![
+                    thread.as_str(),
+                    e.title,
+                    e.url,
+                    e.state.as_str(),
+                    e.space_id,
+                    e.space_path
+                ],
+            )
+            .map_err(backend)?;
+        if changed == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn set_user_role(&self, user: UserId, role: Role) -> StoreResult<()> {
+        self.conn
+            .execute(sql::SET_USER_ROLE, rusqlite::params![user, role.as_str()])
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn set_user_state(&self, user: UserId, state: UserState) -> StoreResult<()> {
+        self.conn
+            .execute(sql::SET_USER_STATE, rusqlite::params![user, state.as_str()])
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn list_users(&self, prefix: &str, limit: u32) -> StoreResult<Vec<UserRow>> {
+        let mut stmt = self.conn.prepare_cached(sql::LIST_USERS).map_err(backend)?;
+        let rows = stmt
+            .query_map(rusqlite::params![prefix, limit], user_row_from_row)
+            .map_err(backend)?;
+        collect(rows, "user row")
+    }
+
+    async fn user_row(&self, name: &str) -> StoreResult<Option<UserRow>> {
+        self.conn
+            .query_row(sql::USER_ROW, [name], user_row_from_row)
+            .optional()
+            .map_err(backend)
+    }
+
+    async fn space_detail(&self, space: SpaceId) -> StoreResult<Option<SpaceDetail>> {
+        self.conn
+            .query_row(sql::SPACE_DETAIL, [space], space_detail_from_row)
+            .optional()
+            .map_err(backend)
+    }
+
+    async fn all_spaces(&self) -> StoreResult<Vec<SpaceDetail>> {
+        let mut stmt = self.conn.prepare_cached(sql::ALL_SPACES).map_err(backend)?;
+        let rows = stmt.query_map([], space_detail_from_row).map_err(backend)?;
+        collect(rows, "space row")
+    }
+
+    async fn create_space(&self, s: &NewSpace) -> StoreResult<SpaceId> {
+        match self.conn.execute(
+            sql::INSERT_SPACE,
+            rusqlite::params![
+                s.name,
+                s.path,
+                s.parent_id,
+                s.ranking.as_str(),
+                s.depth_cap as i64,
+                s.config
+            ],
+        ) {
+            Ok(_) => Ok(self.conn.last_insert_rowid()),
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+            {
+                Err(StoreError::Conflict)
+            }
+            Err(e) => Err(backend(e)),
+        }
+    }
+
+    async fn update_space(
+        &self,
+        space: SpaceId,
+        name: &str,
+        ranking: Ranking,
+        depth_cap: u32,
+        config: &str,
+    ) -> StoreResult<()> {
+        self.conn
+            .execute(
+                sql::UPDATE_SPACE,
+                rusqlite::params![space, name, ranking.as_str(), depth_cap as i64, config],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn site_stats(&self) -> StoreResult<SiteStats> {
+        self.conn
+            .query_row(sql::SITE_STATS, [], |r| {
+                Ok(SiteStats {
+                    users: r.get::<_, i64>("users")? as u32,
+                    threads: r.get::<_, i64>("threads")? as u32,
+                    posts: r.get::<_, i64>("posts")? as u32,
+                    pending_posts: r.get::<_, i64>("pending_posts")? as u32,
+                    open_reviews: r.get::<_, i64>("open_reviews")? as u32,
+                    banned_users: r.get::<_, i64>("banned_users")? as u32,
+                })
+            })
+            .map_err(backend)
+    }
+
+    async fn full_log(&self, limit: u32) -> StoreResult<Vec<LogDetail>> {
+        let mut stmt = self.conn.prepare_cached(sql::FULL_LOG).map_err(backend)?;
+        let rows = stmt
+            .query_map([limit], |r| {
+                let target: Option<String> = r.get("target_public_id")?;
+                Ok(LogDetail {
+                    entry: LogEntry {
+                        id: r.get("id")?,
+                        actor_kind: ActorKind::parse(&r.get::<_, String>("actor_kind")?),
+                        actor_name: r.get("actor_name")?,
+                        target_kind: r.get("target_kind")?,
+                        target_public_id: target.and_then(|t| PublicId::parse(&t).ok()),
+                        action: r.get("action")?,
+                        created_at: r.get("created_at")?,
+                    },
+                    public: r.get::<_, i64>("public")? != 0,
+                    detail: r.get("detail")?,
+                })
+            })
+            .map_err(backend)?;
+        collect(rows, "log row")
+    }
+
     async fn retire_email_tokens(
         &self,
         user: UserId,
@@ -385,6 +535,18 @@ impl Store for SqliteStore {
             )
             .map_err(backend)?;
         Ok(n as u32)
+    }
+
+    async fn post_by_id(&self, post: &PublicId) -> StoreResult<(Post, PublicId)> {
+        self.conn
+            .query_row(sql::POST_BY_ID, [post.as_str()], |r| {
+                let mut p = post_from_row(r)?;
+                p.body_md = Some(r.get("body_md")?);
+                Ok((p, parse_id(r, "thread_public_id")?))
+            })
+            .optional()
+            .map_err(backend)?
+            .ok_or(StoreError::NotFound)
     }
 
     async fn thread_version(&self, thread: &PublicId) -> StoreResult<Option<i64>> {
@@ -1049,6 +1211,26 @@ fn space_from_row(r: &Row<'_>) -> rusqlite::Result<Space> {
         parent_id: r.get("parent_id")?,
         ranking: parse_enum(&r.get::<_, String>("ranking")?),
         depth_cap: r.get::<_, i64>("depth_cap")? as u32,
+    })
+}
+
+/// One row of `sql::LIST_USERS` / `sql::USER_ROW`.
+fn user_row_from_row(r: &Row<'_>) -> rusqlite::Result<UserRow> {
+    Ok(UserRow {
+        user: user_from_row(r)?,
+        created_at: r.get("created_at")?,
+        email: r.get("email")?,
+        email_verified: r.get::<_, i64>("email_verified")? != 0,
+        post_count: r.get::<_, i64>("post_count")? as u32,
+    })
+}
+
+/// One row of `sql::SPACE_DETAIL` / `sql::ALL_SPACES`.
+fn space_detail_from_row(r: &Row<'_>) -> rusqlite::Result<SpaceDetail> {
+    Ok(SpaceDetail {
+        space: space_from_row(r)?,
+        config: r.get("config")?,
+        thread_count: r.get::<_, i64>("thread_count")? as u32,
     })
 }
 

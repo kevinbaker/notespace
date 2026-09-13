@@ -5,7 +5,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use notespace_core::account::{self, ConfirmOutcome, Delivery};
-use notespace_core::email::{EmailToken, TokenKind};
+use notespace_core::email::EmailToken;
 use notespace_core::store::Store;
 use notespace_render::account::{SettingsError, SettingsNotice, VerifyOutcome};
 use serde::Deserialize;
@@ -258,6 +258,7 @@ mod passwords {
         ChangeOutcome, PasswordChange, RecoveryConfig, RequestOutcome, ResetCompletion,
         ResetOutcome, ResetRequest,
     };
+    use notespace_core::email::TokenKind;
     use notespace_core::ratelimit::Limit;
     use notespace_render::account::{ForgotError, ResetError};
 

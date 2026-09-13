@@ -6,12 +6,13 @@
 use crate::email::{ConsumedToken, StoredToken, TokenKind};
 use crate::id::PublicId;
 use crate::model::{
-    Account, NewPost, NewThread, Post, PostState, Profile, SanitizedHtml, Space, SpaceId, Thread,
-    ThreadPage, ThreadSummary, Timestamp, User, UserId,
+    Account, NewPost, NewSpace, NewThread, Post, PostState, Profile, Role, SanitizedHtml,
+    SiteStats, Space, SpaceDetail, SpaceId, Thread, ThreadEdit, ThreadPage, ThreadSummary,
+    Timestamp, User, UserId, UserRow, UserState,
 };
 use crate::moderation::{
-    AgreementStats, LogEntry, NewAction, NewReview, NewSignal, ReportTally, Resolution, ReviewItem,
-    ReviewPost, WriteContext,
+    AgreementStats, LogDetail, LogEntry, NewAction, NewReview, NewSignal, ReportTally, Resolution,
+    ReviewItem, ReviewPost, WriteContext,
 };
 use crate::path::Path;
 use crate::ratelimit::{AttemptKeys, Attempts};
@@ -92,6 +93,9 @@ pub trait Store {
     ///
     /// **Budget: 3 statements**, index-only.
     async fn locate_post(&self, post: &PublicId, page_size: u32) -> StoreResult<PostLocation>;
+
+    /// One post with `body_md` loaded, and the public id of its thread. **Budget: 1 statement.**
+    async fn post_by_id(&self, post: &PublicId) -> StoreResult<(Post, PublicId)>;
 
     /// **Budget: 1 statement.**
     async fn recent_threads(&self, limit: u32) -> StoreResult<Vec<ThreadSummary>>;
@@ -313,6 +317,52 @@ pub trait Store {
         kind: TokenKind,
         now: Timestamp,
     ) -> StoreResult<u32>;
+
+    // -- Administration -------------------------------------------------------
+
+    /// The thread and its space, no posts. **Budget: 1 statement.**
+    async fn thread_head(&self, thread: &PublicId) -> StoreResult<(Space, Thread)>;
+
+    /// Rewrite what an admin may change, bumping the page version. `NotFound` for an absent
+    /// thread. **Budget: 1 statement.**
+    async fn update_thread(&self, thread: &PublicId, edit: &ThreadEdit) -> StoreResult<()>;
+
+    /// **Budget: 1 statement.**
+    async fn set_user_role(&self, user: UserId, role: Role) -> StoreResult<()>;
+
+    /// The state only; revoking sessions is the caller's step. **Budget: 1 statement.**
+    async fn set_user_state(&self, user: UserId, state: UserState) -> StoreResult<()>;
+
+    /// Newest first, optionally by name prefix. **Budget: 1 statement.**
+    async fn list_users(&self, prefix: &str, limit: u32) -> StoreResult<Vec<UserRow>>;
+
+    /// **Budget: 1 statement.**
+    async fn user_row(&self, name: &str) -> StoreResult<Option<UserRow>>;
+
+    /// **Budget: 1 statement.**
+    async fn space_detail(&self, space: SpaceId) -> StoreResult<Option<SpaceDetail>>;
+
+    /// Every space, in path order. **Budget: 1 statement.**
+    async fn all_spaces(&self) -> StoreResult<Vec<SpaceDetail>>;
+
+    /// A taken path is a [`StoreError::Conflict`]. **Budget: 1 statement.**
+    async fn create_space(&self, space: &NewSpace) -> StoreResult<SpaceId>;
+
+    /// Name, ranking, depth cap and config; the path is not editable. **Budget: 1 statement.**
+    async fn update_space(
+        &self,
+        space: SpaceId,
+        name: &str,
+        ranking: crate::model::Ranking,
+        depth_cap: u32,
+        config: &str,
+    ) -> StoreResult<()>;
+
+    /// **Budget: 1 statement.**
+    async fn site_stats(&self) -> StoreResult<SiteStats>;
+
+    /// The log with private rows and detail, newest first. **Budget: 1 statement.**
+    async fn full_log(&self, limit: u32) -> StoreResult<Vec<LogDetail>>;
 }
 
 /// `password_hash` is `None` for an account with no local credential. Reached after hashing, so

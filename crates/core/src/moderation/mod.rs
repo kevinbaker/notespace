@@ -15,7 +15,7 @@ use crate::id::PublicId;
 use crate::model::{PostId, SpaceId, Timestamp, UserId};
 use serde::{Deserialize, Serialize};
 
-pub use classify::{ClassifyError, ClassifyInput, Classifier, Verdict};
+pub use classify::{Classifier, ClassifyError, ClassifyInput, Verdict};
 pub use heuristics::{Reason, Signals, Triage};
 pub use layers::Layered;
 pub use pipeline::{ModerationQueue, NoQueue};
@@ -171,6 +171,14 @@ pub struct LogEntry {
     pub target_public_id: Option<PublicId>,
     pub action: String,
     pub created_at: Timestamp,
+}
+
+/// A row of the full log, for the admin page: the public row plus what it hides.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogDetail {
+    pub entry: LogEntry,
+    pub public: bool,
+    pub detail: String,
 }
 
 /// Why a post is in the queue.
@@ -342,17 +350,31 @@ mod tests {
         for c in Category::ALL {
             assert_eq!(Category::parse(c.as_str()), Some(c), "{c:?}");
             let via_serde = serde_json::to_string(&c).unwrap();
-            assert_eq!(via_serde.trim_matches('"'), c.as_str(), "serde disagrees for {c:?}");
+            assert_eq!(
+                via_serde.trim_matches('"'),
+                c.as_str(),
+                "serde disagrees for {c:?}"
+            );
         }
     }
 
     #[test]
     fn category_parsing_is_lenient_about_spelling_but_not_meaning() {
-        assert_eq!(Category::parse("Sexual Content"), Some(Category::SexualContent));
+        assert_eq!(
+            Category::parse("Sexual Content"),
+            Some(Category::SexualContent)
+        );
         assert_eq!(Category::parse("SELF-HARM"), Some(Category::SelfHarm));
         assert_eq!(Category::parse("hate speech"), Some(Category::Hate));
-        assert_eq!(Category::parse("prompt injection"), Some(Category::Manipulation));
-        assert_eq!(Category::parse("banana"), None, "unknown labels are dropped, not Other");
+        assert_eq!(
+            Category::parse("prompt injection"),
+            Some(Category::Manipulation)
+        );
+        assert_eq!(
+            Category::parse("banana"),
+            None,
+            "unknown labels are dropped, not Other"
+        );
         assert_eq!(Category::parse(""), None);
     }
 

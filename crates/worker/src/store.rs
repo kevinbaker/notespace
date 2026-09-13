@@ -6,8 +6,8 @@ use notespace_core::email::{ConsumedToken, EmailAddress, StoredToken, TokenKind}
 use notespace_core::id::PublicId;
 use notespace_core::model::*;
 use notespace_core::moderation::{
-    classify::Call, ActorKind, AgreementStats, Category, LogEntry, NewAction, NewReview, NewSignal,
-    ReportTally, Resolution, ReviewItem, ReviewPost, ReviewReason, WriteContext,
+    classify::Call, ActorKind, AgreementStats, Category, LogDetail, LogEntry, NewAction, NewReview,
+    NewSignal, ReportTally, Resolution, ReviewItem, ReviewPost, ReviewReason, WriteContext,
 };
 use notespace_core::path::Path;
 use notespace_core::ratelimit::{AttemptKeys, Attempts};
@@ -68,6 +68,39 @@ struct ThreadRow {
     space_depth_cap: i64,
 }
 
+fn thread_from_row(tr: ThreadRow) -> StoreResult<(Space, Thread)> {
+    let space = Space {
+        id: tr.space_id,
+        path: tr.space_path,
+        name: tr.space_name,
+        parent_id: None,
+        ranking: ranking(&tr.space_ranking),
+        depth_cap: tr.space_depth_cap.clamp(0, i64::from(u32::MAX)) as u32,
+    };
+    let t = Thread {
+        id: tr.id,
+        // Re-parsed rather than reusing the request's id, so a corrupt row says so.
+        public_id: PublicId::parse(&tr.public_id).map_err(|e| {
+            StoreError::Corrupt(format!(
+                "thread {} has invalid public_id {:?}: {e}",
+                tr.id, tr.public_id
+            ))
+        })?,
+        space_id: tr.space_id,
+        kind: thread_kind(&tr.kind),
+        title: tr.title,
+        url: tr.url,
+        author_id: tr.author_id,
+        author_name: tr.author_name,
+        created_at: tr.created_at,
+        bumped_at: tr.bumped_at,
+        post_count: tr.post_count.max(0) as u32,
+        state: thread_state(&tr.state),
+        cache_version: tr.cache_version,
+    };
+    Ok((space, t))
+}
+
 #[derive(Deserialize)]
 struct ThreadSummaryRow {
     public_id: String,
@@ -90,7 +123,7 @@ struct SpaceRow {
 }
 
 #[derive(Deserialize)]
-struct UserRow {
+struct PlainUserRow {
     id: i64,
     name: String,
     state: String,
@@ -120,6 +153,53 @@ struct AccountRow {
     email: Option<String>,
     email_verified_at: Option<i64>,
     has_password: i64,
+}
+
+#[derive(Deserialize)]
+struct UserListRow {
+    id: i64,
+    name: String,
+    state: String,
+    role: String,
+    created_at: i64,
+    email: Option<String>,
+    email_verified: i64,
+    post_count: i64,
+}
+
+#[derive(Deserialize)]
+struct SpaceDetailRow {
+    id: i64,
+    path: String,
+    name: String,
+    parent_id: Option<i64>,
+    ranking: String,
+    depth_cap: i64,
+    config: String,
+    thread_count: i64,
+}
+
+#[derive(Deserialize)]
+struct StatsRow {
+    users: i64,
+    threads: i64,
+    posts: i64,
+    pending_posts: i64,
+    open_reviews: i64,
+    banned_users: i64,
+}
+
+#[derive(Deserialize)]
+struct FullLogRow {
+    id: i64,
+    actor_kind: String,
+    actor_name: String,
+    target_kind: String,
+    target_public_id: Option<String>,
+    action: String,
+    created_at: i64,
+    public: i64,
+    detail: String,
 }
 
 #[derive(Deserialize)]
@@ -255,7 +335,7 @@ fn space_from_row(r: SpaceRow) -> Space {
     }
 }
 
-fn user_from_row(r: UserRow) -> User {
+fn user_from_row(r: PlainUserRow) -> User {
     User {
         id: r.id,
         name: r.name,
@@ -281,6 +361,36 @@ fn write_error(e: impl std::fmt::Display) -> StoreError {
         StoreError::Conflict
     } else {
         StoreError::Backend(msg)
+    }
+}
+
+fn user_row_from_row(r: UserListRow) -> UserRow {
+    UserRow {
+        user: User {
+            id: r.id,
+            name: r.name,
+            state: r.state.parse().unwrap_or_default(),
+            role: r.role.parse().unwrap_or_default(),
+        },
+        created_at: r.created_at,
+        email: r.email,
+        email_verified: r.email_verified != 0,
+        post_count: r.post_count.max(0) as u32,
+    }
+}
+
+fn space_detail_from_row(r: SpaceDetailRow) -> SpaceDetail {
+    SpaceDetail {
+        space: Space {
+            id: r.id,
+            path: r.path,
+            name: r.name,
+            parent_id: r.parent_id,
+            ranking: ranking(&r.ranking),
+            depth_cap: r.depth_cap.clamp(0, i64::from(u32::MAX)) as u32,
+        },
+        config: r.config,
+        thread_count: r.thread_count.max(0) as u32,
     }
 }
 
@@ -394,6 +504,14 @@ fn post_from_row(r: PostRow) -> StoreResult<Post> {
         score: r.score,
         state: post_state(&r.state),
     })
+}
+
+#[derive(Deserialize)]
+struct PostWithSourceRow {
+    #[serde(flatten)]
+    post: PostRow,
+    body_md: String,
+    thread_public_id: String,
 }
 
 #[derive(Deserialize)]
@@ -780,37 +898,7 @@ impl D1Store {
 
         let thread_rows: Vec<ThreadRow> = thread_res.results().map_err(backend)?;
         let tr = thread_rows.into_iter().next().ok_or(StoreError::NotFound)?;
-
-        let space = Space {
-            id: tr.space_id,
-            path: tr.space_path,
-            name: tr.space_name,
-            parent_id: None,
-            ranking: ranking(&tr.space_ranking),
-            depth_cap: tr.space_depth_cap.clamp(0, i64::from(u32::MAX)) as u32,
-        };
-
-        let t = Thread {
-            id: tr.id,
-            // Re-parsed rather than reusing the request's id, so a corrupt row says so.
-            public_id: PublicId::parse(&tr.public_id).map_err(|e| {
-                StoreError::Corrupt(format!(
-                    "thread {} has invalid public_id {:?}: {e}",
-                    tr.id, tr.public_id
-                ))
-            })?,
-            space_id: tr.space_id,
-            kind: thread_kind(&tr.kind),
-            title: tr.title,
-            url: tr.url,
-            author_id: tr.author_id,
-            author_name: tr.author_name,
-            created_at: tr.created_at,
-            bumped_at: tr.bumped_at,
-            post_count: tr.post_count.max(0) as u32,
-            state: thread_state(&tr.state),
-            cache_version: tr.cache_version,
-        };
+        let (space, t) = thread_from_row(tr)?;
 
         let mut rows: Vec<PostRow> = posts_res.results().map_err(backend)?;
 
@@ -1024,7 +1112,7 @@ impl Store for D1Store {
     }
 
     async fn user_by_verified_email(&self, email: &str) -> StoreResult<Option<User>> {
-        let rows: Vec<UserRow> = self
+        let rows: Vec<PlainUserRow> = self
             .query(sql::USER_BY_VERIFIED_EMAIL, vec![email.into()])
             .await?;
         Ok(rows.into_iter().next().map(user_from_row))
@@ -1116,6 +1204,159 @@ impl Store for D1Store {
         Ok(rows.into_iter().next().map(|r| r.name))
     }
 
+    // -- Administration -------------------------------------------------------
+
+    async fn thread_head(&self, thread: &PublicId) -> StoreResult<(Space, Thread)> {
+        let rows: Vec<ThreadRow> = self
+            .query(sql::THREAD_HEAD, vec![thread.as_str().into()])
+            .await?;
+        rows.into_iter()
+            .next()
+            .ok_or(StoreError::NotFound)
+            .and_then(thread_from_row)
+    }
+
+    async fn update_thread(&self, thread: &PublicId, e: &ThreadEdit) -> StoreResult<()> {
+        let changed = self
+            .run(
+                sql::UPDATE_THREAD,
+                vec![
+                    thread.as_str().into(),
+                    e.title.as_str().into(),
+                    opt_str(e.url.as_deref()),
+                    e.state.as_str().into(),
+                    num(e.space_id),
+                    e.space_path.as_str().into(),
+                ],
+            )
+            .await?
+            .unwrap_or(0);
+        if changed == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn set_user_role(&self, user: UserId, role: Role) -> StoreResult<()> {
+        self.run(sql::SET_USER_ROLE, vec![num(user), role.as_str().into()])
+            .await
+            .map(|_| ())
+    }
+
+    async fn set_user_state(&self, user: UserId, state: UserState) -> StoreResult<()> {
+        self.run(sql::SET_USER_STATE, vec![num(user), state.as_str().into()])
+            .await
+            .map(|_| ())
+    }
+
+    async fn list_users(&self, prefix: &str, limit: u32) -> StoreResult<Vec<UserRow>> {
+        let rows: Vec<UserListRow> = self
+            .query(sql::LIST_USERS, vec![prefix.into(), num(limit as i64)])
+            .await?;
+        Ok(rows.into_iter().map(user_row_from_row).collect())
+    }
+
+    async fn user_row(&self, name: &str) -> StoreResult<Option<UserRow>> {
+        let rows: Vec<UserListRow> = self.query(sql::USER_ROW, vec![name.into()]).await?;
+        Ok(rows.into_iter().next().map(user_row_from_row))
+    }
+
+    async fn space_detail(&self, space: SpaceId) -> StoreResult<Option<SpaceDetail>> {
+        let rows: Vec<SpaceDetailRow> = self.query(sql::SPACE_DETAIL, vec![num(space)]).await?;
+        Ok(rows.into_iter().next().map(space_detail_from_row))
+    }
+
+    async fn all_spaces(&self) -> StoreResult<Vec<SpaceDetail>> {
+        let rows: Vec<SpaceDetailRow> = self.query(sql::ALL_SPACES, vec![]).await?;
+        Ok(rows.into_iter().map(space_detail_from_row).collect())
+    }
+
+    async fn create_space(&self, s: &NewSpace) -> StoreResult<SpaceId> {
+        let res = self
+            .db
+            .prepare(sql::INSERT_SPACE)
+            .bind(&[
+                s.name.as_str().into(),
+                s.path.as_str().into(),
+                match s.parent_id {
+                    Some(id) => num(id),
+                    None => worker::wasm_bindgen::JsValue::NULL,
+                },
+                s.ranking.as_str().into(),
+                num(s.depth_cap as i64),
+                s.config.as_str().into(),
+            ])
+            .map_err(backend)?
+            .run()
+            .await
+            .map_err(write_error)?;
+        self.last_stats.set(collect_stats(&[&res]));
+        res.meta()
+            .ok()
+            .flatten()
+            .and_then(|m| m.last_row_id)
+            .ok_or_else(|| StoreError::Backend("insert reported no row id".into()))
+    }
+
+    async fn update_space(
+        &self,
+        space: SpaceId,
+        name: &str,
+        ranking: Ranking,
+        depth_cap: u32,
+        config: &str,
+    ) -> StoreResult<()> {
+        self.run(
+            sql::UPDATE_SPACE,
+            vec![
+                num(space),
+                name.into(),
+                ranking.as_str().into(),
+                num(depth_cap as i64),
+                config.into(),
+            ],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn site_stats(&self) -> StoreResult<SiteStats> {
+        let rows: Vec<StatsRow> = self.query(sql::SITE_STATS, vec![]).await?;
+        let r = rows.into_iter().next().ok_or(StoreError::NotFound)?;
+        let n = |v: i64| v.max(0) as u32;
+        Ok(SiteStats {
+            users: n(r.users),
+            threads: n(r.threads),
+            posts: n(r.posts),
+            pending_posts: n(r.pending_posts),
+            open_reviews: n(r.open_reviews),
+            banned_users: n(r.banned_users),
+        })
+    }
+
+    async fn full_log(&self, limit: u32) -> StoreResult<Vec<LogDetail>> {
+        let rows: Vec<FullLogRow> = self.query(sql::FULL_LOG, vec![num(limit as i64)]).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| LogDetail {
+                entry: LogEntry {
+                    id: r.id,
+                    actor_kind: ActorKind::parse(&r.actor_kind),
+                    actor_name: r.actor_name,
+                    target_kind: r.target_kind,
+                    target_public_id: r
+                        .target_public_id
+                        .as_deref()
+                        .and_then(|t| PublicId::parse(t).ok()),
+                    action: r.action,
+                    created_at: r.created_at,
+                },
+                public: r.public != 0,
+                detail: r.detail,
+            })
+            .collect())
+    }
+
     async fn retire_email_tokens(
         &self,
         user: UserId,
@@ -1129,6 +1370,16 @@ impl Store for D1Store {
             )
             .await?
             .unwrap_or(0))
+    }
+
+    async fn post_by_id(&self, post: &PublicId) -> StoreResult<(Post, PublicId)> {
+        let rows: Vec<PostWithSourceRow> = self
+            .query(sql::POST_BY_ID, vec![post.as_str().into()])
+            .await?;
+        let r = rows.into_iter().next().ok_or(StoreError::NotFound)?;
+        let mut p = post_from_row(r.post)?;
+        p.body_md = Some(r.body_md);
+        Ok((p, parse_id(&r.thread_public_id, "thread public_id")?))
     }
 
     async fn thread_version(&self, thread: &PublicId) -> StoreResult<Option<i64>> {
@@ -1172,7 +1423,7 @@ impl Store for D1Store {
     }
 
     async fn user_by_id(&self, id: UserId) -> StoreResult<Option<User>> {
-        let rows: Vec<UserRow> = self.query(sql::USER_BY_ID, vec![num(id)]).await?;
+        let rows: Vec<PlainUserRow> = self.query(sql::USER_BY_ID, vec![num(id)]).await?;
         Ok(rows.into_iter().next().map(user_from_row))
     }
 

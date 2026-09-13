@@ -61,7 +61,8 @@ pub fn queue_page(items: &[ReviewItem], csrf: &str, notice: Option<QueueNotice>)
                 main class="auth wide" {
                     h1 { "Review queue" }
                     p class="muted" {
-                        (items.len()) " waiting · " a href="/modlog" { "public log" } " · " a href="/" { "home" }
+                        (items.len()) " waiting · " a href="/admin" { "admin" } " · "
+                        a href="/modlog" { "public log" } " · " a href="/" { "home" }
                     }
                     @if let Some(n) = notice {
                         p class="notice" role="status" { (n.message()) }
@@ -77,6 +78,7 @@ pub fn queue_page(items: &[ReviewItem], csrf: &str, notice: Option<QueueNotice>)
                                 " · in " a href={ "/t/" (item.thread_public_id) } { (item.thread_title) }
                                 " · by " a href={ "/u/" (item.author_name) } { (item.author_name) }
                                 " · " a href={ "/p/" (item.post_public_id) } { "permalink" }
+                                " · " a href={ "/admin/thread/" (item.thread_public_id) "#p" (item.post_public_id) } { "admin" }
                             }
                             // Sanitized at write time, like the thread page.
                             div class="post-body" { (PreEscaped(&item.body_html)) }

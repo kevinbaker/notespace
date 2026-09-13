@@ -119,6 +119,12 @@ impl maud::Render for PreEscapedStyle {
              textarea{width:100%;padding:.5rem;font:inherit;border:1px solid #ccc;\
              border-radius:4px;resize:vertical}\
              .muted{color:#666;font-size:.9rem}\
+             blockquote.parent{margin:1rem 0;padding:.5rem .9rem;border-left:3px solid #ccc;\
+             background:rgba(128,128,128,.08);border-radius:0 4px 4px 0}\
+             blockquote.parent .post-body{margin:.25rem 0}\
+             .parent-actions{margin:.25rem 0 0}\
+             button.quote{width:auto;margin:0 0 0 .5rem;padding:.15rem .5rem;font-size:.85rem;\
+             background:none;color:inherit;border:1px solid #ccc}\
              button{margin-top:1.25rem;width:100%;padding:.6rem;font-size:1rem;border:0;\
              border-radius:4px;background:#1a1a1a;color:#fff;cursor:pointer}\
              .error{background:#fdecea;border:1px solid #f5c2c0;padding:.6rem .75rem;\
@@ -186,15 +192,44 @@ impl ReplyError {
     }
 }
 
+/// What the reply is to: the post, or the thread when it is a top-level reply.
+pub struct ReplyTarget<'a> {
+    pub thread_title: &'a str,
+    /// `None` for a top-level reply.
+    pub parent: Option<ParentPost<'a>>,
+}
+
+pub struct ParentPost<'a> {
+    pub public_id: &'a str,
+    pub author_name: &'a str,
+    /// Sanitized at write time, like the thread page.
+    pub body_html: &'a str,
+}
+
+/// `body_md` as a markdown quote, for prefilling a reply.
+pub fn quoted(body_md: &str) -> String {
+    let mut out = String::with_capacity(body_md.len() + 64);
+    for line in body_md.trim().lines() {
+        out.push_str("> ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push('\n');
+    out
+}
+
 /// On its own page, because the baked thread page is shared byte-for-byte and cannot carry a
-/// per-visitor CSRF token. `draft` is echoed back so a rejected reply is not lost.
+/// per-visitor CSRF token. `draft` is echoed back so a rejected reply is not lost. The parent
+/// is shown above the form, with a no-JS "quote it all" link; `/static/reply.js` adds a
+/// "quote selection" button when it runs.
 pub fn reply_page(
     csrf: &str,
     thread: &str,
-    parent: Option<&str>,
+    target: &ReplyTarget<'_>,
     draft: &str,
     error: Option<ReplyError>,
 ) -> Markup {
+    let parent = target.parent.as_ref();
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -207,14 +242,32 @@ pub fn reply_page(
             }
             body {
                 main class="auth wide" {
-                    h1 { "Reply" }
+                    h1 {
+                        @match parent {
+                            Some(p) => { "Reply to " (p.author_name) },
+                            None => "Reply to the thread",
+                        }
+                    }
+                    p class="muted" {
+                        "in " a href={ "/t/" (thread) } { (target.thread_title) }
+                    }
+                    @if let Some(p) = parent {
+                        blockquote class="parent" id="parent" {
+                            div class="post-body" { (maud::PreEscaped(p.body_html)) }
+                            p class="muted parent-actions" {
+                                a href={ "/p/" (p.public_id) } { "permalink" }
+                                " · "
+                                a href={ "/t/" (thread) "/reply?parent=" (p.public_id) "&quote=1" } { "quote it all" }
+                            }
+                        }
+                    }
                     @if let Some(e) = error {
                         p class="error" role="alert" { (e.message()) }
                     }
                     form method="post" action={ "/t/" (thread) "/reply" } {
                         input type="hidden" name="csrf" value=(csrf);
                         @if let Some(p) = parent {
-                            input type="hidden" name="parent" value=(p);
+                            input type="hidden" name="parent" value=(p.public_id);
                         }
                         label for="body" { "Your reply" }
                         textarea id="body" name="body" rows="10" required
@@ -224,6 +277,9 @@ pub fn reply_page(
                     p class="muted" {
                         a href={ "/t/" (thread) } { "Back to the thread" }
                     }
+                }
+                @if parent.is_some() {
+                    script defer src="/static/reply.js" {}
                 }
             }
         }
@@ -357,5 +413,52 @@ pub fn held_page(thread: &str, post: &str) -> Markup {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::*;
+
+    #[test]
+    fn a_quote_prefixes_every_line_and_ends_with_a_blank_one() {
+        assert_eq!(quoted("one\ntwo"), "> one\n> two\n\n");
+        assert_eq!(quoted("  padded  \n"), "> padded\n\n");
+    }
+
+    #[test]
+    fn the_parent_is_shown_and_the_script_loads_only_with_one() {
+        let with = reply_page(
+            "tok",
+            "abc",
+            &ReplyTarget {
+                thread_title: "T",
+                parent: Some(ParentPost {
+                    public_id: "p1",
+                    author_name: "alice",
+                    body_html: "<p>hi</p>",
+                }),
+            },
+            "",
+            None,
+        )
+        .into_string();
+        assert!(with.contains("Reply to alice"));
+        assert!(with.contains("<p>hi</p>"));
+        assert!(with.contains("quote=1"));
+        assert!(with.contains("/static/reply.js"));
+        let without = reply_page(
+            "tok",
+            "abc",
+            &ReplyTarget {
+                thread_title: "T",
+                parent: None,
+            },
+            "",
+            None,
+        )
+        .into_string();
+        assert!(without.contains("Reply to the thread"));
+        assert!(!without.contains("reply.js"));
     }
 }

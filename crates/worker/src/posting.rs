@@ -374,7 +374,7 @@ pub async fn delete_submit(
     // The bootstrap moderator list counts here as it does in review.
     let mut actor = signed.user.clone();
     if crate::can_moderate(&env, &actor) && !actor.role.can_moderate() {
-        actor.role = notespace_core::model::Role::Moderator;
+        actor.role = notespace_core::model::Role::Admin;
     }
     match edit::delete(&signed.store, &post, &actor, now_ms()).await {
         Ok(DeleteOutcome::Deleted) => see_other(format!("/p/{canonical}")),

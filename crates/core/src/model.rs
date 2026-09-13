@@ -145,9 +145,71 @@ pub enum Role {
 }
 
 impl Role {
-    /// Whether this role may work the review queue and act on posts.
+    /// Whether this role may work the review queue and act on posts, threads and accounts.
     pub fn can_moderate(&self) -> bool {
         matches!(self, Role::Moderator | Role::Admin)
+    }
+
+    /// Whether this role may change roles and spaces: the things that decide who moderates.
+    pub fn is_admin(&self) -> bool {
+        matches!(self, Role::Admin)
+    }
+
+    pub fn parse(s: &str) -> Option<Role> {
+        match s {
+            "member" => Some(Role::Member),
+            "moderator" => Some(Role::Moderator),
+            "admin" => Some(Role::Admin),
+            _ => None,
+        }
+    }
+}
+
+impl UserState {
+    pub fn parse(s: &str) -> Option<UserState> {
+        match s {
+            "active" => Some(UserState::Active),
+            "deleted" => Some(UserState::Deleted),
+            "banned" => Some(UserState::Banned),
+            _ => None,
+        }
+    }
+}
+
+impl ThreadState {
+    pub fn parse(s: &str) -> Option<ThreadState> {
+        match s {
+            "visible" => Some(ThreadState::Visible),
+            "locked" => Some(ThreadState::Locked),
+            "pinned" => Some(ThreadState::Pinned),
+            "hidden" => Some(ThreadState::Hidden),
+            "deleted" => Some(ThreadState::Deleted),
+            _ => None,
+        }
+    }
+}
+
+impl PostState {
+    pub fn parse(s: &str) -> Option<PostState> {
+        match s {
+            "visible" => Some(PostState::Visible),
+            "pending" => Some(PostState::Pending),
+            "hidden" => Some(PostState::Hidden),
+            "deleted" => Some(PostState::Deleted),
+            _ => None,
+        }
+    }
+}
+
+impl Ranking {
+    pub fn parse(s: &str) -> Option<Ranking> {
+        match s {
+            "bump" => Some(Ranking::Bump),
+            "gravity" => Some(Ranking::Gravity),
+            "best" => Some(Ranking::Best),
+            "score_threshold" => Some(Ranking::ScoreThreshold),
+            _ => None,
+        }
     }
 }
 
@@ -219,6 +281,58 @@ pub struct ProfilePost {
     pub thread_title: String,
     pub body_html: String,
     pub created_at: Timestamp,
+}
+
+/// A user as the admin pages list them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserRow {
+    pub user: User,
+    pub created_at: Timestamp,
+    pub email: Option<String>,
+    pub email_verified: bool,
+    pub post_count: u32,
+}
+
+/// A space with what the admin form edits and the list shows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpaceDetail {
+    pub space: Space,
+    /// Raw JSON, `{}` when nothing is set.
+    pub config: String,
+    pub thread_count: u32,
+}
+
+/// A space to create. `path` is the stored form, trailing separator included.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewSpace {
+    pub name: String,
+    pub path: String,
+    pub parent_id: Option<SpaceId>,
+    pub ranking: Ranking,
+    pub depth_cap: u32,
+    pub config: String,
+}
+
+/// What an admin may change on a thread. Everything, or nothing, in one statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadEdit {
+    pub title: String,
+    pub url: Option<String>,
+    pub state: ThreadState,
+    pub space_id: SpaceId,
+    /// The new space's stored path, kept in step on the thread for listings.
+    pub space_path: String,
+}
+
+/// The numbers on the admin dashboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SiteStats {
+    pub users: u32,
+    pub threads: u32,
+    pub posts: u32,
+    pub pending_posts: u32,
+    pub open_reviews: u32,
+    pub banned_users: u32,
 }
 
 /// What the account's own settings page needs and nothing else reads.

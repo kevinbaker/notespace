@@ -2,6 +2,7 @@
 //! afford to be expensive, and [`page`] on a cold read, assembling already-rendered fragments.
 
 pub mod account;
+pub mod admin;
 pub mod auth;
 pub mod compose;
 pub mod feed;

@@ -3,7 +3,7 @@
 //! rendered and in preorder, so this is one linear pass.
 
 use maud::{html, Markup, PreEscaped, DOCTYPE};
-use notespace_core::model::{PostState, ThreadPage};
+use notespace_core::model::{PostState, ThreadPage, ThreadState};
 
 /// Deepest visual indent, so a deep subthread cannot squeeze the text column to nothing.
 const MAX_INDENT: u32 = 8;
@@ -50,6 +50,11 @@ pub fn thread_page(page: &ThreadPage) -> Markup {
                     p class="thread-meta" {
                         "by " a href={ "/u/" (t.author_name) } { (t.author_name) }
                         " · " (t.post_count) " posts"
+                        @match t.state {
+                            ThreadState::Pinned => " · pinned",
+                            ThreadState::Locked => " · locked: no new replies",
+                            _ => "",
+                        }
                     }
 
                     ol class="posts" {
@@ -135,6 +140,8 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}\
 .post{margin-left:calc(var(--indent,0)*1.25rem);padding:.6rem 0 .6rem .75rem;\
 border-left:2px solid var(--line);margin-bottom:.4rem}\
 .post[data-depth='0']{border-left-color:transparent;padding-left:0}\
+.post:target{background:rgba(255,200,0,.14);border-left-color:var(--accent)}\
+.post:target[data-depth='0']{border-left-color:var(--accent);padding-left:.75rem}\
 .post-body{margin:.35rem 0}\
 .post-body>*:first-child{margin-top:0}.post-body>*:last-child{margin-bottom:0}\
 .post-body pre{overflow-x:auto;padding:.6rem;background:rgba(128,128,128,.12);border-radius:4px}\

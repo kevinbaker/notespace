@@ -975,6 +975,8 @@ GET  /forgot, /reset?token=     password recovery, by mail
 GET  /modlog                    public action log
 GET  /mod/queue                 review queue (capability-gated)
 POST /mod/review/{id}           approve or reject one item
+GET  /admin                     dashboard; /admin/thread/{id}, /admin/users, /admin/spaces,
+                                /admin/log — moderators; roles and spaces admin-only
 POST /uploads/sign              issue scoped R2 upload URL
 WS   /t/{id}/live               hot threads only, via DO
 ```

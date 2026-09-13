@@ -5,6 +5,7 @@
 //! here is unit-testable without a database or a network.
 
 pub mod account;
+pub mod admin;
 pub mod cache_key;
 pub mod compose;
 pub mod conformance;

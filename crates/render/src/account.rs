@@ -80,7 +80,12 @@ pub fn settings_page(
             body {
                 main class="auth" {
                     h1 { "Account" }
-                    p { "Signed in as " strong { (user.name) } "." }
+                    p {
+                        "Signed in as " strong { (user.name) } "."
+                        @if user.role.can_moderate() {
+                            " " a href="/admin" { "Admin" } " · " a href="/mod/queue" { "review queue" }
+                        }
+                    }
                     @if let Some(n) = &notice {
                         @if n.is_error() {
                             p class="error" role="alert" { (n.message()) }

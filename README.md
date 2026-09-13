@@ -115,8 +115,10 @@ What the HN sample showed (DECISIONS.md has the numbers): the 8B default over-fl
 comments and misreads quoted insults as the poster's own; `gpt-4o-mini` behind Llama Guard 4
 published 27 of 30 random comments and hid none, and costs about $0.25 per thousand posts.
 
-To make someone a moderator, set `MODERATORS = "alice,bob"` in `wrangler.toml` or
-`UPDATE user SET role = 'moderator' WHERE name = 'alice'`. The queue needs creating once:
+To make the first admin, set `MODERATORS = "alice"` in `wrangler.toml`; from `/admin` an admin
+grants roles, creates and configures spaces (including each space's moderation policy), edits
+and moves threads, hides posts, and bans accounts. Moderators get everything but roles and
+spaces. The queue needs creating once:
 `npx wrangler queues create notespace-moderation`.
 
 ## Running it
