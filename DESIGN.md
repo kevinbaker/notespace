@@ -1145,6 +1145,10 @@ than shipping a binary. That is M5.
 
 ### Open
 
+11. Federation (ActivityPub). Not planned; `docs/FEDERATION.md` is the primer and the cost
+    estimate. The read path would be unaffected; the request budget, storage and moderation
+    load would not be.
+
 3. ~~Auth: sessions in D1, in a DO, or signed stateless cookies?~~ **Decided: D1.** See §4.9.
 4. Search on the wasm target — does D1 expose FTS5? If not, an external index or a native-only
    feature flag is needed. **Untested in M0.**

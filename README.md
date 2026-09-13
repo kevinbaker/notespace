@@ -23,6 +23,8 @@ replies, editing, profiles, RSS, and an AI-triaged moderation pipeline:
   moderation pipeline run under plain `cargo test`.
 - **`crates/seed`** — deterministic seed/fixture generator that renders through the real write path.
 - **`crates/hn-import`** — turns a Hacker News dump into seed SQL through that same write path.
+
+Not federated, and [docs/FEDERATION.md](docs/FEDERATION.md) says what that would take.
 - **`crates/bench-wasm`** — exposes the render paths to a Node harness so CPU can be measured in
   real wasm.
 
