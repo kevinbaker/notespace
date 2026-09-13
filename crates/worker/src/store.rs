@@ -123,6 +123,11 @@ struct AccountRow {
 }
 
 #[derive(Deserialize)]
+struct NameRow {
+    name: String,
+}
+
+#[derive(Deserialize)]
 struct ConsumedRow {
     user_id: i64,
     email: String,
@@ -1094,6 +1099,21 @@ impl Store for D1Store {
                 })
             })
             .transpose()
+    }
+
+    async fn peek_email_token(
+        &self,
+        token_hash: &str,
+        kind: TokenKind,
+        now: Timestamp,
+    ) -> StoreResult<Option<String>> {
+        let rows: Vec<NameRow> = self
+            .query(
+                sql::PEEK_EMAIL_TOKEN,
+                vec![token_hash.into(), kind.as_str().into(), num(now)],
+            )
+            .await?;
+        Ok(rows.into_iter().next().map(|r| r.name))
     }
 
     async fn retire_email_tokens(

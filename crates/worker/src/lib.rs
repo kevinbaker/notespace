@@ -188,7 +188,9 @@ async fn login_form(
     };
     let next = q.next.as_deref().and_then(cookie::safe_next);
     let notice = q.done.as_deref().and_then(|d| match d {
-        "reset" => Some(notespace_render::auth::LoginNotice::PasswordReset),
+        "reset" => Some(notespace_render::auth::LoginNotice::PasswordReset {
+            username: q.name.clone().unwrap_or_default(),
+        }),
         _ => None,
     });
     let body =
@@ -386,6 +388,8 @@ struct LoginQuery {
     next: Option<String>,
     error: Option<String>,
     done: Option<String>,
+    /// Whose password `done=reset` was about.
+    name: Option<String>,
 }
 
 /// Password login compiled out: the endpoints do not exist.

@@ -5,7 +5,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use notespace_core::account::{self, ConfirmOutcome, Delivery};
-use notespace_core::email::EmailToken;
+use notespace_core::email::{EmailToken, TokenKind};
 use notespace_core::store::Store;
 use notespace_render::account::{SettingsError, SettingsNotice, VerifyOutcome};
 use serde::Deserialize;
@@ -472,13 +472,34 @@ mod passwords {
             );
         };
         let raw = q.token.unwrap_or_default();
-        if EmailToken::parse(&raw).is_none() {
+        let Some(token) = EmailToken::parse(&raw) else {
             return uncached_html(notespace_render::account::reset_page(
                 "",
                 "",
+                None,
                 Some(ResetError::Invalid),
             ));
-        }
+        };
+        // Say whose password this is: the mail's address does not.
+        let Ok(db) = env.d1(crate::DB_BINDING) else {
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding");
+        };
+        let store = crate::store::D1Store::new(db);
+        let username = match store
+            .peek_email_token(&token.hash(), TokenKind::Reset, now_ms())
+            .await
+        {
+            Ok(Some(name)) => name,
+            Ok(None) => {
+                return uncached_html(notespace_render::account::reset_page(
+                    "",
+                    "",
+                    None,
+                    Some(ResetError::Invalid),
+                ))
+            }
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        };
         let (csrf, set_anon) = match anon_token(&key, &headers) {
             Ok(t) => t,
             Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
@@ -492,7 +513,7 @@ mod passwords {
                 .map(|min| ResetError::ShortPassword { min }),
         });
         anon_page(
-            notespace_render::account::reset_page(&csrf, &raw, err),
+            notespace_render::account::reset_page(&csrf, &raw, Some(&username), err),
             set_anon,
         )
     }
@@ -550,7 +571,10 @@ mod passwords {
         )
         .await
         {
-            Ok(ResetOutcome::Done { .. }) => see_other("/login?done=reset".into()),
+            Ok(ResetOutcome::Done { user }) => see_other(format!(
+                "/login?done=reset&name={}",
+                urlencoding(&user.name)
+            )),
             Ok(ResetOutcome::Invalid) => back("invalid"),
             Ok(ResetOutcome::ShortPassword { min }) => back(&format!("short-{min}")),
             Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),

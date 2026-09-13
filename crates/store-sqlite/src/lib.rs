@@ -355,6 +355,22 @@ impl Store for SqliteStore {
             .transpose()
     }
 
+    async fn peek_email_token(
+        &self,
+        token_hash: &str,
+        kind: TokenKind,
+        now: Timestamp,
+    ) -> StoreResult<Option<String>> {
+        self.conn
+            .query_row(
+                sql::PEEK_EMAIL_TOKEN,
+                rusqlite::params![token_hash, kind.as_str(), now],
+                |r| r.get("name"),
+            )
+            .optional()
+            .map_err(backend)
+    }
+
     async fn retire_email_tokens(
         &self,
         user: UserId,

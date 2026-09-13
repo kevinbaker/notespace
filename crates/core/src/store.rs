@@ -298,6 +298,14 @@ pub trait Store {
         now: Timestamp,
     ) -> StoreResult<Option<ConsumedToken>>;
 
+    /// The username a live token belongs to, without spending it. **Budget: 1 statement.**
+    async fn peek_email_token(
+        &self,
+        token_hash: &str,
+        kind: TokenKind,
+        now: Timestamp,
+    ) -> StoreResult<Option<String>>;
+
     /// Spend every outstanding token of a kind, returning how many. **Budget: 1 statement.**
     async fn retire_email_tokens(
         &self,

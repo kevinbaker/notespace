@@ -31,13 +31,23 @@ impl LoginError {
 
 /// Something that just happened elsewhere, worth a line above the form.
 pub enum LoginNotice {
-    PasswordReset,
+    /// Names the account, because the address on a reset mail says nothing about the username.
+    PasswordReset { username: String },
 }
 
 impl LoginNotice {
-    fn message(&self) -> &'static str {
+    fn message(&self) -> String {
         match self {
-            LoginNotice::PasswordReset => "Password reset. Sign in with the new one.",
+            LoginNotice::PasswordReset { username } => {
+                format!("The password for {username} has been reset. Sign in with the new one.")
+            }
+        }
+    }
+
+    /// What to put in the username field.
+    fn username(&self) -> Option<&str> {
+        match self {
+            LoginNotice::PasswordReset { username } => Some(username),
         }
     }
 }
@@ -49,6 +59,7 @@ pub fn login_page(
     error: Option<LoginError>,
     notice: Option<LoginNotice>,
 ) -> Markup {
+    let prefill = notice.as_ref().and_then(|n| n.username()).unwrap_or("");
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -74,11 +85,12 @@ pub fn login_page(
                             input type="hidden" name="next" value=(n);
                         }
                         label for="username" { "Username" }
-                        input id="username" name="username" type="text"
-                              autocomplete="username" required autofocus;
+                        input id="username" name="username" type="text" value=(prefill)
+                              autocomplete="username" required autofocus[prefill.is_empty()];
                         label for="password" { "Password" }
                         input id="password" name="password" type="password"
-                              autocomplete="current-password" required;
+                              autocomplete="current-password" required
+                              autofocus[!prefill.is_empty()];
                         button type="submit" { "Sign in" }
                     }
                     p class="muted" {

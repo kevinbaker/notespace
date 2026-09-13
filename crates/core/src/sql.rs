@@ -440,6 +440,14 @@ UPDATE email_token SET used_at = ?3 \
 WHERE token_hash = ?1 AND kind = ?2 AND used_at IS NULL AND expires_at > ?3 \
 RETURNING user_id, email";
 
+/// Whose an unspent, unexpired token is, without spending it: the reset page says so before
+/// the visitor types a password.
+///
+/// Binds: `?1` = token_hash, `?2` = kind, `?3` = now.
+pub const PEEK_EMAIL_TOKEN: &str = "\
+SELECT u.name FROM email_token t JOIN user u ON u.id = t.user_id \
+WHERE t.token_hash = ?1 AND t.kind = ?2 AND t.used_at IS NULL AND t.expires_at > ?3";
+
 /// Issuing a new link retires the older ones of that kind.
 ///
 /// Binds: `?1` = user id, `?2` = kind, `?3` = now.

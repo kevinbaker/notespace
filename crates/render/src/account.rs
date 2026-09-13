@@ -231,8 +231,14 @@ impl ResetError {
 }
 
 /// The link lands here with the token in the query; the form re-posts it so following the
-/// link does not spend it. A mail scanner that prefetches the link changes nothing.
-pub fn reset_page(csrf: &str, token: &str, error: Option<ResetError>) -> Markup {
+/// link does not spend it. A mail scanner that prefetches the link changes nothing. `username`
+/// is whose password this is, when known: the address the mail went to says nothing about it.
+pub fn reset_page(
+    csrf: &str,
+    token: &str,
+    username: Option<&str>,
+    error: Option<ResetError>,
+) -> Markup {
     let invalid = matches!(error, Some(ResetError::Invalid));
     html! {
         (DOCTYPE)
@@ -247,6 +253,9 @@ pub fn reset_page(csrf: &str, token: &str, error: Option<ResetError>) -> Markup 
             body {
                 main class="auth" {
                     h1 { "Choose a new password" }
+                    @if let Some(u) = username {
+                        p { "This resets the password for the account " strong { (u) } "." }
+                    }
                     @if let Some(e) = error {
                         p class="error" role="alert" { (e.message()) }
                     }
@@ -378,7 +387,8 @@ mod tests {
     /// Following a link must not spend it: both landing pages POST the token.
     #[test]
     fn links_land_on_a_form_rather_than_acting() {
-        let reset = reset_page("tok", "abc123", None).into_string();
+        let reset = reset_page("tok", "abc123", Some("alice"), None).into_string();
+        assert!(reset.contains("<strong>alice</strong>"));
         assert!(reset.contains(r#"name="token" value="abc123""#));
         assert!(reset.contains(r#"method="post" action="/reset""#));
         let verify = verify_page("tok", "abc123", None).into_string();

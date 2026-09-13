@@ -482,6 +482,13 @@ async fn email_tokens_are_spent_exactly_once_and_only_as_their_kind<S: Store>(
         Ok(None) => {}
         other => return Check::fail(NAME, format!("spent at its own expiry: {other:?}")),
     }
+    match store
+        .peek_email_token(&live.hash(), TokenKind::Verify, NOW)
+        .await
+    {
+        Ok(Some(name)) => require!(NAME, !name.is_empty(), "peek returned an empty name"),
+        other => return Check::fail(NAME, format!("peek: {other:?}")),
+    }
     let got = match store
         .consume_email_token(&live.hash(), TokenKind::Verify, NOW)
         .await
@@ -489,6 +496,13 @@ async fn email_tokens_are_spent_exactly_once_and_only_as_their_kind<S: Store>(
         Ok(Some(c)) => c,
         other => return Check::fail(NAME, format!("first spend: {other:?}")),
     };
+    match store
+        .peek_email_token(&live.hash(), TokenKind::Verify, NOW)
+        .await
+    {
+        Ok(None) => {}
+        other => return Check::fail(NAME, format!("peek after spend: {other:?}")),
+    }
     require!(NAME, got.user_id == fx.author_id, "wrong user");
     require!(
         NAME,
