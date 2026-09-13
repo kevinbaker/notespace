@@ -59,7 +59,31 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> WorkerResult<Respon
     // Without this a wasm panic surfaces as an opaque 1101 with no stack.
     console_error_panic_hook::set_once();
     startup::report_once(&posture(&env));
-    Ok(router(env).call(req).await?)
+    if let Some(redirect) = https_redirect(&req) {
+        return Ok(redirect);
+    }
+    let mut resp = router(env).call(req).await?;
+    // A year, so a browser that has been here once never tries http again. The session and
+    // anonymous cookies are `__Host-`, hence `Secure`, hence invisible over http: without this a
+    // plain-http visit rendered every form and then refused every submit as "expired".
+    resp.headers_mut().insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        header::HeaderValue::from_static("max-age=31536000"),
+    );
+    Ok(resp)
+}
+
+/// Cloudflare answers on http as well as https unless the zone says otherwise, and this does
+/// not depend on the zone saying otherwise. Static assets are served before the Worker and
+/// are not affected; nothing they carry is secret.
+fn https_redirect(req: &HttpRequest) -> Option<Response> {
+    if req.uri().scheme_str() != Some("http") {
+        return None;
+    }
+    let mut parts = req.uri().clone().into_parts();
+    parts.scheme = Some(axum::http::uri::Scheme::HTTPS);
+    let target = axum::http::Uri::from_parts(parts).ok()?.to_string();
+    Some((StatusCode::MOVED_PERMANENTLY, [(header::LOCATION, target)]).into_response())
 }
 
 /// What this deployment is actually running, read from bindings rather than assumed.
