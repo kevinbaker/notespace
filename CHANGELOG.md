@@ -55,9 +55,10 @@ First release. Suitable for a limited beta, self-hosted or on a free Cloudflare 
   moderator. For a beta where every account is new, lower each space's `new_account_hours` or
   expect to clear the queue by hand.
 - **No search, no notifications, no mentions.** Reading is by browsing and RSS.
-- **No self-service account deletion.** A moderator can ban or delete an account; a member
-  cannot delete their own from `/settings`. Anyone running a beta in a jurisdiction that
-  requires it should be ready to do this on request.
+- **No self-service account deletion.** A moderator can ban or delete an account (deletion
+  reserves the name and tombstones the posts); a member cannot delete their own from
+  `/settings`. Anyone running a beta in a jurisdiction that requires it should be ready to do
+  this on request, and to note that the email address stays on the row.
 - **Themes are edited by site admins only.** A space's custom CSS may use `url()`, which is a
   per-reader IP disclosure to whoever hosts the image; that is acceptable for site admins and
   would need revisiting before space-level moderators can edit themes.

@@ -216,6 +216,10 @@ pub trait Store {
     /// **Budget: 1 statement.** Returns how many sessions ended.
     async fn delete_user_sessions(&self, user: UserId) -> StoreResult<u32>;
 
+    /// Every post by the user becomes a `[deleted]` tombstone and every thread they posted in
+    /// turns over. **Budget: 2 statements, one batch.** Returns how many posts changed.
+    async fn tombstone_user_posts(&self, user: UserId) -> StoreResult<u32>;
+
     // -- Moderation ---------------------------------------------------------
 
     /// What the write path needs before deciding whether to hold a post: the space's config,

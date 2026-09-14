@@ -1625,6 +1625,27 @@ impl Store for D1Store {
         Ok(meta.unwrap_or(0))
     }
 
+    async fn tombstone_user_posts(&self, user: UserId) -> StoreResult<u32> {
+        let bump = self
+            .db
+            .prepare(sql::BUMP_THREADS_OF_USER)
+            .bind(&[num(user)])
+            .map_err(backend)?;
+        let tomb = self
+            .db
+            .prepare(sql::TOMBSTONE_USER_POSTS)
+            .bind(&[num(user)])
+            .map_err(backend)?;
+        let results = self.db.batch(vec![bump, tomb]).await.map_err(backend)?;
+        let refs: Vec<&D1Result> = results.iter().collect();
+        self.last_stats.set(collect_stats(&refs));
+        Ok(results
+            .get(1)
+            .and_then(|r| r.meta().ok().flatten())
+            .and_then(|m| m.changes)
+            .unwrap_or(0) as u32)
+    }
+
     // -- Moderation ---------------------------------------------------------
 
     async fn write_context(&self, thread: &PublicId, author: UserId) -> StoreResult<WriteContext> {

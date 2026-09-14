@@ -799,6 +799,13 @@ returned, and no review row was ever opened -- so the post sat pending, invisibl
 failed: open a review for a human". `AnyClassifier::Human` is a classifier that always fails
 that way, and `resolve` returns it when nothing is configured.
 
+**Deleting an account tombstones its posts, as the page always said it did.** Writing the
+admin guide meant reading the admin page's own hint -- "deleting keeps the name reserved and
+the posts as tombstones" -- against the code, which only changed the user's state; the posts
+stayed up under the name. Now `tombstone_user_posts` marks every post `deleted` and turns over
+every thread the account posted in, in one batch, so the cached pages show the markers. The
+email address stays on the row; the guide says so.
+
 ## `crates/core/src/sql.rs` -- space listings
 
 `SPACE_THREADS` is the subtree range scan the 0003 migration was designed for, and that

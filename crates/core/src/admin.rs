@@ -235,6 +235,10 @@ pub async fn set_user_state<S: Store>(
     if !state.can_act() {
         store.delete_user_sessions(target.id).await?;
     }
+    // What the page promises: the name stays reserved and the posts become tombstones.
+    if state == UserState::Deleted {
+        store.tombstone_user_posts(target.id).await?;
+    }
     let action = match state {
         UserState::Active => "unban",
         UserState::Banned => "ban",

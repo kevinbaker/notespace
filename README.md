@@ -8,7 +8,8 @@ binary on a machine with a SQLite file, or a Worker on a free Cloudflare account
 > all work, on both targets; `dev.notespace.org` is the Worker. [docs/DEPLOY.md](docs/DEPLOY.md)
 > stands up either: `cargo build --release -p notespace-server` and run it, or the free plan,
 > or Workers Paid.
-> [CHANGELOG.md](CHANGELOG.md) lists what is in and what is known to be missing.
+> [docs/ADMIN.md](docs/ADMIN.md) is for whoever runs one: roles, spaces, the moderation policy
+> and the queue. [CHANGELOG.md](CHANGELOG.md) lists what is in and what is known to be missing.
 > [DESIGN.md](DESIGN.md) is where this is going; [IMPLEMENTATION.md](IMPLEMENTATION.md) maps
 > the design to the code; [DECISIONS.md](DECISIONS.md) says why.
 

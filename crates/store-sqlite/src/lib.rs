@@ -910,6 +910,17 @@ impl Store for SqliteStore {
         Ok(n as u32)
     }
 
+    async fn tombstone_user_posts(&self, user: UserId) -> StoreResult<u32> {
+        let tx = self.conn.unchecked_transaction().map_err(backend)?;
+        tx.execute(sql::BUMP_THREADS_OF_USER, [user])
+            .map_err(backend)?;
+        let n = tx
+            .execute(sql::TOMBSTONE_USER_POSTS, [user])
+            .map_err(backend)?;
+        tx.commit().map_err(backend)?;
+        Ok(n as u32)
+    }
+
     async fn user_by_name(&self, name: &str) -> StoreResult<Option<Credential>> {
         self.conn
             .query_row(sql::USER_BY_NAME, [name], |r| {

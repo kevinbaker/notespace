@@ -143,6 +143,20 @@ pub const DELETE_SESSION: &str = "DELETE FROM session WHERE token_hash = ?1";
 /// Binds: `?1` user_id.
 pub const DELETE_USER_SESSIONS: &str = "DELETE FROM session WHERE user_id = ?1";
 
+/// Every thread the user posted in turns over, so the tombstones show. Runs in the same batch
+/// as `TOMBSTONE_USER_POSTS`, and before it, while the posts still say where they are.
+///
+/// Binds: `?1` = user id.
+pub const BUMP_THREADS_OF_USER: &str = "\
+UPDATE thread SET cache_version = cache_version + 1 \
+WHERE id IN (SELECT DISTINCT thread_id FROM post WHERE author_id = ?1 AND state != 'deleted')";
+
+/// An account deletion leaves `[deleted]` markers, not holes: replies keep their context.
+///
+/// Binds: `?1` = user id.
+pub const TOMBSTONE_USER_POSTS: &str = "\
+UPDATE post SET state = 'deleted' WHERE author_id = ?1 AND state != 'deleted'";
+
 // ---------------------------------------------------------------------------
 // Login rate limiting
 // ---------------------------------------------------------------------------

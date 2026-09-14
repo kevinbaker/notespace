@@ -247,7 +247,7 @@ says it was not.
 
 Sign in as the `MODERATORS` account. `/admin/spaces` creates spaces; the site starts with none.
 Each space's form sets its nesting depth (0 is a flat board), ranking, moderation policy and
-theme.
+theme. [ADMIN.md](ADMIN.md) is the guide to all of it.
 
 Moderation defaults are conservative: every post from an account younger than 72 hours is held
 for the classifier, and a classifier that is unreachable holds the post for a human. For a beta

@@ -393,6 +393,40 @@ async fn the_author_can_edit_and_the_page_turns_over() {
     );
 }
 
+/// What the admin page promises when an account is deleted: the posts stay as tombstones and
+/// the pages they are on turn over, so the tombstones show.
+#[tokio::test]
+async fn deleting_an_account_tombstones_its_posts_and_turns_their_pages_over() {
+    let store = seeded();
+    let (tid, pid) = posted(&store, 32).await;
+    let (other, _) = posted(&store, 33).await;
+    let before = store.thread_version(&tid).await.unwrap().unwrap();
+    let other_before = store.thread_version(&other).await.unwrap().unwrap();
+    let outcome = notespace_core::admin::set_user_state(
+        &store,
+        &user(MOD_USER),
+        &user(OLD_USER),
+        UserState::Deleted,
+        NOW + 1,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, notespace_core::admin::Outcome::Done));
+    let page = store.thread_page(&tid, &Page::first(1)).await.unwrap();
+    assert_eq!(page.posts[0].public_id, pid);
+    assert_eq!(page.posts[0].state, PostState::Deleted, "not a tombstone");
+    assert!(
+        store.thread_version(&tid).await.unwrap().unwrap() > before,
+        "the page did not turn over"
+    );
+    // Every thread the account posted in, not just one.
+    assert!(store.thread_version(&other).await.unwrap().unwrap() > other_before);
+    // Idempotent: nothing left to tombstone, nothing turns over.
+    let again = store.thread_version(&tid).await.unwrap().unwrap();
+    assert_eq!(store.tombstone_user_posts(OLD_USER).await.unwrap(), 0);
+    assert_eq!(store.thread_version(&tid).await.unwrap().unwrap(), again);
+}
+
 #[tokio::test]
 async fn nobody_else_edits_not_even_a_moderator() {
     let store = seeded();
