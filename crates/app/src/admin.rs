@@ -2,9 +2,11 @@
 //! capability check; a visitor without it gets a 404, as the queue does, because the page's
 //! existence is not their business. The `MODERATORS` variable bootstraps the first admin.
 
+use crate::platform::Platform;
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
+use notespace_app_macros::handler;
 use notespace_core::admin::{self, Outcome, Rejected, SpaceForm, ThreadForm};
 use notespace_core::id::PublicId;
 use notespace_core::model::{PostState, Ranking, Role, ThreadState, UserState};
@@ -16,7 +18,6 @@ use notespace_core::username::Username;
 use notespace_render::admin as page;
 use notespace_render::admin::Notice;
 use serde::Deserialize;
-use worker::Env;
 
 use crate::{error, form_fields, now_ms, see_other, signed_in, uncached_html, Signed, PAGE_SIZE};
 
@@ -30,11 +31,11 @@ const LOG: u32 = 200;
 /// The signed-in visitor, lifted by the `MODERATORS` list if they are on it, and only if the
 /// result can moderate. The bootstrap list grants admin: it exists so the first admin can
 /// exist, and an admin is what the first one has to be.
-async fn moderator(
-    env: &Env,
+async fn moderator<'a, P: Platform>(
+    env: &'a P,
     headers: &axum::http::HeaderMap,
     next: &str,
-) -> Result<Signed, Response> {
+) -> Result<Signed<'a, P::Store>, Response> {
     let mut signed = signed_in(env, headers, next).await?;
     if crate::can_moderate(env, &signed.user) && !signed.user.role.can_moderate() {
         signed.user.role = Role::Admin;
@@ -113,9 +114,9 @@ fn back(path: &str, outcome: Result<Outcome, StoreError>) -> Response {
     }
 }
 
-#[worker::send]
-pub async fn dashboard(
-    State(env): State<Env>,
+#[handler]
+pub async fn dashboard<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     Query(q): Query<NoticeQuery>,
 ) -> Response {
@@ -136,9 +137,9 @@ pub async fn dashboard(
 
 // -- Threads and posts ------------------------------------------------------
 
-#[worker::send]
-pub async fn thread_form(
-    State(env): State<Env>,
+#[handler]
+pub async fn thread_form<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     UrlPath(id): UrlPath<String>,
     Query(q): Query<NoticeQuery>,
@@ -185,9 +186,9 @@ pub async fn thread_form(
     ))
 }
 
-#[worker::send]
-pub async fn thread_submit(
-    State(env): State<Env>,
+#[handler]
+pub async fn thread_submit<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     UrlPath(id): UrlPath<String>,
     body: String,
@@ -219,14 +220,14 @@ pub async fn thread_submit(
     };
     back(
         &path,
-        admin::update_thread(&signed.store, &signed.user, &thread, form, now_ms()).await,
+        admin::update_thread(signed.store, &signed.user, &thread, form, now_ms()).await,
     )
 }
 
 /// Posts are acted on from their thread's admin page and return there.
-#[worker::send]
-pub async fn post_state(
-    State(env): State<Env>,
+#[handler]
+pub async fn post_state<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     UrlPath(id): UrlPath<String>,
     body: String,
@@ -252,7 +253,7 @@ pub async fn post_state(
     let Some(state) = PostState::parse(field("state")) else {
         return error(StatusCode::BAD_REQUEST, "bad state");
     };
-    let outcome = admin::set_post_state(&signed.store, &signed.user, &post, state, now_ms()).await;
+    let outcome = admin::set_post_state(signed.store, &signed.user, &post, state, now_ms()).await;
     match outcome {
         Ok(Outcome::Done) => see_other(format!("{path}?saved=1#p{}", post.encode())),
         other => back(&path, other),
@@ -261,9 +262,9 @@ pub async fn post_state(
 
 // -- Users ------------------------------------------------------------------
 
-#[worker::send]
-pub async fn users(
-    State(env): State<Env>,
+#[handler]
+pub async fn users<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     Query(q): Query<NoticeQuery>,
 ) -> Response {
@@ -279,9 +280,9 @@ pub async fn users(
     uncached_html(page::users_page(&query, &users, notice(&q)))
 }
 
-#[worker::send]
-pub async fn user(
-    State(env): State<Env>,
+#[handler]
+pub async fn user<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     UrlPath(name): UrlPath<String>,
     Query(q): Query<NoticeQuery>,
@@ -308,12 +309,16 @@ pub async fn user(
     ))
 }
 
-async fn user_action(
-    env: &Env,
+async fn user_action<P: Platform>(
+    env: &P,
     headers: &axum::http::HeaderMap,
     name: &str,
     body: &str,
-    apply: impl AsyncFnOnce(&Signed, &notespace_core::model::User, &str) -> Result<Outcome, StoreError>,
+    apply: impl AsyncFnOnce(
+        &Signed<'_, P::Store>,
+        &notespace_core::model::User,
+        &str,
+    ) -> Result<Outcome, StoreError>,
 ) -> Response {
     let Ok(username) = Username::parse(name) else {
         return error(StatusCode::NOT_FOUND, "no such user");
@@ -337,9 +342,9 @@ async fn user_action(
     back(&path, apply(&signed, &target, &value).await)
 }
 
-#[worker::send]
-pub async fn user_state(
-    State(env): State<Env>,
+#[handler]
+pub async fn user_state<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     UrlPath(name): UrlPath<String>,
     body: String,
@@ -353,15 +358,15 @@ pub async fn user_state(
             let Some(state) = UserState::parse(value) else {
                 return Ok(Outcome::Rejected(Rejected::NotFound));
             };
-            admin::set_user_state(&signed.store, &signed.user, target, state, now_ms()).await
+            admin::set_user_state(signed.store, &signed.user, target, state, now_ms()).await
         },
     )
     .await
 }
 
-#[worker::send]
-pub async fn user_role(
-    State(env): State<Env>,
+#[handler]
+pub async fn user_role<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     UrlPath(name): UrlPath<String>,
     body: String,
@@ -375,7 +380,7 @@ pub async fn user_role(
             let Some(role) = Role::parse(value) else {
                 return Ok(Outcome::Rejected(Rejected::NotFound));
             };
-            admin::set_user_role(&signed.store, &signed.user, target, role, now_ms()).await
+            admin::set_user_role(signed.store, &signed.user, target, role, now_ms()).await
         },
     )
     .await
@@ -383,9 +388,9 @@ pub async fn user_role(
 
 // -- Spaces -----------------------------------------------------------------
 
-#[worker::send]
-pub async fn spaces(
-    State(env): State<Env>,
+#[handler]
+pub async fn spaces<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     Query(q): Query<NoticeQuery>,
 ) -> Response {
@@ -444,9 +449,9 @@ fn space_form<'a>(
     })
 }
 
-#[worker::send]
-pub async fn space_create(
-    State(env): State<Env>,
+#[handler]
+pub async fn space_create<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Response {
@@ -465,7 +470,7 @@ pub async fn space_create(
         Err(why) => return bad_theme("/admin/spaces", &why),
     };
     match admin::create_space(
-        &signed.store,
+        signed.store,
         &signed.user,
         field("key"),
         parent,
@@ -480,9 +485,9 @@ pub async fn space_create(
     }
 }
 
-#[worker::send]
-pub async fn space_form_page(
-    State(env): State<Env>,
+#[handler]
+pub async fn space_form_page<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     UrlPath(id): UrlPath<i64>,
     Query(q): Query<NoticeQuery>,
@@ -502,9 +507,9 @@ pub async fn space_form_page(
     uncached_html(page::space_page(&signed.mint(), &detail, notice(&q)))
 }
 
-#[worker::send]
-pub async fn space_submit(
-    State(env): State<Env>,
+#[handler]
+pub async fn space_submit<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     UrlPath(id): UrlPath<i64>,
     body: String,
@@ -524,14 +529,14 @@ pub async fn space_submit(
     };
     back(
         &path,
-        admin::update_space(&signed.store, &signed.user, id, form, now_ms()).await,
+        admin::update_space(signed.store, &signed.user, id, form, now_ms()).await,
     )
 }
 
 // -- Log --------------------------------------------------------------------
 
-#[worker::send]
-pub async fn log(State(env): State<Env>, headers: axum::http::HeaderMap) -> Response {
+#[handler]
+pub async fn log<P: Platform>(State(env): State<P>, headers: axum::http::HeaderMap) -> Response {
     let signed = match moderator(&env, &headers, "/admin/log").await {
         Ok(s) => s,
         Err(r) => return r,

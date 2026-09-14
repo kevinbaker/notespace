@@ -1,0 +1,29 @@
+[package]
+name = "notespace-server"
+description = "notespace as one binary: the web layer on tokio, a SQLite file for storage."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "notespace"
+path = "src/main.rs"
+
+[dependencies]
+notespace-core = { workspace = true, features = ["password"] }
+notespace-render = { workspace = true }
+notespace-app = { path = "../app", features = ["password"] }
+notespace-store-sqlite = { path = "../store-sqlite" }
+axum = { version = "0.8", default-features = false, features = ["query", "tokio", "http1"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "signal"] }
+tower-service = "0.3"
+send_wrapper = { version = "0.6", features = ["futures"] }
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+rsa = { version = "0.9", features = ["sha2"] }
+base64 = "0.22"
+getrandom = "0.2"
+serde_json = { workspace = true }

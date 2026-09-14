@@ -2,15 +2,95 @@
 
 Three ways to run it, in order of how finished they are:
 
-| target | status at v0.1.0 | what it costs | what it holds |
+| target | what it is | what it costs | what it holds |
 |---|---|---|---|
-| [Cloudflare, free plan](#cloudflare-free-plan) | **This is the release.** `dev.notespace.org` runs on it. | $0 | a small community: ~30k pageviews a day, ~500 AI classifications a day |
-| [Cloudflare, Workers Paid](#cloudflare-workers-paid) | Same code, more headroom, two settings to change. | $5/month plus usage | no request cap; OWASP-grade password hashing; Cloudflare's own mail |
-| [Self-hosted on SQLite](#self-hosted-sqlite) | **Not yet.** The storage adapter exists and passes the same tests as D1; the HTTP server around it does not. | — | — |
+| [Self-hosted on SQLite](#self-hosted-sqlite) | One binary, one file, one command. The simplest way to run notespace. | a machine you already have | whatever the machine holds; a small forum is nothing to it |
+| [Cloudflare, free plan](#cloudflare-free-plan) | The same code as a Worker; `dev.notespace.org` runs on it. Nothing to keep up. | $0 | a small community: ~30k pageviews a day, ~500 AI classifications a day |
+| [Cloudflare, Workers Paid](#cloudflare-workers-paid) | The Worker with more headroom, two settings to change. | $5/month plus usage | no request cap; OWASP-grade password hashing; Cloudflare's own mail |
 
-Everything below assumes a machine with Rust, Node and a logged-in `wrangler`. Nothing here
-works from Cloudflare's dashboard build, which ships Node but not `cargo` — see
-[Why the dashboard build fails](#why-the-dashboard-build-fails).
+The three share every handler, template and test: `crates/app` is the web layer, written against
+a `Platform` trait; `crates/server` and `crates/worker` are the two things that implement it.
+
+## Self-hosted, SQLite
+
+```bash
+cargo build --release -p notespace-server
+MODERATORS=yourname SITE_NAME="Your forum" ./target/release/notespace
+```
+
+That is a running forum on `http://127.0.0.1:8080`, with `notespace.db` (SQLite, WAL mode, every
+migration applied) and `notespace.keys` (a CSRF key and a password pepper, generated, mode 0600)
+in the current directory. Register the account named in `MODERATORS`; it is the admin. Create a
+space at `/admin/spaces`. Post.
+
+The binary is one thread on purpose: SQLite serialises writes anyway, a page renders in tens of
+microseconds, and a small forum never notices. Password hashing runs at OWASP's minimum
+(Argon2id 19 MiB, t=2), since there is no 10 ms budget here.
+
+### Configuration
+
+Environment variables, with the same names the Worker uses in `wrangler.toml`, so the two
+sections below apply here too. Plus three of its own:
+
+| variable | default | |
+|---|---|---|
+| `NOTESPACE_DB` | `notespace.db` | the database file; created if absent; `<name>.keys` sits beside it |
+| `NOTESPACE_LISTEN` | `127.0.0.1:8080` | address and port |
+| `PASSWORD_SCHEME` | `owasp` | the Worker's default is `constrained`; there is no reason for that here |
+
+`CSRF_KEY` and `PASSWORD_PEPPER` are read from the environment if set and generated into the
+keys file if not. **Back up the keys file with the database**: without the pepper no password
+can ever be verified again. Rotate as on the Worker, by appending to the list.
+
+What is not available natively, and what stands in:
+
+| Worker | self-hosted |
+|---|---|
+| Workers AI (`MOD_PROVIDER=workers_ai`, `llama_guard`) | not available; use `anthropic` or `openrouter` with the key as an environment variable, or run with no classifier |
+| No classifier configured | held posts go straight to `/mod/queue` marked "classifier unavailable"; a moderator publishes or rejects |
+| The moderation queue | an in-process channel; the sweep still runs every five minutes |
+| Cloudflare Email Service | not available; `MAIL_PROVIDER=resend` etc. with `MAIL_API_KEY` |
+| The edge cache | an in-memory cache of the last 512 baked pages, same keys, same invalidation |
+| Static assets | compiled into the binary and served at the same `/static/` paths |
+| `SITE_THEME` | the same, as one multi-line environment variable |
+
+### Putting it on the internet
+
+The binary speaks plain HTTP and expects TLS in front of it. The session cookies are
+`__Host-`-prefixed and `Secure`, which browsers accept on `localhost` but nowhere else over
+http; so for anything but a local try-out, put Caddy (or nginx, or a Cloudflare Tunnel) in
+front:
+
+```
+# Caddyfile
+forum.example.org {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+Caddy obtains the certificate itself. Set `BASE_URL=https://forum.example.org` so links in
+mail and OIDC callbacks name the public address, and register OIDC clients against it as in
+the Worker section below.
+
+Run it as a service the ordinary way:
+
+```ini
+# /etc/systemd/system/notespace.service
+[Service]
+WorkingDirectory=/var/lib/notespace
+Environment=MODERATORS=yourname SITE_NAME="Your forum" BASE_URL=https://forum.example.org
+ExecStart=/usr/local/bin/notespace
+Restart=on-failure
+User=notespace
+```
+
+Backups are the two files in the working directory (`sqlite3 notespace.db ".backup copy.db"`
+for a consistent copy while running, or stop the service and copy). Upgrades are a new binary:
+it applies any migration the file has not seen on the next start.
+
+Nothing here works from Cloudflare's dashboard build, which ships Node but not `cargo` — see
+[Why the dashboard build fails](#why-the-dashboard-build-fails). The two Cloudflare sections
+assume a machine with Rust, Node and a logged-in `wrangler`.
 
 ## Cloudflare, free plan
 
@@ -71,8 +151,8 @@ SITE_THEME = """                               # optional; see "The look" below
 ```
 
 The `[[send_email]]` block can stay — without a paid plan it refuses every send, is logged, and
-the flow carries on — or be deleted. The `[ai]` block enables the classifier; without it,
-moderation holds posts for a human with no model in the loop.
+the flow carries on — or be deleted. The `[ai]` block enables the classifier; without it, held
+posts go straight to `/mod/queue` for a moderator.
 
 ### 3. Secrets
 
@@ -279,30 +359,6 @@ verification link.
 A paid plan also makes the Anthropic or OpenRouter classifiers (`MOD_PROVIDER`, with
 `ANTHROPIC_API_KEY` or `OPENROUTER_API_KEY` as secrets) a matter of taste rather than budget;
 their prompts and the evaluation behind the defaults are in [DECISIONS.md](../DECISIONS.md).
-
-## Self-hosted, SQLite
-
-**Not shipped in v0.1.0.** The design has always had two targets, and the storage half of the
-second one is done: `crates/store-sqlite` implements the same `Store` trait as the D1 adapter,
-passes the same conformance suite (`cargo test`), the migrations are dialect-identical, and the
-seed and Hacker News importers write SQLite files today. What does not exist is the server
-around it — the Cloudflare Worker's handlers are written against `worker::Env`, D1 and the
-Cache API.
-
-What a `crates/server` binary needs, in the order it would be built:
-
-1. axum on tokio, mounting the same routes over `SqliteStore`, with an in-process cache in
-   place of the Cache API and `include_bytes!` in place of static assets;
-2. secrets from the environment or a file, and a pepper generated on first run (a binary has a
-   disk; a Worker does not, which is why the Worker never generates one);
-3. `Scheme::OWASP` for passwords, unchanged — there is no 10 ms limit;
-4. a classifier over HTTP (Anthropic or OpenRouter; the providers exist) and a mail provider
-   over HTTP (all five exist), in place of the AI and Email bindings;
-5. a background task for the moderation sweep, in place of the cron trigger.
-
-Steps 3–5 are wiring; 1 and 2 are the work. This is milestone M5 in [DESIGN.md](../DESIGN.md).
-Until then, the SQLite adapter is how the test suite and the import tooling run, not how the
-site does.
 
 ## Why the dashboard build fails
 

@@ -83,6 +83,52 @@ pub fn page_cursor_offset(rank: i64, page_size: u32) -> Option<i64> {
 
 /// Everything the application needs from storage. Statement budgets are stated per method and
 /// checked for the read path by the query-budget tests in `crates/store-sqlite/tests`.
+/// What a store reports about the queries it ran, emitted per request as `Server-Timing`.
+/// D1 fills all three; SQLite counts statements and leaves the rest absent.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QueryStats {
+    pub statements: u32,
+    pub rows_read: Option<usize>,
+    pub duration_ms: Option<f64>,
+}
+
+impl QueryStats {
+    /// `None` is absent information, not zero.
+    pub fn plus(self, other: QueryStats) -> QueryStats {
+        QueryStats {
+            statements: self.statements + other.statements,
+            rows_read: match (self.rows_read, other.rows_read) {
+                (Some(a), Some(b)) => Some(a + b),
+                (a, b) => a.or(b),
+            },
+            duration_ms: match (self.duration_ms, other.duration_ms) {
+                (Some(a), Some(b)) => Some(a + b),
+                (a, b) => a.or(b),
+            },
+        }
+    }
+
+    /// `Server-Timing` value.
+    pub fn server_timing(&self) -> String {
+        let mut out = format!("d1;desc=\"statements={}\"", self.statements);
+        if let Some(rows) = self.rows_read {
+            out.push_str(&format!(", d1_rows;desc=\"rows_read={rows}\""));
+        }
+        if let Some(ms) = self.duration_ms {
+            out.push_str(&format!(", d1_query;dur={ms}"));
+        }
+        out
+    }
+}
+
+/// A store that can say what its last call cost. Interior mutability, so telemetry stays out
+/// of the `Store` signatures.
+pub trait Instrumented {
+    fn last_stats(&self) -> QueryStats {
+        QueryStats::default()
+    }
+}
+
 #[async_trait(?Send)]
 pub trait Store {
     /// **Budget: 2 statements**, ideally one round trip.

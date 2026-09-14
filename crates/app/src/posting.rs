@@ -1,21 +1,21 @@
 //! Spaces, new threads, editing, profiles and feeds. Read pages are user-agnostic and briefly
 //! cacheable; the forms are uncached and carry a token, like the reply form.
 
+use crate::platform::{Instrumented, Platform};
 use axum::extract::{Path as UrlPath, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
+use notespace_app_macros::handler;
 use notespace_core::id::PublicId;
 use notespace_core::space_key::SpacePath;
 use notespace_core::store::{Page, Store, StoreError};
 use notespace_core::theme::Theme;
 use notespace_core::username::Username;
 use notespace_render::compose::{ComposeDraft, ComposeError, EditError};
-use worker::Env;
 
-use crate::store::D1Store;
 use crate::{
     cache, client_address, error, form_fields, host, ids, moderation, now_ms, see_other, signed_in,
-    uncached_html, Signed, DB_BINDING, PAGE_SIZE,
+    uncached_html, Signed, PAGE_SIZE,
 };
 
 /// Threads shown on a space page.
@@ -50,9 +50,9 @@ fn brief_html(html: String, timing: &str, max_age: u32) -> Response {
 }
 
 /// `/s/{path}` or `/s/{path}/new`: the tail decides.
-#[worker::send]
-pub async fn space(
-    State(env): State<Env>,
+#[handler]
+pub async fn space<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     UrlPath(path): UrlPath<String>,
 ) -> Response {
@@ -73,10 +73,7 @@ pub async fn space(
         )
             .into_response();
     }
-    let Ok(db) = env.d1(DB_BINDING) else {
-        return error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding");
-    };
-    let store = D1Store::new(db);
+    let store = env.store();
     let space = match store.space_by_path(&space_path).await {
         Ok(Some(s)) => s,
         Ok(None) => return error(StatusCode::NOT_FOUND, "no such space"),
@@ -100,14 +97,11 @@ pub async fn space(
 /// A space's stylesheet: its token overrides and its own CSS, from `space.config`. Linked with
 /// `?v={theme hash}` and served immutable, so a reader fetches it once per change; it is built
 /// from one indexed row and is not worth the edge cache. A space without a theme has no sheet.
-async fn theme_css(env: &Env, space: &str) -> Response {
+async fn theme_css<P: Platform>(env: &P, space: &str) -> Response {
     let Ok(space_path) = SpacePath::parse(space) else {
         return error(StatusCode::NOT_FOUND, "no such space");
     };
-    let Ok(db) = env.d1(DB_BINDING) else {
-        return error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding");
-    };
-    let store = D1Store::new(db);
+    let store = env.store();
     let space = match store.space_by_path(&space_path).await {
         Ok(Some(s)) => s,
         Ok(None) => return error(StatusCode::NOT_FOUND, "no such space"),
@@ -130,9 +124,9 @@ async fn theme_css(env: &Env, space: &str) -> Response {
 }
 
 /// Only `/s/{path}/new` accepts a POST.
-#[worker::send]
-pub async fn space_post(
-    State(env): State<Env>,
+#[handler]
+pub async fn space_post<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     UrlPath(path): UrlPath<String>,
     body: String,
@@ -144,11 +138,18 @@ pub async fn space_post(
 }
 
 /// What both compose handlers need: the space, resolved, and the signed-in visitor.
-async fn compose_context(
-    env: &Env,
+async fn compose_context<'a, P: Platform>(
+    env: &'a P,
     headers: &axum::http::HeaderMap,
     raw_path: &str,
-) -> Result<(Signed, SpacePath, notespace_core::model::Space), Response> {
+) -> Result<
+    (
+        Signed<'a, P::Store>,
+        SpacePath,
+        notespace_core::model::Space,
+    ),
+    Response,
+> {
     let Ok(space_path) = SpacePath::parse(raw_path) else {
         return Err(error(StatusCode::NOT_FOUND, "no such space"));
     };
@@ -161,7 +162,11 @@ async fn compose_context(
     Ok((signed, space_path, space))
 }
 
-async fn compose_form(env: &Env, headers: &axum::http::HeaderMap, raw_path: &str) -> Response {
+async fn compose_form<P: Platform>(
+    env: &P,
+    headers: &axum::http::HeaderMap,
+    raw_path: &str,
+) -> Response {
     let (signed, space_path, space) = match compose_context(env, headers, raw_path).await {
         Ok(c) => c,
         Err(r) => return r,
@@ -177,8 +182,8 @@ async fn compose_form(env: &Env, headers: &axum::http::HeaderMap, raw_path: &str
 
 /// Rejections re-render the form in place with the draft, rather than redirecting: a body can
 /// be long, and a query string is no place for it.
-async fn compose_submit(
-    env: &Env,
+async fn compose_submit<P: Platform>(
+    env: &P,
     headers: &axum::http::HeaderMap,
     raw_path: &str,
     body: &str,
@@ -215,11 +220,11 @@ async fn compose_submit(
     let html = notespace_core::model::SanitizedHtml::assert_sanitized(
         notespace_render::markdown_to_html(draft.body),
     );
-    let thread_id = match ids::generate() {
+    let thread_id = match ids::generate(now_ms()) {
         Ok(id) => id,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
-    let post_ids = match ids::generate_many(reply::MAX_PATH_RETRIES as usize + 1) {
+    let post_ids = match ids::generate_many(now_ms(), reply::MAX_PATH_RETRIES as usize + 1) {
         Ok(v) => v,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
     };
@@ -245,8 +250,8 @@ async fn compose_submit(
         post_ids: &post_ids,
         now: now_ms(),
     };
-    let queue = moderation::MaybeQueue::from_env(env);
-    match compose::create(&signed.store, &queue, &cfg, attempt).await {
+    let queue = moderation::Queue(env.clone());
+    match compose::create(signed.store, &queue, &cfg, attempt).await {
         Ok(Outcome::Posted { thread, .. }) => see_other(format!("/t/{}", thread.public_id)),
         Ok(Outcome::Held { thread, post }) => {
             see_other(format!("/t/{}/held/{}", thread.public_id, post.public_id))
@@ -288,9 +293,9 @@ fn edit_error(why: notespace_core::edit::Rejected) -> Option<EditError> {
 }
 
 /// The author sees the source and a form; anyone else is told whose post it is.
-#[worker::send]
-pub async fn edit_form(
-    State(env): State<Env>,
+#[handler]
+pub async fn edit_form<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     UrlPath(id): UrlPath<String>,
 ) -> Response {
@@ -330,9 +335,9 @@ pub async fn edit_form(
     uncached_html(page)
 }
 
-#[worker::send]
-pub async fn edit_submit(
-    State(env): State<Env>,
+#[handler]
+pub async fn edit_submit<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     UrlPath(id): UrlPath<String>,
     body: String,
@@ -362,9 +367,9 @@ pub async fn edit_submit(
     let html = notespace_core::model::SanitizedHtml::assert_sanitized(
         notespace_render::markdown_to_html(draft),
     );
-    let queue = moderation::MaybeQueue::from_env(&env);
+    let queue = moderation::Queue(env.clone());
     match edit::edit(
-        &signed.store,
+        signed.store,
         &queue,
         &post,
         &signed.user,
@@ -384,9 +389,9 @@ pub async fn edit_submit(
     }
 }
 
-#[worker::send]
-pub async fn delete_submit(
-    State(env): State<Env>,
+#[handler]
+pub async fn delete_submit<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     UrlPath(id): UrlPath<String>,
     body: String,
@@ -412,7 +417,7 @@ pub async fn delete_submit(
     if crate::can_moderate(&env, &actor) && !actor.role.can_moderate() {
         actor.role = notespace_core::model::Role::Admin;
     }
-    match edit::delete(&signed.store, &post, &actor, now_ms()).await {
+    match edit::delete(signed.store, &post, &actor, now_ms()).await {
         Ok(DeleteOutcome::Deleted) => see_other(format!("/p/{canonical}")),
         Ok(DeleteOutcome::Rejected(why)) => match edit_error(why) {
             Some(e) => uncached_html(notespace_render::compose::edit_page(
@@ -431,8 +436,11 @@ pub async fn delete_submit(
 // Profiles and feeds
 // ---------------------------------------------------------------------------
 
-#[worker::send]
-pub async fn profile(State(env): State<Env>, UrlPath(name): UrlPath<String>) -> Response {
+#[handler]
+pub async fn profile<P: Platform>(
+    State(env): State<P>,
+    UrlPath(name): UrlPath<String>,
+) -> Response {
     let Ok(username) = Username::parse(&name) else {
         return error(StatusCode::NOT_FOUND, "no such user");
     };
@@ -443,10 +451,7 @@ pub async fn profile(State(env): State<Env>, UrlPath(name): UrlPath<String>) -> 
         )
             .into_response();
     }
-    let Ok(db) = env.d1(DB_BINDING) else {
-        return error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding");
-    };
-    let store = D1Store::new(db);
+    let store = env.store();
     match store.user_profile(username.as_str(), PROFILE_LIMIT).await {
         Ok(Some(profile)) => brief_html(
             notespace_render::profile::profile_page(&profile).into_string(),
@@ -460,8 +465,12 @@ pub async fn profile(State(env): State<Env>, UrlPath(name): UrlPath<String>) -> 
 
 /// `/t/{id}.rss`: the first page of the thread as a feed, cached under the thread's version
 /// like the page is.
-#[worker::send]
-pub async fn feed(State(env): State<Env>, headers: axum::http::HeaderMap, id: String) -> Response {
+#[handler]
+pub async fn feed<P: Platform>(
+    State(env): State<P>,
+    headers: axum::http::HeaderMap,
+    id: String,
+) -> Response {
     let thread_id = match PublicId::parse(&id) {
         Ok(p) => p,
         Err(e) => return error(StatusCode::BAD_REQUEST, &format!("bad thread id: {e}")),
@@ -474,10 +483,7 @@ pub async fn feed(State(env): State<Env>, headers: axum::http::HeaderMap, id: St
         )
             .into_response();
     }
-    let Ok(db) = env.d1(DB_BINDING) else {
-        return error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding");
-    };
-    let store = D1Store::new(db);
+    let store = env.store();
     let version = store.thread_version(&thread_id).await.ok().flatten();
     let lookup = store.last_stats().server_timing();
     let host = host(&headers);
@@ -493,7 +499,7 @@ pub async fn feed(State(env): State<Env>, headers: axum::http::HeaderMap, id: St
         })
     });
     if let Some(k) = &key {
-        if let Some(hit) = cache::get(k, &lookup).await {
+        if let Some(hit) = cache::get(&env, k, &lookup).await {
             return hit;
         }
     }
@@ -506,7 +512,7 @@ pub async fn feed(State(env): State<Env>, headers: axum::http::HeaderMap, id: St
                 store.last_stats().server_timing()
             );
             if let Some(k) = &key {
-                cache::put_typed(k, &xml, "application/rss+xml; charset=utf-8", &timing).await;
+                cache::put(&env, k, &xml, "application/rss+xml; charset=utf-8").await;
             }
             let mut resp = (
                 StatusCode::OK,

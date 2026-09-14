@@ -1,29 +1,33 @@
 # notespace
 
-A configurable, AI-moderated, threaded forum in Rust that runs on a free Cloudflare account.
-Designed from the start to also run self-hosted on SQLite; the storage half of that exists, the
-server half does not yet.
+A configurable, AI-moderated, threaded forum in Rust. One codebase, two ways to run it: a single
+binary on a machine with a SQLite file, or a Worker on a free Cloudflare account.
 
 > **v0.1.0 — first release, suitable for a limited beta.** Reading, accounts (Google, GitHub or
 > local passwords), posting, editing, per-space themes and an AI-triaged moderation pipeline
-> all work and are deployed at `dev.notespace.org`. [docs/DEPLOY.md](docs/DEPLOY.md) stands up
-> an instance on the free plan, on Workers Paid, and says what self-hosting still needs.
+> all work, on both targets; `dev.notespace.org` is the Worker. [docs/DEPLOY.md](docs/DEPLOY.md)
+> stands up either: `cargo build --release -p notespace-server` and run it, or the free plan,
+> or Workers Paid.
 > [CHANGELOG.md](CHANGELOG.md) lists what is in and what is known to be missing.
 > [DESIGN.md](DESIGN.md) is where this is going; [IMPLEMENTATION.md](IMPLEMENTATION.md) maps
 > the design to the code; [DECISIONS.md](DECISIONS.md) says why.
 
 ## What exists
 
-A Cloudflare Worker that serves a threaded forum from D1, with spaces, accounts, threads,
-replies, editing, profiles, RSS, themes, and an AI-triaged moderation pipeline:
+A threaded forum with spaces, accounts, threads, replies, editing, profiles, RSS, themes, and an
+AI-triaged moderation pipeline, as a Worker on D1 or a binary on SQLite:
 
 - **`crates/core`** — domain model, the `Store` trait, and materialized tree paths. No I/O, no
   target awareness, property-tested.
 - **`crates/render`** — markdown → sanitized HTML (pulldown-cmark + ammonia) at write time, maud
   page templates for the read path, and the one stylesheet and fonts under `public/`.
-- **`crates/worker`** — axum on Workers, wired to a D1-backed `Store`; also the moderation
-  queue consumer and cron sweep.
-- **`crates/store-sqlite`** — the native adapter, and where the shared conformance suite and the
+- **`crates/app`** — every route and handler, written against a `Platform` trait (a store, a
+  clock, an HTTP client, a cache, a queue, configuration) rather than any runtime.
+- **`crates/worker`** — the `Platform` made of Cloudflare bindings: D1, Workers AI, Queues, the
+  Email Service, `crypto.subtle`; plus the queue consumer and cron sweep.
+- **`crates/server`** — the `Platform` made of a SQLite file, `reqwest`, the environment and an
+  in-memory cache: one binary, one thread, secrets generated on first run.
+- **`crates/store-sqlite`** — the SQLite `Store`, and where the shared conformance suite and the
   moderation pipeline run under plain `cargo test`.
 - **`crates/seed`** — deterministic seed/fixture generator that renders through the real write path.
 - **`crates/hn-import`** — turns a Hacker News dump into seed SQL through that same write path.
@@ -167,8 +171,9 @@ mapping, the BigQuery alternative, and what it costs against a deployed D1.
 
 ### Deploying
 
-[docs/DEPLOY.md](docs/DEPLOY.md): a fresh instance is `wrangler d1 create`, `wrangler queues
-create`, five lines in `wrangler.toml`, one secret, and `wrangler deploy`. Sign-in through
+[docs/DEPLOY.md](docs/DEPLOY.md). Self-hosted: `cargo build --release -p notespace-server`, run
+`notespace` with `MODERATORS` set, put Caddy in front. Cloudflare: `wrangler d1 create`,
+`wrangler queues create`, five lines in `wrangler.toml`, one secret, and `wrangler deploy`. Sign-in through
 Google or GitHub is the recommended shape; local passwords are a cargo feature
 (`NOTESPACE_FEATURES=password`) with a mandatory pepper. The look is `SITE_THEME` in
 `wrangler.toml`; each space has its own on top.
@@ -177,9 +182,11 @@ Google or GitHub is the recommended shape; local passwords are a cargo feature
 
 ```
 crates/core/      domain model, Store trait, materialized paths, moderation  (pure, no I/O)
-crates/render/    markdown -> sanitized HTML, page templates, public/ (stylesheet, fonts, reply.js)
-crates/store-sqlite/ native SQLite adapter; conformance and pipeline tests
-crates/worker/    Cloudflare Workers entrypoint + D1 adapter + queue/cron consumers
+crates/render/    markdown -> sanitized HTML, page templates, public/ (stylesheet, fonts, scripts)
+crates/app/       routes and handlers over a Platform trait; app-macros/ is its #[handler]
+crates/server/    the binary: Platform on SQLite + reqwest + env, tokio current-thread
+crates/worker/    Cloudflare Workers entrypoint: Platform on bindings + D1 adapter + consumers
+crates/store-sqlite/ the SQLite Store; conformance and pipeline tests
 crates/seed/      deterministic seed + fixture generator
 crates/hn-import/ Hacker News -> seed SQL, through the real write path
 crates/bench-wasm/ CPU harness, run under Node

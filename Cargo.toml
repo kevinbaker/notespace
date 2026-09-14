@@ -6,11 +6,14 @@ members = [
     "crates/render",
     "crates/seed",
     "crates/store-sqlite",
+    "crates/app-macros",
+    "crates/app",
+    "crates/server",
     "crates/worker",
     "crates/bench-wasm",
 ]
 
-default-members = ["crates/core", "crates/hn-import", "crates/render", "crates/seed", "crates/store-sqlite"]
+default-members = ["crates/core", "crates/hn-import", "crates/render", "crates/seed", "crates/store-sqlite", "crates/app-macros", "crates/app", "crates/server"]
 
 # `worker` and `bench-wasm` are wasm-only and are built explicitly with
 # `--target wasm32-unknown-unknown`; keeping them out of the default set means a bare

@@ -1,20 +1,16 @@
-//! Moderation on the Worker: the classifier behind a binding, and the Queue that wakes the
-//! consumer. Request and response shapes come from `core`; this file only carries bytes.
+//! Moderation glue: the classifier the deployment configured, and the queue that hands held
+//! posts to it. Request and response shapes come from `core`; this file carries bytes through
+//! the platform.
 
+use crate::platform::{HttpRequest, Job, Platform};
 use notespace_core::id::PublicId;
 use notespace_core::moderation::classify::{Classifier, ClassifyError, ClassifyInput, Verdict};
 use notespace_core::moderation::heuristics::Reason;
 use notespace_core::moderation::layers::Layered;
-use notespace_core::moderation::pipeline::ModerationQueue;
+use notespace_core::moderation::pipeline::{self, ModerationQueue};
 use notespace_core::moderation::providers;
-use serde::{Deserialize, Serialize};
-use worker::{Env, Fetch, Headers, Method, Request, RequestInit};
 
-/// Kept in step with wrangler.toml by `the_moderation_binding_names_match_wrangler_toml`.
-pub const AI_BINDING: &str = "AI";
-pub const QUEUE_BINDING: &str = "MODERATION";
-
-/// `MOD_PROVIDER`: one of `workers_ai` (default when the `AI` binding exists), `llama_guard`,
+/// `MOD_PROVIDER`: one of `workers_ai` (default when the platform has Workers AI), `llama_guard`,
 /// `anthropic`, `openrouter`, `openrouter_guard`, `off` -- or two joined with `+`, a safety
 /// model in front of an instruct model: `llama_guard+workers_ai`, `openrouter_guard+openrouter`.
 /// `MOD_MODEL` overrides the instruct model, `MOD_GUARD_MODEL` the guard.
@@ -24,31 +20,31 @@ pub const GUARD_MODEL_VAR: &str = "MOD_GUARD_MODEL";
 pub const ANTHROPIC_KEY_SECRET: &str = "ANTHROPIC_API_KEY";
 pub const OPENROUTER_KEY_SECRET: &str = "OPENROUTER_API_KEY";
 
-/// One queue message: which post, and what Tier 0 held it for.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Job {
-    pub post: String,
-    #[serde(default)]
-    pub reasons: Vec<Reason>,
-}
+/// Posts a sweep classifies per run.
+pub const SWEEP_LIMIT: u32 = 10;
 
 /// Whichever provider the deployment configured. An enum rather than `Box<dyn Classifier>`
 /// because the pipeline is generic over `C: Classifier`.
-pub enum AnyClassifier {
-    WorkersAi(WorkersAi),
-    Anthropic(Anthropic),
-    OpenAiCompatible(OpenAiCompatible),
-    Layered(Box<Layered<AnyClassifier, AnyClassifier>>),
+pub enum AnyClassifier<P: Platform> {
+    WorkersAi(WorkersAi<P>),
+    Anthropic(Anthropic<P>),
+    OpenAiCompatible(OpenAiCompatible<P>),
+    Layered(Box<Layered<AnyClassifier<P>, AnyClassifier<P>>>),
+    /// No model configured. Every call fails as unavailable, which is the pipeline's path for
+    /// "a human has to look": the post gets a review item and shows up in the queue. Without
+    /// this a held post on a deployment with no classifier stayed pending and invisible forever.
+    Human,
 }
 
 #[async_trait::async_trait(?Send)]
-impl Classifier for AnyClassifier {
+impl<P: Platform> Classifier for AnyClassifier<P> {
     fn model(&self) -> &str {
         match self {
             AnyClassifier::WorkersAi(c) => &c.model,
             AnyClassifier::Anthropic(c) => &c.model,
             AnyClassifier::OpenAiCompatible(c) => &c.model,
             AnyClassifier::Layered(l) => l.model(),
+            AnyClassifier::Human => "none",
         }
     }
     async fn classify(&self, input: &ClassifyInput<'_>) -> Result<Verdict, ClassifyError> {
@@ -57,44 +53,39 @@ impl Classifier for AnyClassifier {
             AnyClassifier::Anthropic(c) => c.classify(input).await,
             AnyClassifier::OpenAiCompatible(c) => c.classify(input).await,
             AnyClassifier::Layered(l) => l.classify(input).await,
+            AnyClassifier::Human => Err(ClassifyError::Unavailable(
+                "no classifier is configured; a moderator has to look".into(),
+            )),
         }
     }
 }
 
-/// `None` means moderation is off for this deployment: held posts wait for a human.
-pub fn resolve(env: &Env) -> Result<Option<AnyClassifier>, String> {
-    let provider = env
-        .var(PROVIDER_VAR)
-        .map(|v| v.to_string())
-        .unwrap_or_default();
+/// The classifier this deployment configured; [`AnyClassifier::Human`] when it configured none.
+pub fn resolve<P: Platform>(p: &P) -> Result<AnyClassifier<P>, String> {
+    let provider = p.var(PROVIDER_VAR).unwrap_or_default();
     if let Some((front, back)) = provider.split_once('+') {
-        let (Some(front), Some(back)) = (single(env, front.trim())?, single(env, back.trim())?)
-        else {
+        let (Some(front), Some(back)) = (single(p, front.trim())?, single(p, back.trim())?) else {
             return Err(format!(
                 "{PROVIDER_VAR}={provider:?}: both layers must be providers"
             ));
         };
-        return Ok(Some(AnyClassifier::Layered(Box::new(Layered::new(
-            front, back,
-        )))));
+        return Ok(AnyClassifier::Layered(Box::new(Layered::new(front, back))));
     }
-    single(env, provider.trim())
+    Ok(single(p, provider.trim())?.unwrap_or(AnyClassifier::Human))
 }
 
-fn single(env: &Env, provider: &str) -> Result<Option<AnyClassifier>, String> {
-    let model = env.var(MODEL_VAR).map(|v| v.to_string()).ok();
-    let guard_model = env.var(GUARD_MODEL_VAR).map(|v| v.to_string()).ok();
+fn single<P: Platform>(p: &P, provider: &str) -> Result<Option<AnyClassifier<P>>, String> {
+    let model = p.var(MODEL_VAR);
+    let guard_model = p.var(GUARD_MODEL_VAR);
     match provider {
         "off" | "none" => Ok(None),
         "openrouter" | "openrouter_guard" => {
-            let key = env
-                .secret(OPENROUTER_KEY_SECRET)
-                .map(|s| s.to_string())
-                .map_err(|_| {
-                    format!("{PROVIDER_VAR}={provider} needs the {OPENROUTER_KEY_SECRET} secret")
-                })?;
+            let key = p.secret(OPENROUTER_KEY_SECRET).ok_or_else(|| {
+                format!("{PROVIDER_VAR}={provider} needs the {OPENROUTER_KEY_SECRET} secret")
+            })?;
             let guard = provider == "openrouter_guard";
             Ok(Some(AnyClassifier::OpenAiCompatible(OpenAiCompatible {
+                p: p.clone(),
                 url: providers::OPENROUTER_URL.into(),
                 key,
                 model: if guard {
@@ -106,37 +97,35 @@ fn single(env: &Env, provider: &str) -> Result<Option<AnyClassifier>, String> {
             })))
         }
         "anthropic" => {
-            let key = env
-                .secret(ANTHROPIC_KEY_SECRET)
-                .map(|s| s.to_string())
-                .map_err(|_| {
-                    format!("{PROVIDER_VAR}=anthropic needs the {ANTHROPIC_KEY_SECRET} secret")
-                })?;
+            let key = p.secret(ANTHROPIC_KEY_SECRET).ok_or_else(|| {
+                format!("{PROVIDER_VAR}=anthropic needs the {ANTHROPIC_KEY_SECRET} secret")
+            })?;
             Ok(Some(AnyClassifier::Anthropic(Anthropic {
+                p: p.clone(),
                 key,
                 model: model.unwrap_or_else(|| providers::ANTHROPIC_DEFAULT_MODEL.to_string()),
             })))
         }
         "llama_guard" => {
-            let ai = env
-                .ai(AI_BINDING)
-                .map_err(|e| format!("no {AI_BINDING} binding: {e}"))?;
+            if !p.has_ai() {
+                return Err(format!("{PROVIDER_VAR}=llama_guard needs Workers AI"));
+            }
             Ok(Some(AnyClassifier::WorkersAi(WorkersAi {
-                ai,
+                p: p.clone(),
                 model: guard_model.unwrap_or_else(|| providers::LLAMA_GUARD_MODEL.to_string()),
                 guard: true,
             })))
         }
-        // Default: Workers AI if the binding is there, otherwise nothing.
-        _ => match env.ai(AI_BINDING) {
-            Ok(ai) => Ok(Some(AnyClassifier::WorkersAi(WorkersAi {
-                ai,
-                model: model.unwrap_or_else(|| providers::WORKERS_AI_DEFAULT_MODEL.to_string()),
-                guard: false,
-            }))),
-            Err(_) if provider.is_empty() => Ok(None),
-            Err(e) => Err(format!("no {AI_BINDING} binding: {e}")),
-        },
+        // Default: Workers AI if the platform has it, otherwise nothing.
+        _ if p.has_ai() => Ok(Some(AnyClassifier::WorkersAi(WorkersAi {
+            p: p.clone(),
+            model: model.unwrap_or_else(|| providers::WORKERS_AI_DEFAULT_MODEL.to_string()),
+            guard: false,
+        }))),
+        "" => Ok(None),
+        other => Err(format!(
+            "{PROVIDER_VAR}={other:?} needs Workers AI, which this platform does not have"
+        )),
     }
 }
 
@@ -151,15 +140,15 @@ fn transport(e: impl std::fmt::Display) -> ClassifyError {
     }
 }
 
-pub struct WorkersAi {
-    ai: worker::Ai,
+pub struct WorkersAi<P: Platform> {
+    p: P,
     model: String,
     /// Llama Guard speaks a different dialect from an instruct model.
     guard: bool,
 }
 
 #[async_trait::async_trait(?Send)]
-impl Classifier for WorkersAi {
+impl<P: Platform> Classifier for WorkersAi<P> {
     fn model(&self) -> &str {
         &self.model
     }
@@ -169,8 +158,12 @@ impl Classifier for WorkersAi {
         } else {
             providers::workers_ai_request(input)
         };
-        let output: serde_json::Value =
-            self.ai.run(&self.model, request).await.map_err(transport)?;
+        let output = self
+            .p
+            .ai_run(&self.model, request)
+            .await
+            .ok_or_else(|| ClassifyError::Unavailable("no Workers AI on this platform".into()))?
+            .map_err(transport)?;
         if self.guard {
             providers::llama_guard_parse(&output, &self.model)
         } else {
@@ -181,36 +174,34 @@ impl Classifier for WorkersAi {
 
 /// One JSON POST. Error bodies are JSON too and the provider's parser sorts them; only an
 /// unreadable body is a transport failure.
-async fn post_json(
+async fn post_json<P: Platform>(
+    p: &P,
     url: &str,
     headers: Vec<(&'static str, String)>,
     body: &serde_json::Value,
 ) -> Result<serde_json::Value, ClassifyError> {
-    let h = Headers::new();
+    let mut req = HttpRequest::post(url, "application/json", body.to_string());
     for (k, v) in headers {
-        h.set(k, &v).map_err(transport)?;
+        req = req.header(k, v);
     }
-    let mut init = RequestInit::new();
-    init.with_method(Method::Post)
-        .with_headers(h)
-        .with_body(Some(body.to_string().into()));
-    let req = Request::new_with_init(url, &init).map_err(transport)?;
-    let mut resp = Fetch::Request(req).send().await.map_err(transport)?;
-    resp.json().await.map_err(transport)
+    let resp = p.http(req).await.map_err(transport)?;
+    serde_json::from_str(&resp.body).map_err(|e| transport(format!("{e}: {}", resp.body)))
 }
 
-pub struct Anthropic {
+pub struct Anthropic<P: Platform> {
+    p: P,
     key: String,
     model: String,
 }
 
 #[async_trait::async_trait(?Send)]
-impl Classifier for Anthropic {
+impl<P: Platform> Classifier for Anthropic<P> {
     fn model(&self) -> &str {
         &self.model
     }
     async fn classify(&self, input: &ClassifyInput<'_>) -> Result<Verdict, ClassifyError> {
         let output = post_json(
+            &self.p,
             providers::ANTHROPIC_URL,
             providers::anthropic_headers(&self.key),
             &providers::anthropic_request(input, &self.model),
@@ -221,7 +212,8 @@ impl Classifier for Anthropic {
 }
 
 /// OpenRouter, OpenAI, or anything speaking `/chat/completions`; instruct or Llama Guard.
-pub struct OpenAiCompatible {
+pub struct OpenAiCompatible<P: Platform> {
+    p: P,
     url: String,
     key: String,
     model: String,
@@ -229,7 +221,7 @@ pub struct OpenAiCompatible {
 }
 
 #[async_trait::async_trait(?Send)]
-impl Classifier for OpenAiCompatible {
+impl<P: Platform> Classifier for OpenAiCompatible<P> {
     fn model(&self) -> &str {
         &self.model
     }
@@ -240,6 +232,7 @@ impl Classifier for OpenAiCompatible {
             providers::openai_compatible_request(input, &self.model)
         };
         let output = post_json(
+            &self.p,
             &self.url,
             providers::openai_compatible_headers(&self.key),
             &body,
@@ -253,50 +246,59 @@ impl Classifier for OpenAiCompatible {
     }
 }
 
-/// The producer side of the `MODERATION` queue. Absent binding means no queue, and the cron
-/// sweep does all the work.
-pub struct QueueProducer(worker::Queue);
-
-impl QueueProducer {
-    pub fn from_env(env: &Env) -> Option<Self> {
-        env.queue(QUEUE_BINDING).ok().map(QueueProducer)
-    }
-}
+/// The write path's view of the queue: hand the post over and carry on. A platform without a
+/// queue says so and the sweep does the work.
+pub struct Queue<P: Platform>(pub P);
 
 #[async_trait::async_trait(?Send)]
-impl ModerationQueue for QueueProducer {
+impl<P: Platform> ModerationQueue for Queue<P> {
     async fn enqueue(&self, post: &PublicId, reasons: &[Reason]) -> Result<(), String> {
         self.0
-            .send(Job {
+            .enqueue(Job {
                 post: post.encode(),
                 reasons: reasons.to_vec(),
             })
             .await
-            .map_err(|e| e.to_string())
+            .map(|_| ())
     }
 }
 
-/// Either the real queue or nothing; the reply handler does not care which.
-pub enum MaybeQueue {
-    Real(QueueProducer),
-    None,
-}
-
-impl MaybeQueue {
-    pub fn from_env(env: &Env) -> Self {
-        match QueueProducer::from_env(env) {
-            Some(q) => MaybeQueue::Real(q),
-            None => MaybeQueue::None,
+/// What a queue consumer does with one job. `Ok(true)` is done; `Ok(false)` asks for a retry;
+/// `Err` is a job that can never succeed and should be dropped.
+pub async fn process<P: Platform>(
+    p: &P,
+    classifier: &AnyClassifier<P>,
+    job: &Job,
+) -> Result<bool, String> {
+    let post = PublicId::parse(&job.post).map_err(|e| format!("bad id {:?}: {e}", job.post))?;
+    match pipeline::process_post(p.store(), classifier, &post, &job.reasons, p.now_ms()).await {
+        Ok(outcome) => {
+            p.log(&format!("moderation: {post} -> {outcome:?}"));
+            Ok(true)
+        }
+        Err(e) => {
+            p.log(&format!("moderation: {post} store error, will retry: {e}"));
+            Ok(false)
         }
     }
 }
 
-#[async_trait::async_trait(?Send)]
-impl ModerationQueue for MaybeQueue {
-    async fn enqueue(&self, post: &PublicId, reasons: &[Reason]) -> Result<(), String> {
-        match self {
-            MaybeQueue::Real(q) => q.enqueue(post, reasons).await,
-            MaybeQueue::None => Ok(()),
+/// The safety net: anything still pending past the grace period, that no human has yet, is
+/// classified here -- whether the queue is misconfigured, absent, or lost a message.
+pub async fn sweep<P: Platform>(p: &P) {
+    let classifier = match resolve(p) {
+        Ok(c) => c,
+        Err(why) => {
+            p.log(&format!("sweep: classifier misconfigured: {why}"));
+            return;
         }
+    };
+    match pipeline::drain(p.store(), &classifier, p.now_ms(), SWEEP_LIMIT).await {
+        Ok(results) => {
+            for (post, r) in results {
+                p.log(&format!("sweep: {post} -> {r:?}"));
+            }
+        }
+        Err(e) => p.log(&format!("sweep: {e}")),
     }
 }

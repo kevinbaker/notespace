@@ -1,15 +1,16 @@
 //! Account self-service: settings, address verification, and password recovery. The password
 //! flows exist only with the `password` feature; verification works for any account.
 
+use crate::platform::Platform;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
+use notespace_app_macros::handler;
 use notespace_core::account::{self, ConfirmOutcome, Delivery};
 use notespace_core::email::EmailToken;
 use notespace_core::store::Store;
 use notespace_render::account::{SettingsError, SettingsNotice, VerifyOutcome};
 use serde::Deserialize;
-use worker::Env;
 
 use crate::{
     anon_binding, anon_page, anon_token, csrf_key, error, form_fields, host, ids, mail, now_ms,
@@ -57,9 +58,9 @@ fn settings_notice(q: &SettingsQuery) -> Option<SettingsNotice> {
     Some(SettingsNotice::Error(err))
 }
 
-#[worker::send]
-pub async fn settings(
-    State(env): State<Env>,
+#[handler]
+pub async fn settings<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     Query(q): Query<SettingsQuery>,
 ) -> Response {
@@ -87,9 +88,9 @@ pub async fn settings(
 }
 
 /// Also how "resend the link" works: re-saving the same address issues a fresh one.
-#[worker::send]
-pub async fn change_email(
-    State(env): State<Env>,
+#[handler]
+pub async fn change_email<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Response {
@@ -106,10 +107,10 @@ pub async fn change_email(
         Ok(t) => t,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
     };
-    let mailer = mail::MaybeMailer::from_env(&env);
+    let mailer = mail::MaybeMailer::resolve(&env);
     let link_cfg = mail::LinkConfig::resolve(&env, host(&headers));
     match account::change_email(
-        &signed.store,
+        signed.store,
         &mailer,
         &link_cfg.links(),
         &signed.user,
@@ -121,10 +122,10 @@ pub async fn change_email(
     {
         Ok(Ok(delivery)) => {
             if let Delivery::Failed(why) = &delivery {
-                worker::console_log!(
+                crate::log(&format!(
                     "mail: verification to user {} failed: {why}",
                     signed.user.id
-                );
+                ));
             }
             see_other(format!("/settings?did={}", delivery_code(&delivery)))
         }
@@ -137,9 +138,9 @@ pub async fn change_email(
 }
 
 /// Ends every session but the one asking.
-#[worker::send]
-pub async fn end_other_sessions(
-    State(env): State<Env>,
+#[handler]
+pub async fn end_other_sessions<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Response {
@@ -174,9 +175,9 @@ pub struct TokenQuery {
 
 /// The link lands here and shows a button. Following a link must not spend it: mail scanners
 /// follow links.
-#[worker::send]
-pub async fn verify_form(
-    State(env): State<Env>,
+#[handler]
+pub async fn verify_form<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     Query(q): Query<TokenQuery>,
 ) -> Response {
@@ -204,9 +205,9 @@ pub async fn verify_form(
     )
 }
 
-#[worker::send]
-pub async fn verify_submit(
-    State(env): State<Env>,
+#[handler]
+pub async fn verify_submit<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Response {
@@ -230,11 +231,8 @@ pub async fn verify_submit(
             Some(VerifyOutcome::Invalid),
         ));
     };
-    let Ok(db) = env.d1(crate::DB_BINDING) else {
-        return error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding");
-    };
-    let store = crate::store::D1Store::new(db);
-    let outcome = match account::confirm_email(&store, &token, now_ms()).await {
+    let store = env.store();
+    let outcome = match account::confirm_email(store, &token, now_ms()).await {
         Ok(ConfirmOutcome::Verified { .. }) => VerifyOutcome::Verified,
         Ok(ConfirmOutcome::Invalid) => VerifyOutcome::Invalid,
         Ok(ConfirmOutcome::Stale) => VerifyOutcome::Stale,
@@ -269,7 +267,7 @@ mod passwords {
     use notespace_render::account::{ForgotError, ResetError};
 
     /// Peppers and scheme, or the response explaining why there are none.
-    fn recovery_config(env: &Env) -> Result<RecoveryConfig, Response> {
+    fn recovery_config<P: Platform>(env: &P) -> Result<RecoveryConfig, Response> {
         match AuthConfig::resolve(env) {
             AuthConfig::Refused(why) => Err(error(StatusCode::SERVICE_UNAVAILABLE, why)),
             AuthConfig::External => Err(error(StatusCode::NOT_FOUND, "password login is disabled")),
@@ -294,9 +292,9 @@ mod passwords {
             .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))
     }
 
-    #[worker::send]
-    pub async fn change_password(
-        State(env): State<Env>,
+    #[handler]
+    pub async fn change_password<P: Platform>(
+        State(env): State<P>,
         headers: axum::http::HeaderMap,
         body: String,
     ) -> Response {
@@ -317,10 +315,10 @@ mod passwords {
             Ok(s) => s,
             Err(r) => return r,
         };
-        let mailer = mail::MaybeMailer::from_env(&env);
+        let mailer = mail::MaybeMailer::resolve(&env);
         let link_cfg = mail::LinkConfig::resolve(&env, host(&headers));
         match account::change_password(
-            &signed.store,
+            signed.store,
             &mailer,
             &link_cfg.links(),
             &cfg,
@@ -351,9 +349,9 @@ mod passwords {
         sent: Option<String>,
     }
 
-    #[worker::send]
-    pub async fn forgot_form(
-        State(env): State<Env>,
+    #[handler]
+    pub async fn forgot_form<P: Platform>(
+        State(env): State<P>,
         headers: axum::http::HeaderMap,
         Query(q): Query<ForgotQuery>,
     ) -> Response {
@@ -389,9 +387,9 @@ mod passwords {
     }
 
     /// Redirects to the same acknowledgement whether or not the address was known.
-    #[worker::send]
-    pub async fn forgot_submit(
-        State(env): State<Env>,
+    #[handler]
+    pub async fn forgot_submit<P: Platform>(
+        State(env): State<P>,
         headers: axum::http::HeaderMap,
         body: String,
     ) -> Response {
@@ -413,18 +411,15 @@ mod passwords {
         {
             return see_other("/forgot?error=expired".into());
         }
-        let Ok(db) = env.d1(crate::DB_BINDING) else {
-            return error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding");
-        };
-        let store = crate::store::D1Store::new(db);
+        let store = env.store();
         let token = match ids::random_email_token() {
             Ok(t) => t,
             Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
         };
-        let mailer = mail::MaybeMailer::from_env(&env);
+        let mailer = mail::MaybeMailer::resolve(&env);
         let link_cfg = mail::LinkConfig::resolve(&env, host(&headers));
         match account::request_reset(
-            &store,
+            store,
             &mailer,
             &link_cfg.links(),
             &cfg,
@@ -441,13 +436,9 @@ mod passwords {
                 // The visitor learns nothing from this; the operator does.
                 match delivery {
                     Some(Delivery::Failed(why)) => {
-                        worker::console_log!("mail: reset failed: {why}")
+                        crate::log(&format!("mail: reset failed: {why}"))
                     }
-                    Some(Delivery::NotConfigured) => {
-                        worker::console_log!(
-                            "mail: a reset was requested but no mailer is configured"
-                        )
-                    }
+                    Some(Delivery::NotConfigured) => crate::log("mail: a reset was requested but no mailer is configured"),
                     _ => {}
                 }
                 see_other("/forgot?sent=1".into())
@@ -463,9 +454,9 @@ mod passwords {
         }
     }
 
-    #[worker::send]
-    pub async fn reset_form(
-        State(env): State<Env>,
+    #[handler]
+    pub async fn reset_form<P: Platform>(
+        State(env): State<P>,
         headers: axum::http::HeaderMap,
         Query(q): Query<TokenQuery>,
     ) -> Response {
@@ -488,10 +479,7 @@ mod passwords {
             ));
         };
         // Say whose password this is: the mail's address does not.
-        let Ok(db) = env.d1(crate::DB_BINDING) else {
-            return error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding");
-        };
-        let store = crate::store::D1Store::new(db);
+        let store = env.store();
         let username = match store
             .peek_email_token(&token.hash(), TokenKind::Reset, now_ms())
             .await
@@ -525,9 +513,9 @@ mod passwords {
         )
     }
 
-    #[worker::send]
-    pub async fn reset_submit(
-        State(env): State<Env>,
+    #[handler]
+    pub async fn reset_submit<P: Platform>(
+        State(env): State<P>,
         headers: axum::http::HeaderMap,
         body: String,
     ) -> Response {
@@ -554,18 +542,15 @@ mod passwords {
         let Some(token) = EmailToken::parse(raw) else {
             return back("invalid");
         };
-        let Ok(db) = env.d1(crate::DB_BINDING) else {
-            return error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding");
-        };
-        let store = crate::store::D1Store::new(db);
+        let store = env.store();
         let salt = match fresh_salt() {
             Ok(s) => s,
             Err(r) => return r,
         };
-        let mailer = mail::MaybeMailer::from_env(&env);
+        let mailer = mail::MaybeMailer::resolve(&env);
         let link_cfg = mail::LinkConfig::resolve(&env, host(&headers));
         match account::complete_reset(
-            &store,
+            store,
             &mailer,
             &link_cfg.links(),
             &cfg,
@@ -591,23 +576,23 @@ mod passwords {
 
 /// Password recovery compiled out: the endpoints do not exist.
 #[cfg(not(feature = "password"))]
-pub async fn change_password() -> Response {
+pub async fn change_password<P: Platform>(State(_): State<P>) -> Response {
     external()
 }
 #[cfg(not(feature = "password"))]
-pub async fn forgot_form() -> Response {
+pub async fn forgot_form<P: Platform>(State(_): State<P>) -> Response {
     external()
 }
 #[cfg(not(feature = "password"))]
-pub async fn forgot_submit() -> Response {
+pub async fn forgot_submit<P: Platform>(State(_): State<P>) -> Response {
     external()
 }
 #[cfg(not(feature = "password"))]
-pub async fn reset_form() -> Response {
+pub async fn reset_form<P: Platform>(State(_): State<P>) -> Response {
     external()
 }
 #[cfg(not(feature = "password"))]
-pub async fn reset_submit() -> Response {
+pub async fn reset_submit<P: Platform>(State(_): State<P>) -> Response {
     external()
 }
 #[cfg(not(feature = "password"))]

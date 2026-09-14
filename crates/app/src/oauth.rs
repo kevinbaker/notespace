@@ -3,23 +3,23 @@
 //! with two sealed cookies: `OAUTH` (state and nonce, redirect to callback) and `PENDING`
 //! (the identity, callback to the username step).
 
+use crate::platform::{HttpRequest, Platform};
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
+use notespace_app_macros::handler;
 use notespace_core::cookie;
 use notespace_core::oidc::{
     self, Finish, FinishRejected, OutboundRequest, Pending, Provider, ProviderKind, RemoteIdentity,
-    SignIn, SignatureCheck,
+    SignIn,
 };
 use notespace_core::session::SessionPolicy;
 use notespace_render::auth::{FinishError, ProviderButton};
 use serde::{Deserialize, Serialize};
-use worker::{Env, Fetch, Headers, Method, Request, RequestInit};
 
-use crate::store::D1Store;
 use crate::{
     anon_binding, anon_page, anon_token, cookie_header, csrf_key, error, form_fields, host, ids,
-    mail, now_ms, see_other, uncached_html, urlencoding, DB_BINDING,
+    mail, now_ms, see_other, uncached_html, urlencoding,
 };
 
 /// Client ids are `OIDC_<PROVIDER>_CLIENT_ID` vars; secrets `OIDC_<PROVIDER>_CLIENT_SECRET`.
@@ -37,21 +37,13 @@ const STATE_LIFETIME_MS: i64 = 10 * 60 * 1000;
 const PENDING_LIFETIME_MS: i64 = 30 * 60 * 1000;
 
 /// Every provider the deployment configured, with callbacks on this host.
-pub fn providers(env: &Env, host: Option<&str>) -> Vec<Provider> {
+pub fn providers<P: Platform>(env: &P, host: Option<&str>) -> Vec<Provider> {
     let base = mail::LinkConfig::resolve(env, host);
     ProviderKind::ALL
         .into_iter()
         .filter_map(|kind| {
-            let id = env
-                .var(&client_id_var(kind))
-                .ok()
-                .map(|v| v.to_string())
-                .filter(|v| !v.trim().is_empty());
-            let secret = env
-                .secret(&client_secret_var(kind))
-                .ok()
-                .map(|s| s.to_string())
-                .filter(|v| !v.is_empty());
+            let id = env.var(&client_id_var(kind));
+            let secret = env.secret(&client_secret_var(kind));
             match (id, secret) {
                 (Some(client_id), Some(client_secret)) => Some(Provider {
                     kind,
@@ -65,10 +57,10 @@ pub fn providers(env: &Env, host: Option<&str>) -> Vec<Provider> {
                 }),
                 (None, None) => None,
                 _ => {
-                    worker::console_log!(
+                    crate::log(&format!(
                         "oidc: {} has a client id or a secret but not both; not offered",
                         kind.as_str()
-                    );
+                    ));
                     None
                 }
             }
@@ -77,7 +69,11 @@ pub fn providers(env: &Env, host: Option<&str>) -> Vec<Provider> {
 }
 
 /// The sign-in page's buttons.
-pub fn buttons(env: &Env, host: Option<&str>, next: Option<&str>) -> Vec<ProviderButton<'static>> {
+pub fn buttons<P: Platform>(
+    env: &P,
+    host: Option<&str>,
+    next: Option<&str>,
+) -> Vec<ProviderButton<'static>> {
     providers(env, host)
         .into_iter()
         .map(|p| ProviderButton {
@@ -90,7 +86,7 @@ pub fn buttons(env: &Env, host: Option<&str>, next: Option<&str>) -> Vec<Provide
         .collect()
 }
 
-fn provider(env: &Env, host: Option<&str>, name: &str) -> Option<Provider> {
+fn provider<P: Platform>(env: &P, host: Option<&str>, name: &str) -> Option<Provider> {
     let kind = ProviderKind::parse(name)?;
     providers(env, host).into_iter().find(|p| p.kind == kind)
 }
@@ -110,9 +106,9 @@ pub struct StartQuery {
 }
 
 /// Off to the provider, with the state sealed in a cookie the callback checks against.
-#[worker::send]
-pub async fn start(
-    State(env): State<Env>,
+#[handler]
+pub async fn start<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     UrlPath(name): UrlPath<String>,
     Query(q): Query<StartQuery>,
@@ -167,37 +163,35 @@ pub struct CallbackQuery {
 }
 
 /// One HTTP call on the flow's behalf: status and body back, the rest is `core`'s.
-async fn send(req: &OutboundRequest) -> Result<(u16, String), String> {
-    let h = Headers::new();
-    for (k, v) in &req.headers {
-        h.set(k, v).map_err(|e| e.to_string())?;
-    }
-    let mut init = RequestInit::new();
-    init.with_headers(h);
-    if req.method == "POST" {
+async fn send<P: Platform>(env: &P, req: &OutboundRequest) -> Result<(u16, String), String> {
+    let mut out = if req.method == "POST" {
         let mut enc = form_urlencoded::Serializer::new(String::new());
         for (k, v) in &req.form {
             enc.append_pair(k, v);
         }
-        init.with_method(Method::Post)
-            .with_body(Some(enc.finish().into()));
-        init.headers
-            .set("Content-Type", "application/x-www-form-urlencoded")
-            .map_err(|e| e.to_string())?;
+        HttpRequest::post(
+            req.url.clone(),
+            "application/x-www-form-urlencoded",
+            enc.finish(),
+        )
+    } else {
+        HttpRequest::get(req.url.clone())
+    };
+    for (k, v) in &req.headers {
+        out = out.header(k.to_string(), v.to_string());
     }
-    let request = Request::new_with_init(&req.url, &init).map_err(|e| e.to_string())?;
-    let mut resp = Fetch::Request(request)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let status = resp.status_code();
-    let text = resp.text().await.unwrap_or_default();
-    Ok((status, text))
+    let resp = env.http(out).await?;
+    Ok((resp.status, resp.body))
 }
 
 /// The provider's assertion about the visitor, checked.
-async fn identity(p: &Provider, code: &str, nonce: &str) -> Result<RemoteIdentity, String> {
-    let (status, body) = send(&p.token_request(code)).await?;
+async fn identity<P: Platform>(
+    env: &P,
+    p: &Provider,
+    code: &str,
+    nonce: &str,
+) -> Result<RemoteIdentity, String> {
+    let (status, body) = send(env, &p.token_request(code)).await?;
     let tokens = p
         .parse_token_response(status, &body)
         .map_err(|e| e.to_string())?;
@@ -207,15 +201,18 @@ async fn identity(p: &Provider, code: &str, nonce: &str) -> Result<RemoteIdentit
             let token = oidc::parse_id_token(&jwt).map_err(|e| e.to_string())?;
             oidc::check_claims(&token, p, nonce, now_ms() / 1000).map_err(|e| e.to_string())?;
             let jwks_url = p.jwks_url().ok_or("no JWKS url")?;
-            let (_, jwks) = send(&OutboundRequest {
-                method: "GET",
-                url: jwks_url.into(),
-                headers: Vec::new(),
-                form: Vec::new(),
-            })
+            let (_, jwks) = send(
+                env,
+                &OutboundRequest {
+                    method: "GET",
+                    url: jwks_url.into(),
+                    headers: Vec::new(),
+                    form: Vec::new(),
+                },
+            )
             .await?;
             let key = oidc::select_jwk(&jwks, token.kid.as_deref()).map_err(|e| e.to_string())?;
-            let ok = crate::subtle::Rs256
+            let ok = env
                 .verify_rs256(&key, token.signing_input.as_bytes(), &token.signature)
                 .await?;
             if !ok {
@@ -228,7 +225,7 @@ async fn identity(p: &Provider, code: &str, nonce: &str) -> Result<RemoteIdentit
             let requests = p.userinfo_requests(&access);
             let mut bodies = Vec::with_capacity(requests.len());
             for r in &requests {
-                let (status, body) = send(r).await?;
+                let (status, body) = send(env, r).await?;
                 if !(200..300).contains(&status) {
                     return Err(format!("GitHub {} answered {status}", r.url));
                 }
@@ -245,15 +242,15 @@ async fn identity(p: &Provider, code: &str, nonce: &str) -> Result<RemoteIdentit
 
 /// Back from the provider. Every failure lands on the sign-in page with a reason, and the
 /// reason is generic on purpose: what exactly failed is in the log.
-#[worker::send]
-pub async fn callback(
-    State(env): State<Env>,
+#[handler]
+pub async fn callback<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     UrlPath(name): UrlPath<String>,
     Query(q): Query<CallbackQuery>,
 ) -> Response {
     let fail = |why: &str| -> Response {
-        worker::console_log!("oidc: {name} sign-in failed: {why}");
+        crate::log(&format!("oidc: {name} sign-in failed: {why}"));
         let mut resp = see_other("/login?error=provider".into());
         if let Ok(v) = cookie::clear(cookie::OAUTH).parse() {
             resp.headers_mut().append(header::SET_COOKIE, v);
@@ -294,21 +291,18 @@ pub async fn callback(
     let Some(code) = q.code.as_deref().filter(|c| !c.is_empty()) else {
         return fail("no code");
     };
-    let identity = match identity(&p, code, &handshake.nonce).await {
+    let identity = match identity(&env, &p, code, &handshake.nonce).await {
         Ok(i) => i,
         Err(why) => return fail(&why),
     };
 
-    let Ok(db) = env.d1(DB_BINDING) else {
-        return error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding");
-    };
-    let store = D1Store::new(db);
+    let store = env.store();
     let token = match ids::random_session_token() {
         Ok(t) => t,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
     };
     let sessions = SessionPolicy::default();
-    match oidc::sign_in(&store, &identity, token.clone(), &sessions, now_ms()).await {
+    match oidc::sign_in(store, &identity, token.clone(), &sessions, now_ms()).await {
         Ok(SignIn::Done { .. }) => {
             let target = handshake.next.as_deref().unwrap_or("/");
             let mut resp = see_other(target.into());
@@ -350,7 +344,7 @@ pub async fn callback(
 }
 
 /// The sealed identity, if the visitor is mid-signup.
-fn pending(env: &Env, headers: &axum::http::HeaderMap) -> Option<Pending> {
+fn pending<P: Platform>(env: &P, headers: &axum::http::HeaderMap) -> Option<Pending> {
     let key = csrf_key(env)?;
     let sealed = cookie::get(cookie_header(headers), cookie::PENDING)?;
     let bytes = key.open(&sealed, now_ms()).ok()?;
@@ -363,9 +357,9 @@ pub struct FinishQuery {
     name: Option<String>,
 }
 
-#[worker::send]
-pub async fn finish_form(
-    State(env): State<Env>,
+#[handler]
+pub async fn finish_form<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     Query(q): Query<FinishQuery>,
 ) -> Response {
@@ -405,9 +399,9 @@ pub async fn finish_form(
     )
 }
 
-#[worker::send]
-pub async fn finish_submit(
-    State(env): State<Env>,
+#[handler]
+pub async fn finish_submit<P: Platform>(
+    State(env): State<P>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Response {
@@ -435,17 +429,14 @@ pub async fn finish_submit(
     {
         return back("expired");
     }
-    let Ok(db) = env.d1(DB_BINDING) else {
-        return error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding");
-    };
-    let store = D1Store::new(db);
+    let store = env.store();
     let token = match ids::random_session_token() {
         Ok(t) => t,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e),
     };
     let sessions = SessionPolicy::default();
     match oidc::finish(
-        &store,
+        store,
         &p.identity,
         &name,
         token.clone(),
@@ -478,8 +469,8 @@ pub async fn finish_submit(
 /// The page a build without password login serves at `/login` and `/register`: the provider
 /// buttons alone.
 #[cfg_attr(feature = "password", allow(dead_code))]
-pub fn providers_only_page(
-    env: &Env,
+pub fn providers_only_page<P: Platform>(
+    env: &P,
     headers: &axum::http::HeaderMap,
     next: Option<&str>,
     error: Option<notespace_render::auth::LoginError>,

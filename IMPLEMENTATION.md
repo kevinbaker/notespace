@@ -32,6 +32,19 @@ The migration list has a completeness guard in `crates/store-sqlite/tests/confor
 | Per-request query telemetry | `crates/worker/src/store.rs` — `QueryStats`, emitted as `Server-Timing` |
 | CPU benchmarks under V8 | `crates/bench-wasm/`, driven by `scripts/kdf-bench.mjs` and `scripts/kdf-sweep.mjs` |
 
+## Two targets, one web layer
+
+| what | where |
+|---|---|
+| The `Platform` trait: store, clock, config, HTTP, cache, queue, AI, mail binding, RS256 | `crates/app/src/platform.rs` |
+| Every route and handler, generic over it | `crates/app/src/lib.rs` — `router`, and `account.rs`, `admin.rs`, `posting.rs`, `oauth.rs` |
+| `#[handler]`: a `Send` future for axum around `?Send` awaits | `crates/app-macros` |
+| Process-wide clock and log, installed once by the platform | `notespace_app::runtime` |
+| The Worker's platform: bindings, `SendWrapper<Rc<D1Store>>` | `crates/worker/src/lib.rs` — `Cloudflare` |
+| The binary's platform: `SqliteStore`, `reqwest`, env, in-memory cache, channel queue | `crates/server/src/main.rs` — `Native` |
+| Migrations applied on start, recorded in `schema_migrations` | `SqliteStore::open`, `MIGRATIONS` in `crates/store-sqlite` |
+| Secrets generated on first run beside the database | `configure` in `crates/server/src/main.rs` |
+
 ## §3.3 Read path — bake, don't render
 
 | what | where |

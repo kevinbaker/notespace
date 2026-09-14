@@ -2,7 +2,7 @@
 
 ## 0.1.0 — 2026-09-13
 
-First release. Suitable for a limited beta on a free Cloudflare account; see
+First release. Suitable for a limited beta, self-hosted or on a free Cloudflare account; see
 [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ### What is in it
@@ -28,25 +28,32 @@ First release. Suitable for a limited beta on a free Cloudflare account; see
 - **The look.** One stylesheet, small dense type in Noto Sans, one green accent. Every colour,
   size and face is a token; the site (`SITE_THEME`) and each space override tokens and add CSS
   of their own, served as versioned immutable stylesheets. Light and dark.
+- **Two targets, one web layer.** Every handler is written against a `Platform` trait.
+  `crates/worker` implements it with Cloudflare bindings; `crates/server` with a SQLite file,
+  `reqwest` and the environment, as one binary that generates its secrets on first run, applies
+  migrations on start, and serves its own static files.
 - **Tooling.** A deterministic seed, a Hacker News importer that runs real threads through the
   real write path, a wasm CPU benchmark harness, a page preview that needs no database, and a
   conformance suite that both storage adapters pass.
 
 ### Known limitations — read before a beta
 
-- **No self-hosted server yet.** The SQLite storage adapter passes the same tests as D1, but
-  the HTTP server around it is not built. Cloudflare is the only deployment target in this
-  release.
-- **Mail on the free plan needs an outside provider.** Cloudflare's Email Service is paid-plan
-  only. Without any provider the site runs, but a forgotten password cannot be reset — one
-  reason Google/GitHub sign-in is the recommended default.
+- **The self-hosted binary is single-threaded and speaks plain HTTP.** Fine for a small forum;
+  put Caddy or nginx in front for TLS, which the `Secure` session cookies need anywhere but
+  `localhost`. Workers AI and Cloudflare's Email Service are not available to it; the Anthropic
+  and OpenRouter classifiers and the five HTTP mail providers are.
+- **Mail needs a provider.** On the free Cloudflare plan the Email Service is unavailable, and
+  natively there is no binding; either way `MAIL_PROVIDER` plus a key. Without any provider the
+  site runs, but a forgotten password cannot be reset — one reason Google/GitHub sign-in is the
+  recommended default.
 - **Password hashing on the free plan is below OWASP's minimum** (4 MiB Argon2id against a
   10 ms CPU budget). The pepper is the mitigation. `PASSWORD_SCHEME=owasp` on a paid plan is the
   fix.
 - **The classifier budget is ~500 posts a day** on the free plan's Workers AI allowance, and
   the default 8B model over-flags ordinary comments (DECISIONS.md has the evaluation). Past the
-  budget, held posts wait for a moderator. For a beta where every account is new, lower each
-  space's `new_account_hours` or expect to clear the queue by hand.
+  budget, or with no classifier configured at all, held posts go to `/mod/queue` for a
+  moderator. For a beta where every account is new, lower each space's `new_account_hours` or
+  expect to clear the queue by hand.
 - **No search, no notifications, no mentions.** Reading is by browsing and RSS.
 - **No self-service account deletion.** A moderator can ban or delete an account; a member
   cannot delete their own from `/settings`. Anyone running a beta in a jurisdiction that
@@ -58,7 +65,8 @@ First release. Suitable for a limited beta on a free Cloudflare account; see
   register" regardless; the pages themselves are shared byte-for-byte by design.
 - **Free-plan capacity is about 100k Worker requests a day**, static assets excluded. A
   popular thread costs one request per reader, D1 nothing; a signed-in reader costs two.
-- **Backups are D1's.** `wrangler d1 export` for a copy; D1 Time Travel for point-in-time
-  restore. Nothing in the app does this for you.
-- **Migrations are forward-only.** There is no down migration and no in-app migration runner;
-  `wrangler d1 migrations apply --remote` is the step, before `deploy`.
+- **Backups are yours.** Self-hosted: the database file and the keys file beside it. Cloudflare:
+  `wrangler d1 export` for a copy, D1 Time Travel for point-in-time restore. Nothing in the app
+  does this for you.
+- **Migrations are forward-only.** The binary applies pending ones on start; on Cloudflare,
+  `wrangler d1 migrations apply --remote` is the step before `deploy`. There is no down.

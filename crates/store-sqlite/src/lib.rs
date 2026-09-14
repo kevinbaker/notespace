@@ -24,6 +24,51 @@ use notespace_core::store::{
 };
 use rusqlite::{Connection, OptionalExtension, Row};
 
+/// Every migration, in order, with its file name: what [`SqliteStore::open`] applies and
+/// records. Dialect-identical to what `wrangler d1 migrations apply` runs against D1.
+pub const MIGRATIONS: [(&str, &str); 10] = [
+    (
+        "0001_init.sql",
+        include_str!("../../../migrations/0001_init.sql"),
+    ),
+    (
+        "0002_thread_public_id.sql",
+        include_str!("../../../migrations/0002_thread_public_id.sql"),
+    ),
+    (
+        "0003_space_paths_and_names.sql",
+        include_str!("../../../migrations/0003_space_paths_and_names.sql"),
+    ),
+    (
+        "0004_post_public_id.sql",
+        include_str!("../../../migrations/0004_post_public_id.sql"),
+    ),
+    (
+        "0005_session.sql",
+        include_str!("../../../migrations/0005_session.sql"),
+    ),
+    (
+        "0006_login_attempt.sql",
+        include_str!("../../../migrations/0006_login_attempt.sql"),
+    ),
+    (
+        "0007_user_password.sql",
+        include_str!("../../../migrations/0007_user_password.sql"),
+    ),
+    (
+        "0008_moderation.sql",
+        include_str!("../../../migrations/0008_moderation.sql"),
+    ),
+    (
+        "0009_email_and_spaces.sql",
+        include_str!("../../../migrations/0009_email_and_spaces.sql"),
+    ),
+    (
+        "0010_external_identity.sql",
+        include_str!("../../../migrations/0010_external_identity.sql"),
+    ),
+];
+
 pub struct SqliteStore {
     conn: Connection,
 }
@@ -46,7 +91,36 @@ impl SqliteStore {
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
+
+    /// A database file, created if absent, in WAL mode with every pending migration applied.
+    /// Applied migrations are recorded by name in `schema_migrations`, the way wrangler records
+    /// them for D1, so a newer binary against an older file runs only what is new.
+    pub fn open(path: &std::path::Path) -> Result<Self, rusqlite::Error> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; \
+             CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);",
+        )?;
+        for (name, sql) in MIGRATIONS {
+            let done: bool = conn.query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE name = ?1",
+                [name],
+                |r| r.get::<_, i64>(0).map(|n| n > 0),
+            )?;
+            if done {
+                continue;
+            }
+            conn.execute_batch(sql)?;
+            conn.execute(
+                "INSERT INTO schema_migrations (name, applied_at) VALUES (?1, strftime('%s','now') * 1000)",
+                [name],
+            )?;
+        }
+        Ok(Self::new(conn))
+    }
 }
+
+impl notespace_core::store::Instrumented for SqliteStore {}
 
 fn backend(e: impl core::fmt::Display) -> StoreError {
     StoreError::Backend(e.to_string())

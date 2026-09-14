@@ -1,7 +1,7 @@
 //! Resolving the password pepper, and refusing to run without one.
 
+use crate::platform::Platform;
 use notespace_core::password::{PepperSet, Scheme};
-use worker::{console_error, Env};
 
 pub const SCHEME_BINDING: &str = "PASSWORD_SCHEME";
 
@@ -20,16 +20,16 @@ pub enum AuthConfig {
 }
 
 impl AuthConfig {
-    pub fn resolve(env: &Env) -> AuthConfig {
+    pub fn resolve<P: Platform>(p: &P) -> AuthConfig {
         if !cfg!(feature = "password") {
             return AuthConfig::External;
         }
-        let Some(spec) = env.secret(PEPPER_BINDING).ok().map(|s| s.to_string()) else {
+        let Some(spec) = p.secret(PEPPER_BINDING) else {
             return AuthConfig::Refused(
                 "PASSWORD_PEPPER is not set. Password login is disabled until it is. Generate \
                  one with `printf '1=%s' \"$(openssl rand -hex 32)\" | wrangler secret put \
                  PASSWORD_PEPPER`. It cannot be generated automatically here -- see \
-                 crates/worker/src/auth_config.rs.",
+                 crates/app/src/auth_config.rs.",
             );
         };
         // A partly-loaded set would strand an arbitrary subset of accounts.
@@ -43,12 +43,7 @@ impl AuthConfig {
                 )
             }
         };
-        let scheme = match env
-            .var(SCHEME_BINDING)
-            .ok()
-            .map(|v| v.to_string())
-            .as_deref()
-        {
+        let scheme = match p.var(SCHEME_BINDING).as_deref() {
             // Below OWASP; the mandatory pepper is what makes it tolerable.
             None | Some("constrained") => Scheme::CONSTRAINED,
             // OWASP's minimum, ~57 ms of CPU: for a paid plan with `limits.cpu_ms` raised.
@@ -56,10 +51,10 @@ impl AuthConfig {
             Some("client-argon") => Scheme::CLIENT_ARGON,
             Some(other) => {
                 // Refuse rather than default, so a misspelling cannot silently weaken hashing.
-                console_error!(
+                p.log_error(&format!(
                     "{SCHEME_BINDING}={other:?} is not a known scheme. Expected \
                      \"constrained\", \"owasp\" or \"client-argon\". Password login is disabled."
-                );
+                ));
                 return AuthConfig::Refused(
                     "PASSWORD_SCHEME is not a known scheme. Expected \"constrained\", \"owasp\" \
                      or \"client-argon\".",

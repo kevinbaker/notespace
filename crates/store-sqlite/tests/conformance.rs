@@ -915,37 +915,40 @@ async fn locate_post_stays_inside_its_budget() {
     assert_eq!(n, 3, "paged locate_post ran {n} statements, budget is 3");
 }
 
-/// The AI and queue bindings, same failure mode. Read from the moderation module rather than
-/// lib.rs, which is where they are declared.
+/// Every binding the Worker names must be declared in wrangler.toml under that name. A mismatch
+/// is a runtime "no D1 binding" (or a silently absent queue), never a build failure, so it is
+/// checked here where `cargo test` runs.
 #[test]
-fn the_moderation_binding_names_match_wrangler_toml() {
-    let src = include_str!("../../worker/src/moderation.rs");
+fn the_binding_names_match_wrangler_toml() {
+    let src = include_str!("../../worker/src/lib.rs");
     let toml = include_str!("../../../wrangler.toml");
     let constant = |name: &str| -> String {
         src.lines()
             .find_map(|l| {
                 l.trim()
-                    .strip_prefix(&format!("pub const {name}: &str = \""))
+                    .strip_prefix(&format!("pub(crate) const {name}: &str = \""))
             })
             .and_then(|l| l.split('"').next())
-            .unwrap_or_else(|| panic!("{name} not found in moderation.rs"))
+            .unwrap_or_else(|| panic!("{name} not found in the worker source"))
             .to_string()
     };
-    let bindings: Vec<&str> = toml
+    // `binding = "X"` for D1, AI and queues; `name = "X"` for send_email.
+    let declared: Vec<&str> = toml
         .lines()
-        .filter_map(|l| l.trim().strip_prefix("binding = \""))
+        .filter_map(|l| {
+            let l = l.trim();
+            l.strip_prefix("binding = \"")
+                .or_else(|| l.strip_prefix("name = \""))
+        })
         .filter_map(|l| l.split('"').next())
         .collect();
-    assert!(
-        bindings.contains(&constant("AI_BINDING").as_str()),
-        "AI binding {:?} not declared in wrangler.toml ({bindings:?})",
-        constant("AI_BINDING")
-    );
-    assert!(
-        bindings.contains(&constant("QUEUE_BINDING").as_str()),
-        "queue binding {:?} not declared in wrangler.toml ({bindings:?})",
-        constant("QUEUE_BINDING")
-    );
+    for name in ["DB_BINDING", "AI_BINDING", "QUEUE_BINDING", "EMAIL_BINDING"] {
+        let value = constant(name);
+        assert!(
+            declared.contains(&value.as_str()),
+            "{name} = {value:?} is not declared in wrangler.toml ({declared:?})"
+        );
+    }
     // The producer and consumer must name the same queue, or messages go nowhere.
     let queues: Vec<&str> = toml
         .lines()
@@ -963,38 +966,12 @@ fn the_moderation_binding_names_match_wrangler_toml() {
     );
 }
 
-/// A mismatch here is a runtime "no D1 binding", never a build failure.
-#[test]
-fn the_d1_binding_name_matches_wrangler_toml() {
-    let src = include_str!("../../worker/src/lib.rs");
-    let toml = include_str!("../../../wrangler.toml");
-
-    let in_code = src
-        .lines()
-        .find_map(|l| {
-            l.trim()
-                .strip_prefix("pub(crate) const DB_BINDING: &str = \"")
-        })
-        .and_then(|l| l.split('"').next())
-        .expect("DB_BINDING not found in the worker source");
-    let in_toml = toml
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("binding = \""))
-        .and_then(|l| l.split('"').next())
-        .expect("no `binding` in wrangler.toml");
-
-    assert_eq!(
-        in_code, in_toml,
-        "worker binds {in_code:?} but wrangler.toml declares {in_toml:?}"
-    );
-}
-
 /// Mail is configured mostly by variables, and a misspelt one is silently "no mail" rather
 /// than an error, so the names in the code and the names in wrangler.toml are checked against
 /// each other here; likewise the binding name and the provider list.
 #[test]
 fn the_mail_names_match_wrangler_toml() {
-    let src = include_str!("../../worker/src/mail.rs");
+    let src = include_str!("../../app/src/mail.rs");
     let toml = include_str!("../../../wrangler.toml");
     let constant = |name: &str| -> String {
         src.lines()

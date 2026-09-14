@@ -755,6 +755,50 @@ Worker only offered `constrained` and `client-argon` because nothing else fit 10
 with `limits.cpu_ms` raised does fit it, and the startup warning about parameters is now
 conditional on the scheme actually being below OWASP rather than printed unconditionally.
 
+## One web layer, two platforms
+
+**The handlers moved out of the Worker crate into `crates/app`, generic over a `Platform`.**
+The README had claimed a self-hosted binary since the first commit; what existed was the
+storage half. The handlers were 4,000 lines written against `worker::Env` -- fifty
+`env.d1(...)` calls, twenty `env.var`/`env.secret`, three files doing `Fetch`, the Cache API,
+the queue producer, the AI and mail bindings, `Date::now`. None of it was logic; all of it was
+plumbing. The `Platform` trait names each of those once (a store, a clock, config, HTTP, a
+cache, a queue, `ai_run`, `send_email`, `verify_rs256`), and the Worker and the binary each
+answer it in about 250 lines. The rewrite was mechanical and the conformance suite, the render
+tests and a redeploy of the unchanged Worker are what say it changed nothing.
+
+**The clock and the log are process-global hooks, not trait methods.** Both are facts about the
+process. Threading them through every helper that wanted `now_ms()` would have touched
+thirty-five call sites for no gain; `runtime::install` once at startup touches none.
+
+**The binary runs on one thread, and `#[handler]` is why that is sound.** Every async trait in
+`core` is `?Send`, because wasm futures are not `Send`, so every handler's future is not either
+-- and axum insists. `#[handler]` wraps the body in a `SendWrapper`, the same move
+`#[worker::send]` makes, and `SendWrapper` panics if the future is ever polled from another
+thread rather than misbehaving. On a Worker that thread is the isolate's one; the binary
+chooses a current-thread tokio runtime to make it so. Making `core` conditionally `Send` on
+native was the alternative, and it would have rippled through every mock in every test for a
+multi-threaded server a small forum does not need. SQLite serialises writes regardless.
+
+**The binary's queue is a channel.** `spawn_local` from inside a handler panics -- axum's
+connection tasks are not inside the `LocalSet` -- which the first cut found the hard way. A
+`tokio::sync::mpsc` the platform sends on, drained by one task spawned in the `LocalSet` at
+startup, is what a queue is anyway, and keeps classification off the request.
+
+**Secrets are generated on first run, natively.** A Worker cannot: it has nowhere to keep one,
+and concurrent isolates would each make their own. A binary has the directory its database is
+in. `notespace.keys` (mode 0600) holds the CSRF key and the pepper; the environment overrides
+it; the log says to back it up with the database. `PASSWORD_SCHEME` defaults to `owasp` here,
+because there is no 10 ms budget to defend.
+
+**A held post with no classifier now reaches a human.** Found while testing the binary with no
+API key, and true of the Worker without an AI binding too: `hold` wrote the post as pending and
+enqueued it, the consumer found no classifier and acked, the sweep found no classifier and
+returned, and no review row was ever opened -- so the post sat pending, invisible to readers
+*and* to `/mod/queue`, forever. The pipeline already had the right path for "the classifier
+failed: open a review for a human". `AnyClassifier::Human` is a classifier that always fails
+that way, and `resolve` returns it when nothing is configured.
+
 ## `crates/core/src/sql.rs` -- space listings
 
 `SPACE_THREADS` is the subtree range scan the 0003 migration was designed for, and that

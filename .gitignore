@@ -8,3 +8,7 @@ node_modules/
 
 # Local secrets for `wrangler dev`. Never committed: this is where the pepper lives.
 .dev.vars
+
+# A self-hosted instance run from the repository root.
+/notespace.db*
+/notespace.keys

@@ -83,3 +83,12 @@ impl SignatureCheck for Rs256 {
         Ok(ok.as_bool().unwrap_or(false))
     }
 }
+
+/// The platform's RS256 check, over `crypto.subtle`.
+pub async fn verify_rs256(
+    key: &Jwk,
+    signing_input: &[u8],
+    signature: &[u8],
+) -> Result<bool, String> {
+    Rs256.verify_rs256(key, signing_input, signature).await
+}

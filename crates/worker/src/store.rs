@@ -2,6 +2,7 @@
 //! plus one indexed range scan over `(thread_id, path)`.
 
 use core::cell::Cell;
+use notespace_app::Instrumented;
 use notespace_core::email::{ConsumedToken, EmailAddress, StoredToken, TokenKind};
 use notespace_core::id::PublicId;
 use notespace_core::model::*;
@@ -578,42 +579,12 @@ fn backend<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(e.to_string())
 }
 
-/// What D1 reported, emitted per request as `Server-Timing`.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct QueryStats {
-    pub statements: u32,
-    /// `None` under local dev.
-    pub rows_read: Option<usize>,
-    /// `None` under local dev.
-    pub duration_ms: Option<f64>,
-}
+pub use notespace_app::QueryStats;
 
-impl QueryStats {
-    /// `None` is absent information, not zero.
-    pub fn plus(self, other: QueryStats) -> QueryStats {
-        QueryStats {
-            statements: self.statements + other.statements,
-            rows_read: match (self.rows_read, other.rows_read) {
-                (Some(a), Some(b)) => Some(a + b),
-                (a, b) => a.or(b),
-            },
-            duration_ms: match (self.duration_ms, other.duration_ms) {
-                (Some(a), Some(b)) => Some(a + b),
-                (a, b) => a.or(b),
-            },
-        }
-    }
-
-    /// `Server-Timing` value.
-    pub fn server_timing(&self) -> String {
-        let mut out = format!("d1;desc=\"statements={}\"", self.statements);
-        if let Some(rows) = self.rows_read {
-            out.push_str(&format!(", d1_rows;desc=\"rows_read={rows}\""));
-        }
-        if let Some(ms) = self.duration_ms {
-            out.push_str(&format!(", d1_query;dur={ms}"));
-        }
-        out
+impl notespace_app::Instrumented for D1Store {
+    /// Stats from the most recent query on this store.
+    fn last_stats(&self) -> QueryStats {
+        self.last_stats.get()
     }
 }
 
@@ -855,11 +826,6 @@ impl D1Store {
             .flatten()
             .and_then(|m| m.changes)
             .map(|c| c as u32))
-    }
-
-    /// Stats from the most recent query on this store.
-    pub fn last_stats(&self) -> QueryStats {
-        self.last_stats.get()
     }
 
     async fn fetch_thread_page(&self, thread: &PublicId, page: &Page) -> StoreResult<ThreadPage> {
