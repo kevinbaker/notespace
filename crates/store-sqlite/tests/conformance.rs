@@ -966,6 +966,27 @@ fn the_binding_names_match_wrangler_toml() {
     );
 }
 
+/// The Worker's `password` feature has to reach the app crate, or a deploy "with password
+/// login" ships the app's no-password stubs and /login says sign-in is not set up. It did once.
+#[test]
+fn the_worker_password_feature_reaches_the_app_crate() {
+    let toml = include_str!("../../worker/Cargo.toml");
+    let line = toml
+        .lines()
+        .find(|l| l.trim_start().starts_with("password = ["))
+        .expect("a `password` feature in crates/worker/Cargo.toml");
+    assert!(
+        line.contains("notespace-app/password"),
+        "the worker's password feature does not enable notespace-app/password: {line}"
+    );
+    // And the deploy script builds with it by default, or the site has no sign-in.
+    let script = include_str!("../../../scripts/build-worker.sh");
+    assert!(
+        script.contains("WORKER_FEATURES:-password"),
+        "scripts/build-worker.sh no longer defaults to the password feature"
+    );
+}
+
 /// Mail is configured mostly by variables, and a misspelt one is silently "no mail" rather
 /// than an error, so the names in the code and the names in wrangler.toml are checked against
 /// each other here; likewise the binding name and the provider list.

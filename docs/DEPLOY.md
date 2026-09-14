@@ -313,6 +313,27 @@ server-timing: d1;desc="statements=2", d1_rows;desc="rows_read=403", d1_query;du
 including the startup posture ("password login is enabled, pepper configured", or why it is
 not). CPU time is in the dashboard under the Worker's metrics.
 
+### Releasing to dev.notespace.org
+
+`main` is where work lands; **`dev-deploy` is what is deployed**, and only point releases go
+there. A push to `dev-deploy` runs `.github/workflows/dev-deploy.yml`: fmt, clippy on every
+target with warnings denied, the test suite, a build of the self-hosted binary, then -- if the
+repository has `CLOUDFLARE_API_TOKEN` (secret) and `CLOUDFLARE_ACCOUNT_ID` (secret or variable)
+-- `d1 migrations apply --remote` and `wrangler deploy`, followed by a smoke test of `/`,
+`/healthz`, `/login` and `/register`. Pull requests against `dev-deploy` run the checks only.
+
+```bash
+git tag -a v0.1.1 -m "v0.1.1"          # on main, once it is what you want deployed
+git push origin main v0.1.1
+git push origin main:dev-deploy         # this is the deploy
+gh run watch                            # or Actions in the repository
+```
+
+The build goes through `scripts/build-worker.sh` on every path -- your machine, the runner,
+Workers Builds -- and defaults to the `password` feature (`WORKER_FEATURES` overrides). A
+deploy from your own machine with `npx wrangler deploy` is the same build, without the gate;
+useful for a hotfix, but the branch should follow.
+
 ## Cloudflare, Workers Paid
 
 $5/month. The same code and steps; what changes:

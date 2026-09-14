@@ -23,19 +23,12 @@ workers_dev = false
 #   { pattern = "dev.notespace.org", custom_domain = true }
 # ]
 
-# Runs on `wrangler dev` and `wrangler deploy` from a machine that has Rust. It does NOT run in
-# Cloudflare's own build environment (Workers Builds / the dashboard's Git integration), which
-# ships Node but not rustup, cargo or worker-build.
+# Runs on `wrangler dev` and `wrangler deploy`, here and in GitHub Actions (.github/workflows/
+# dev-deploy.yml, on pushes to the dev-deploy branch). The script installs a Rust toolchain if
+# the machine has none, and builds with the `password` feature -- WORKER_FEATURES overrides --
+# which needs the PASSWORD_PEPPER and CSRF_KEY secrets set or the auth routes answer 503.
 [build]
-# Wrangler runs this through /bin/sh, which does not source your shell profile, so ~/.cargo/bin
-# is usually absent from PATH even when worker-build is installed. Prepending it here avoids
-# "worker-build: not found" (exit 127).
-#
-# Cargo features come from NOTESPACE_FEATURES, since wrangler has no flag for them:
-# `NOTESPACE_FEATURES=password wrangler deploy` builds local password login in. Empty is the
-# default build. An empty --features list is accepted by cargo, so the variable can be unset.
-command = 'PATH="$HOME/.cargo/bin:$PATH" worker-build --release -- --features "${NOTESPACE_FEATURES:-}"'
-cwd = "crates/worker"
+command = "scripts/build-worker.sh"
 
 # The stylesheet, the fonts and reply.js. Cloudflare serves these in front of the Worker: a
 # request for one never invokes it and is not counted against the daily request cap, which is

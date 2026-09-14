@@ -1,0 +1,163 @@
+name: dev-deploy
+
+on:
+  push:
+    branches: [dev-deploy]
+  pull_request:
+    branches: [dev-deploy]
+  workflow_dispatch:
+
+# A second deploy overtaking the first would leave dev.notespace.org on the older build.
+concurrency:
+  group: dev-deploy
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  WORKER_BUILD_VERSION: "0.8.5"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      deployable: ${{ steps.credentials.outputs.deployable }}
+    steps:
+      # The `secrets` context is not readable from a job-level `if`, so the deploy job gates on
+      # this instead. Without it a repository with no token set fails every push.
+      #
+      # The account id is not sensitive -- it appears in dashboard URLs -- so it is taken from a
+      # variable as readily as from a secret. The token is only ever read from a secret, because
+      # variable values are not masked in logs.
+      - name: Look for deploy credentials
+        id: credentials
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          # Presence only. Never echo the values themselves.
+          [ -n "$TOKEN" ] && t=present || t=MISSING
+          [ -n "$ACCOUNT" ] && a=present || a=MISSING
+          echo "CLOUDFLARE_API_TOKEN:  $t  (secret)"
+          echo "CLOUDFLARE_ACCOUNT_ID: $a  (secret or variable)"
+          if [ "$t" = present ] && [ "$a" = present ]; then
+            echo "deployable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deployable=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Deploy skipped::CLOUDFLARE_API_TOKEN is $t, CLOUDFLARE_ACCOUNT_ID is $a. Set them under Settings > Secrets and variables > Actions -- the token as a repository secret, the account id as either. Environment and organization scopes are not visible to this job."
+          fi
+
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+
+      # notespace-worker and notespace-bench are wasm-only; the `worker` crate does not build
+      # natively. Everything else -- core, render, app, the server binary -- is checked here.
+      - name: clippy (native crates)
+        run: cargo clippy --workspace --all-targets --exclude notespace-worker --exclude notespace-bench -- -D warnings
+
+      - name: clippy (worker, with password login)
+        run: cargo clippy -p notespace-worker --target wasm32-unknown-unknown --all-targets --features password -- -D warnings
+
+      - name: clippy (worker, external auth)
+        run: cargo clippy -p notespace-worker --target wasm32-unknown-unknown --all-targets -- -D warnings
+
+      - name: clippy (bench)
+        run: cargo clippy -p notespace-bench --target wasm32-unknown-unknown --all-targets -- -D warnings
+
+      # Bare, not --workspace: the wasm-only crates are out of default-members and have no tests.
+      - run: cargo test
+
+      - name: build the self-hosted binary
+        run: cargo build --release -p notespace-server
+
+  deploy:
+    needs: check
+    if: github.event_name != 'pull_request' && needs.check.outputs.deployable == 'true'
+    runs-on: ubuntu-latest
+    env:
+      CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The restore/save pair below owns ~/.cargo/bin, and rust-cache's cleanup step
+          # deletes binaries it finds there.
+          cache-bin: false
+          shared-key: deploy
+
+      # The install metadata comes along, or cargo cannot tell the binary is already there and
+      # rebuilds it anyway.
+      - name: Restore worker-build
+        id: worker-build
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/bin/worker-build
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: worker-build-${{ env.WORKER_BUILD_VERSION }}-${{ runner.os }}
+
+      - name: Install worker-build
+        run: cargo install -q worker-build@${{ env.WORKER_BUILD_VERSION }}
+
+      # Saved here rather than at the end of the job: both cache actions are `post-if: success()`,
+      # so a deploy that fails later would otherwise pay the four-minute compile again on retry.
+      - name: Save worker-build
+        if: steps.worker-build.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/bin/worker-build
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: worker-build-${{ env.WORKER_BUILD_VERSION }}-${{ runner.os }}
+
+      # wrangler deploy does not run migrations, so an unapplied one would 500 every page.
+      - name: Apply D1 migrations
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ env.CF_ACCOUNT_ID }}
+          command: d1 migrations apply notespace-dev --remote
+
+      # Runs scripts/build-worker.sh through wrangler's [build] command.
+      - name: Deploy
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ env.CF_ACCOUNT_ID }}
+          command: deploy
+
+      # The read path is the deploy's own contract, so it fails the build. The auth routes
+      # depend on secrets set out of band -- 503 means PASSWORD_PEPPER or CSRF_KEY is missing,
+      # 404 means the build did not carry the password feature -- so they only warn.
+      - name: Smoke test
+        run: |
+          set -eu
+          probe() { curl -sS -o /dev/null -w '%{http_code}' --retry 3 --retry-delay 5 \
+            --retry-all-errors "https://dev.notespace.org$1"; }
+          failed=0
+          for path in / /healthz; do
+            code=$(probe "$path")
+            echo "${code}  ${path}"
+            [ "$code" = "200" ] || failed=1
+          done
+          for path in /login /register; do
+            code=$(probe "$path")
+            echo "${code}  ${path}"
+            [ "$code" = "200" ] ||
+              echo "::warning title=Auth route not serving::${path} returned ${code}"
+          done
+          exit "$failed"
