@@ -3,7 +3,7 @@
 //! whole rule set. Two opinions are combined by [`combine`], which is pure and is where the
 //! trust arithmetic lives.
 
-use super::classify::{Call, ClassifyError, ClassifyInput, Classifier, Verdict};
+use super::classify::{Call, Classifier, ClassifyError, ClassifyInput, Verdict};
 use super::Category;
 
 /// `front` runs first on every post; `back` runs on every post too, because the front cannot
@@ -177,7 +177,11 @@ mod tests {
     fn an_uncorroborated_guard_flag_holds_but_cannot_hide() {
         let p = ModerationPolicy::default();
         let guard_alone = v(Call::Flag, 1.0, &[Category::Violence]);
-        assert_eq!(p.decide(&guard_alone), Disposition::HideForReview, "premise");
+        assert_eq!(
+            p.decide(&guard_alone),
+            Disposition::HideForReview,
+            "premise"
+        );
         let out = combine(Ok(guard_alone), Ok(v(Call::Clean, 0.9, &[])), "m").unwrap();
         assert_eq!(out.call, Call::Flag);
         assert_eq!(out.confidence, UNCORROBORATED);
@@ -225,8 +229,12 @@ mod tests {
         assert_eq!(out.call, Call::Flag);
         assert_eq!(out.confidence, 0.95);
         assert_eq!(out.categories, vec![Category::Spam]);
-        let out = combine(Ok(v(Call::Unsure, 0.0, &[])), Ok(v(Call::Clean, 0.9, &[])), "m")
-            .unwrap();
+        let out = combine(
+            Ok(v(Call::Unsure, 0.0, &[])),
+            Ok(v(Call::Clean, 0.9, &[])),
+            "m",
+        )
+        .unwrap();
         assert_eq!(out.call, Call::Clean);
     }
 

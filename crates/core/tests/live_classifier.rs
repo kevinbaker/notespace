@@ -48,7 +48,8 @@ fn input(body: &str) -> ClassifyInput<'_> {
 
 /// Sends one request and returns the raw response body for the provider's parser.
 type Transport = Box<dyn Fn(&ClassifyInput<'_>) -> Result<serde_json::Value, String>>;
-type Parser = fn(&serde_json::Value, &str) -> Result<Verdict, notespace_core::moderation::ClassifyError>;
+type Parser =
+    fn(&serde_json::Value, &str) -> Result<Verdict, notespace_core::moderation::ClassifyError>;
 
 /// One tried model.
 struct Live {
@@ -180,11 +181,17 @@ fn evaluate(live: &Live) -> Score {
         match case.expect.as_str() {
             "clean" | "flag" => {
                 score.obvious += 1;
-                let expected = if case.expect == "clean" { Call::Clean } else { Call::Flag };
+                let expected = if case.expect == "clean" {
+                    Call::Clean
+                } else {
+                    Call::Flag
+                };
                 if verdict.call == expected {
                     score.right += 1;
                 } else {
-                    score.wrong.push(format!("{} ({:?})", case.id, verdict.call));
+                    score
+                        .wrong
+                        .push(format!("{} ({:?})", case.id, verdict.call));
                 }
                 // A clean post the policy would remove, or a bad one it would publish, is the
                 // failure that reaches users. Everything else costs a moderator a look.
@@ -193,7 +200,9 @@ fn evaluate(live: &Live) -> Score {
                     _ => disposition == Disposition::Publish,
                 };
                 if harmful {
-                    score.harmful.push(format!("{} -> {disposition:?}", case.id));
+                    score
+                        .harmful
+                        .push(format!("{} -> {disposition:?}", case.id));
                 }
             }
             _ => {}
@@ -277,15 +286,24 @@ fn the_corpus_is_well_formed() {
             c.expect
         );
         for cat in &c.categories {
-            assert!(Category::parse(cat).is_some(), "{}: unknown category {cat}", c.id);
+            assert!(
+                Category::parse(cat).is_some(),
+                "{}: unknown category {cat}",
+                c.id
+            );
         }
         assert!(c.body.chars().count() >= 2, "{}: empty body", c.id);
     }
     let flags = cases.iter().filter(|c| c.expect == "flag").count();
     let cleans = cases.iter().filter(|c| c.expect == "clean").count();
-    assert!(flags >= 4 && cleans >= 4, "both classes need representation");
     assert!(
-        cases.iter().any(|c| c.categories.iter().any(|k| k == "manipulation")),
+        flags >= 4 && cleans >= 4,
+        "both classes need representation"
+    );
+    assert!(
+        cases
+            .iter()
+            .any(|c| c.categories.iter().any(|k| k == "manipulation")),
         "the corpus must include a prompt-injection case"
     );
 }
@@ -313,7 +331,11 @@ fn tier_zero_holds_every_injection_case_in_the_corpus() {
         );
         match t {
             Triage::Hold(reasons) => {
-                assert!(reasons.contains(&Reason::Manipulation), "{}: {reasons:?}", c.id)
+                assert!(
+                    reasons.contains(&Reason::Manipulation),
+                    "{}: {reasons:?}",
+                    c.id
+                )
             }
             other => panic!("{}: not held by tier 0: {other:?}", c.id),
         }

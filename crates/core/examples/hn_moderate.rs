@@ -17,7 +17,9 @@
 //! table. Cost is a few hundred tokens per comment against whatever model is named.
 
 use notespace_core::model::Role;
-use notespace_core::moderation::classify::{Call, ClassifyError, ClassifyInput, Classifier, Verdict};
+use notespace_core::moderation::classify::{
+    Call, Classifier, ClassifyError, ClassifyInput, Verdict,
+};
 use notespace_core::moderation::heuristics::{triage, Signals, Triage};
 use notespace_core::moderation::layers::Layered;
 use notespace_core::moderation::policy::{Disposition, ModerationPolicy};
@@ -55,7 +57,10 @@ impl Classifier for OpenRouter {
     }
     async fn classify(&self, input: &ClassifyInput<'_>) -> Result<Verdict, ClassifyError> {
         if self.guard {
-            let out = self.post(providers::openai_compatible_llama_guard_request(input, &self.model))?;
+            let out = self.post(providers::openai_compatible_llama_guard_request(
+                input,
+                &self.model,
+            ))?;
             providers::openai_compatible_llama_guard_parse(&out, &self.model)
         } else {
             let out = self.post(providers::openai_compatible_request(input, &self.model))?;

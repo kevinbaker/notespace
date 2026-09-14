@@ -156,8 +156,14 @@ mod tests {
 
     #[test]
     fn a_missing_or_broken_config_is_the_default_policy() {
-        assert_eq!(ModerationPolicy::from_config("{}"), ModerationPolicy::default());
-        assert_eq!(ModerationPolicy::from_config(""), ModerationPolicy::default());
+        assert_eq!(
+            ModerationPolicy::from_config("{}"),
+            ModerationPolicy::default()
+        );
+        assert_eq!(
+            ModerationPolicy::from_config(""),
+            ModerationPolicy::default()
+        );
         assert_eq!(
             ModerationPolicy::from_config("{not json"),
             ModerationPolicy::default()
@@ -175,7 +181,10 @@ mod tests {
         );
         assert_eq!(p.report_threshold, 1);
         assert_eq!(p.blocklist, vec!["buy now".to_string()]);
-        assert_eq!(p.new_account_hours, ModerationPolicy::default().new_account_hours);
+        assert_eq!(
+            p.new_account_hours,
+            ModerationPolicy::default().new_account_hours
+        );
     }
 
     #[test]
@@ -190,7 +199,10 @@ mod tests {
     #[test]
     fn only_a_confident_clean_publishes_and_only_a_confident_flag_hides() {
         let p = ModerationPolicy::default();
-        assert_eq!(p.decide(&verdict(Call::Clean, 0.95, &[])), Disposition::Publish);
+        assert_eq!(
+            p.decide(&verdict(Call::Clean, 0.95, &[])),
+            Disposition::Publish
+        );
         assert_eq!(
             p.decide(&verdict(Call::Clean, 0.5, &[])),
             Disposition::HoldForReview
@@ -228,7 +240,11 @@ mod tests {
             "a flag with no category named is not a reason to hide"
         );
         assert_eq!(
-            p.decide(&verdict(Call::Flag, 1.0, &[Category::OffTopic, Category::Spam])),
+            p.decide(&verdict(
+                Call::Flag,
+                1.0,
+                &[Category::OffTopic, Category::Spam]
+            )),
             Disposition::HideForReview
         );
     }
@@ -267,7 +283,11 @@ mod tests {
             agreed: 20,
             disagreed: 0,
         };
-        assert_eq!(p.effective(&good_but_few), p, "loosening needs a bigger sample");
+        assert_eq!(
+            p.effective(&good_but_few),
+            p,
+            "loosening needs a bigger sample"
+        );
 
         let good = AgreementStats {
             agreed: 40,
@@ -275,7 +295,10 @@ mod tests {
         };
         let loosened = p.effective(&good);
         assert!(loosened.publish_confidence < p.publish_confidence);
-        assert_eq!(loosened.hide_confidence, p.hide_confidence, "hiding never loosens");
+        assert_eq!(
+            loosened.hide_confidence, p.hide_confidence,
+            "hiding never loosens"
+        );
     }
 
     #[test]

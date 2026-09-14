@@ -438,7 +438,9 @@ mod passwords {
                     Some(Delivery::Failed(why)) => {
                         crate::log(&format!("mail: reset failed: {why}"))
                     }
-                    Some(Delivery::NotConfigured) => crate::log("mail: a reset was requested but no mailer is configured"),
+                    Some(Delivery::NotConfigured) => {
+                        crate::log("mail: a reset was requested but no mailer is configured")
+                    }
                     _ => {}
                 }
                 see_other("/forgot?sent=1".into())

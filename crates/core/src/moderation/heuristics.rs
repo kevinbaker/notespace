@@ -20,9 +20,16 @@ pub struct Signals<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "reason")]
 pub enum Reason {
-    NewAccount { age_hours: i64 },
-    TooManyLinks { count: u32, max: u32 },
-    Blocklist { term: String },
+    NewAccount {
+        age_hours: i64,
+    },
+    TooManyLinks {
+        count: u32,
+        max: u32,
+    },
+    Blocklist {
+        term: String,
+    },
     /// Phrases addressed to a language model rather than to readers.
     Manipulation,
     /// Mostly upper case, past a length where that is a choice.
@@ -186,7 +193,10 @@ mod tests {
     fn an_ordinary_post_from_an_established_account_publishes() {
         let p = ModerationPolicy::default();
         assert_eq!(
-            triage(&p, &signals("I think the second approach is cleaner, honestly.")),
+            triage(
+                &p,
+                &signals("I think the second approach is cleaner, honestly.")
+            ),
             Triage::Publish
         );
     }
@@ -251,7 +261,9 @@ mod tests {
         };
         assert_eq!(
             triage(&p, &signals("BUY\n  NOW while stocks last")),
-            Triage::Hold(vec![Reason::Blocklist { term: "buy now".into() }])
+            Triage::Hold(vec![Reason::Blocklist {
+                term: "buy now".into()
+            }])
         );
         assert_eq!(triage(&p, &signals("I bought it now")), Triage::Publish);
     }
@@ -280,7 +292,10 @@ mod tests {
         assert!(is_shouting(loud));
         assert_eq!(triage(&p, &signals(loud)), Triage::Publish);
         assert!(!is_shouting("OK"), "short text is not shouting");
-        assert!(!is_shouting("1234567890 ".repeat(10).as_str()), "digits are not letters");
+        assert!(
+            !is_shouting("1234567890 ".repeat(10).as_str()),
+            "digits are not letters"
+        );
 
         // With another reason present, shouting is recorded alongside it.
         let mut s = signals(loud);
@@ -305,7 +320,8 @@ mod tests {
     #[test]
     fn moderators_and_disabled_policies_skip_the_heuristics() {
         let p = ModerationPolicy::default();
-        let mut s = signals("https://a https://b https://c https://d https://e https://f https://g");
+        let mut s =
+            signals("https://a https://b https://c https://d https://e https://f https://g");
         s.author_created_at = NOW;
         s.author_role = Role::Moderator;
         assert_eq!(triage(&p, &s), Triage::Publish);

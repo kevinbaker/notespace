@@ -306,10 +306,7 @@ pub fn openai_compatible_text(output: &Value) -> Result<String, ClassifyError> {
             .and_then(|m| m.as_str())
             .unwrap_or("")
             .to_string();
-        let code = err
-            .get("code")
-            .map(|c| c.to_string())
-            .unwrap_or_default();
+        let code = err.get("code").map(|c| c.to_string()).unwrap_or_default();
         return Err(match code.trim_matches('"') {
             "429" | "402" => ClassifyError::Budget(format!("{code}: {msg}")),
             c if c.starts_with('5') => ClassifyError::Unavailable(format!("{code}: {msg}")),
@@ -358,7 +355,10 @@ mod tests {
         );
         assert_eq!(r["messages"][0]["role"], "system");
         assert_eq!(r["messages"][1]["role"], "user");
-        assert!(r["messages"][1]["content"].as_str().unwrap().contains("<post>\nhi\n</post>"));
+        assert!(r["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("<post>\nhi\n</post>"));
     }
 
     #[test]
@@ -408,7 +408,10 @@ mod tests {
     fn llama_guard_alone_holds_rather_than_hides() {
         let p = crate::moderation::ModerationPolicy::default();
         assert!(LLAMA_GUARD_CONFIDENCE < p.hide_confidence);
-        assert!(LLAMA_GUARD_CONFIDENCE >= p.publish_confidence, "but safe does publish");
+        assert!(
+            LLAMA_GUARD_CONFIDENCE >= p.publish_confidence,
+            "but safe does publish"
+        );
     }
 
     #[test]
@@ -429,7 +432,10 @@ mod tests {
         assert_eq!(r["messages"].as_array().unwrap().len(), 1);
         assert_eq!(r["messages"][0]["role"], "user");
         assert_eq!(r["output_config"]["format"]["type"], "json_schema");
-        assert!(r.get("thinking").is_none(), "thinking is left at the model's default");
+        assert!(
+            r.get("thinking").is_none(),
+            "thinking is left at the model's default"
+        );
         let h = anthropic_headers("sk-test");
         assert!(h.iter().any(|(k, v)| *k == "x-api-key" && v == "sk-test"));
         assert!(h.iter().any(|(k, _)| *k == "anthropic-version"));
@@ -447,21 +453,37 @@ mod tests {
         });
         let v = anthropic_parse(&ok, "requested").unwrap();
         assert_eq!(v.call, Call::Flag);
-        assert_eq!(v.model, "claude-opus-5", "records the model that actually answered");
+        assert_eq!(
+            v.model, "claude-opus-5",
+            "records the model that actually answered"
+        );
 
         let refused = json!({"stop_reason": "refusal", "content": []});
         let v = anthropic_parse(&refused, "m").unwrap();
         assert_eq!(v.call, Call::Unsure);
         assert_eq!(v.confidence, 0.0);
 
-        let limited = json!({"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}});
-        assert!(matches!(anthropic_parse(&limited, "m"), Err(ClassifyError::Budget(_))));
+        let limited =
+            json!({"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}});
+        assert!(matches!(
+            anthropic_parse(&limited, "m"),
+            Err(ClassifyError::Budget(_))
+        ));
         let down = json!({"error": {"type": "api_error", "message": "oops"}});
-        assert!(matches!(anthropic_parse(&down, "m"), Err(ClassifyError::Unavailable(_))));
+        assert!(matches!(
+            anthropic_parse(&down, "m"),
+            Err(ClassifyError::Unavailable(_))
+        ));
         let bad_key = json!({"error": {"type": "authentication_error", "message": "no"}});
-        assert!(matches!(anthropic_parse(&bad_key, "m"), Err(ClassifyError::Malformed(_))));
+        assert!(matches!(
+            anthropic_parse(&bad_key, "m"),
+            Err(ClassifyError::Malformed(_))
+        ));
         let empty = json!({"content": []});
-        assert!(matches!(anthropic_parse(&empty, "m"), Err(ClassifyError::Malformed(_))));
+        assert!(matches!(
+            anthropic_parse(&empty, "m"),
+            Err(ClassifyError::Malformed(_))
+        ));
     }
 
     #[test]
@@ -476,7 +498,9 @@ mod tests {
             "decision"
         );
         let h = openai_compatible_headers("sk-or-x");
-        assert!(h.iter().any(|(k, v)| *k == "authorization" && v == "Bearer sk-or-x"));
+        assert!(h
+            .iter()
+            .any(|(k, v)| *k == "authorization" && v == "Bearer sk-or-x"));
     }
 
     #[test]
@@ -490,19 +514,38 @@ mod tests {
         assert_eq!(v.call, Call::Clean);
         assert_eq!(v.model, "meta-llama/llama-3.1-8b-instruct");
 
-        let filtered = json!({"choices": [{"finish_reason": "content_filter", "message": {"content": null}}]});
-        assert_eq!(openai_compatible_parse(&filtered, "m").unwrap().call, Call::Unsure);
+        let filtered =
+            json!({"choices": [{"finish_reason": "content_filter", "message": {"content": null}}]});
+        assert_eq!(
+            openai_compatible_parse(&filtered, "m").unwrap().call,
+            Call::Unsure
+        );
 
         let limited = json!({"error": {"code": 429, "message": "slow down"}});
-        assert!(matches!(openai_compatible_parse(&limited, "m"), Err(ClassifyError::Budget(_))));
+        assert!(matches!(
+            openai_compatible_parse(&limited, "m"),
+            Err(ClassifyError::Budget(_))
+        ));
         let broke = json!({"error": {"code": 402, "message": "insufficient credits"}});
-        assert!(matches!(openai_compatible_parse(&broke, "m"), Err(ClassifyError::Budget(_))));
+        assert!(matches!(
+            openai_compatible_parse(&broke, "m"),
+            Err(ClassifyError::Budget(_))
+        ));
         let down = json!({"error": {"code": 502, "message": "upstream"}});
-        assert!(matches!(openai_compatible_parse(&down, "m"), Err(ClassifyError::Unavailable(_))));
+        assert!(matches!(
+            openai_compatible_parse(&down, "m"),
+            Err(ClassifyError::Unavailable(_))
+        ));
         let bad = json!({"error": {"code": 400, "message": "bad model"}});
-        assert!(matches!(openai_compatible_parse(&bad, "m"), Err(ClassifyError::Malformed(_))));
+        assert!(matches!(
+            openai_compatible_parse(&bad, "m"),
+            Err(ClassifyError::Malformed(_))
+        ));
         let empty = json!({"choices": []});
-        assert!(matches!(openai_compatible_parse(&empty, "m"), Err(ClassifyError::Malformed(_))));
+        assert!(matches!(
+            openai_compatible_parse(&empty, "m"),
+            Err(ClassifyError::Malformed(_))
+        ));
     }
 
     #[test]
@@ -512,7 +555,10 @@ mod tests {
         assert_eq!(v.call, Call::Flag);
         assert_eq!(v.categories, vec![Category::Hate]);
         let r = openai_compatible_llama_guard_request(&input("x"), "g");
-        assert!(r.get("response_format").is_none(), "Guard does not speak JSON");
+        assert!(
+            r.get("response_format").is_none(),
+            "Guard does not speak JSON"
+        );
         assert_eq!(r["messages"].as_array().unwrap().len(), 1);
     }
 }
