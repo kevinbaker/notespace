@@ -72,6 +72,8 @@ th{font-size:.85rem;font-weight:600;color:var(--fg-2)}
 .site .brand{font-weight:600;color:var(--fg)}
 .site .crumbs{display:flex;flex-wrap:wrap;gap:.4rem;flex:1}
 .site .links{display:flex;flex-wrap:wrap;gap:.6rem}
+.site .me{color:var(--fg);font-weight:500}
+.site .link{font:inherit;color:inherit}
 main{max-width:var(--measure);margin:0 auto;padding:1rem 1rem 3rem}
 main.narrow{max-width:22rem;padding-top:2.5rem}
 main.wide{max-width:var(--wide)}

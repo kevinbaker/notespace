@@ -367,50 +367,6 @@ pub fn held_page(thread: &str, post: &str) -> Markup {
     })
 }
 
-#[cfg(test)]
-mod reply_tests {
-    use super::*;
-
-    #[test]
-    fn the_parent_is_shown_and_the_script_loads_only_with_one() {
-        let with = reply_page(
-            "tok",
-            "abc",
-            &ReplyTarget {
-                thread_title: "T",
-                parent: Some(ParentPost {
-                    public_id: "p1",
-                    author_name: "alice",
-                    body_html: "<p>hi</p>",
-                }),
-            },
-            "",
-            None,
-        )
-        .into_string();
-        assert!(with.contains("Reply to alice"));
-        assert!(with.contains("<p>hi</p>"));
-        assert!(with.contains("/static/reply.js"));
-        assert!(
-            !with.contains("class=\"quote\""),
-            "quoting is the script's; no dead controls without it"
-        );
-        let without = reply_page(
-            "tok",
-            "abc",
-            &ReplyTarget {
-                thread_title: "T",
-                parent: None,
-            },
-            "",
-            None,
-        )
-        .into_string();
-        assert!(without.contains("Reply to the thread"));
-        assert!(!without.contains("reply.js"));
-    }
-}
-
 /// Why the username step was refused.
 pub enum FinishError {
     BadName(String),
@@ -462,4 +418,48 @@ pub fn finish_page(
             button type="submit" { "Create account" }
         }
     })
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::*;
+
+    #[test]
+    fn the_parent_is_shown_and_the_script_loads_only_with_one() {
+        let with = reply_page(
+            "tok",
+            "abc",
+            &ReplyTarget {
+                thread_title: "T",
+                parent: Some(ParentPost {
+                    public_id: "p1",
+                    author_name: "alice",
+                    body_html: "<p>hi</p>",
+                }),
+            },
+            "",
+            None,
+        )
+        .into_string();
+        assert!(with.contains("Reply to alice"));
+        assert!(with.contains("<p>hi</p>"));
+        assert!(with.contains("/static/reply.js"));
+        assert!(
+            !with.contains("class=\"quote\""),
+            "quoting is the script's; no dead controls without it"
+        );
+        let without = reply_page(
+            "tok",
+            "abc",
+            &ReplyTarget {
+                thread_title: "T",
+                parent: None,
+            },
+            "",
+            None,
+        )
+        .into_string();
+        assert!(without.contains("Reply to the thread"));
+        assert!(!without.contains("reply.js"));
+    }
 }

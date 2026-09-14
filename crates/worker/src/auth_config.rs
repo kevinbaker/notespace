@@ -51,16 +51,18 @@ impl AuthConfig {
         {
             // Below OWASP; the mandatory pepper is what makes it tolerable.
             None | Some("constrained") => Scheme::CONSTRAINED,
+            // OWASP's minimum, ~57 ms of CPU: for a paid plan with `limits.cpu_ms` raised.
+            Some("owasp") => Scheme::OWASP,
             Some("client-argon") => Scheme::CLIENT_ARGON,
             Some(other) => {
                 // Refuse rather than default, so a misspelling cannot silently weaken hashing.
                 console_error!(
                     "{SCHEME_BINDING}={other:?} is not a known scheme. Expected \
-                     \"constrained\" or \"client-argon\". Password login is disabled."
+                     \"constrained\", \"owasp\" or \"client-argon\". Password login is disabled."
                 );
                 return AuthConfig::Refused(
-                    "PASSWORD_SCHEME is not a known scheme. Expected \"constrained\" or \
-                     \"client-argon\".",
+                    "PASSWORD_SCHEME is not a known scheme. Expected \"constrained\", \"owasp\" \
+                     or \"client-argon\".",
                 );
             }
         };

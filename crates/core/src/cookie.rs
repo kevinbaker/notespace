@@ -4,6 +4,11 @@
 /// and `Domain`-less, which together stop a subdomain setting or overwriting it.
 pub const SESSION: &str = "__Host-ns_session";
 
+/// Set alongside [`SESSION`] and readable by script: the one bit that says "there is a
+/// session", so a shared page can decide whether to ask `/api/me` who it is. Carries nothing
+/// else, and the server never reads it; the session cookie is `HttpOnly` and stays so.
+pub const SIGNED_IN: &str = "ns_in";
+
 /// Binds a CSRF token before there is a session to bind it to.
 pub const ANON: &str = "__Host-ns_anon";
 
@@ -31,6 +36,22 @@ pub fn set(name: &str, value: &str, max_age_secs: i64) -> String {
 /// Expire a cookie. Same attributes as [`set`], because a browser matches on them.
 pub fn clear(name: &str) -> String {
     format!("{name}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0")
+}
+
+/// The session cookie and its script-visible marker, set together so they cannot disagree.
+pub fn set_session(value: &str, max_age_secs: i64) -> [String; 2] {
+    [
+        set(SESSION, value, max_age_secs),
+        format!("{SIGNED_IN}=1; Path=/; Secure; SameSite=Lax; Max-Age={max_age_secs}"),
+    ]
+}
+
+/// Both cookies, expired.
+pub fn clear_session() -> [String; 2] {
+    [
+        clear(SESSION),
+        format!("{SIGNED_IN}=; Path=/; Secure; SameSite=Lax; Max-Age=0"),
+    ]
 }
 
 /// Local absolute paths only; anything else is an open redirect. `//evil.example` is the case a

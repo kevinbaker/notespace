@@ -765,7 +765,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "notespace-bench"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "argon2",
  "hmac",
@@ -780,7 +780,7 @@ dependencies = [
 
 [[package]]
 name = "notespace-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -797,7 +797,7 @@ dependencies = [
 
 [[package]]
 name = "notespace-hn-import"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "notespace-core",
  "notespace-render",
@@ -807,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "notespace-render"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "ammonia",
  "maud",
@@ -818,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "notespace-seed"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "notespace-core",
  "notespace-render",
@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "notespace-store-sqlite"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "notespace-core",
@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "notespace-worker"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",

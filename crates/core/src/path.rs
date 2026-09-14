@@ -299,7 +299,7 @@ mod tests {
             assert!(w[0] < w[1], "alphabet not ascending at {:?}", w);
         }
         assert_eq!(ALPHABET.len(), 32);
-        for c in [b'I', b'L', b'O', b'U'] {
+        for c in *b"ILOU" {
             assert!(
                 !ALPHABET.contains(&c),
                 "ambiguous char {} in alphabet",

@@ -313,14 +313,9 @@ pub async fn callback(
             let target = handshake.next.as_deref().unwrap_or("/");
             let mut resp = see_other(target.into());
             let h = resp.headers_mut();
-            for c in [
-                cookie::set(
-                    cookie::SESSION,
-                    &token.to_cookie_value(),
-                    sessions.lifetime_ms / 1000,
-                ),
-                cookie::clear(cookie::OAUTH),
-            ] {
+            let [session, marker] =
+                cookie::set_session(&token.to_cookie_value(), sessions.lifetime_ms / 1000);
+            for c in [session, marker, cookie::clear(cookie::OAUTH)] {
                 if let Ok(v) = c.parse() {
                     h.append(header::SET_COOKIE, v);
                 }
@@ -463,14 +458,9 @@ pub async fn finish_submit(
             let target = p.next.as_deref().unwrap_or("/");
             let mut resp = see_other(target.into());
             let h = resp.headers_mut();
-            for c in [
-                cookie::set(
-                    cookie::SESSION,
-                    &token.to_cookie_value(),
-                    sessions.lifetime_ms / 1000,
-                ),
-                cookie::clear(cookie::PENDING),
-            ] {
+            let [session, marker] =
+                cookie::set_session(&token.to_cookie_value(), sessions.lifetime_ms / 1000);
+            for c in [session, marker, cookie::clear(cookie::PENDING)] {
                 if let Ok(v) = c.parse() {
                     h.append(header::SET_COOKIE, v);
                 }

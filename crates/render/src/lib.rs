@@ -26,6 +26,7 @@ pub const BAKE_REVISION: u64 = fnv1a(
         include_str!("index.rs"),
         include_str!("layout.rs"),
         include_str!("../public/static/style.css"),
+        include_str!("../public/static/me.js"),
         include_str!("time.rs"),
         include_str!("feed.rs")
     )

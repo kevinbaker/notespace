@@ -57,11 +57,13 @@ ask.
 | A space's theme: validated property overrides and its own CSS | `crates/core/src/theme.rs` — `Theme::from_config`, `parse_lines`, `with_css`, `version` |
 | Where a theme is stored | `space.config` under `"theme"`; carried on `Space::config` so the read path has it |
 | Where a theme is served | `/s/{path}/theme.css?v={hash}` — `posting::theme_css`; linked only by pages of a space that has one |
+| The site's own name and theme | `SITE_NAME`, `SITE_THEME` in `wrangler.toml` → `startup::site_once` → `layout::set_site_name`, `set_site_theme`; served at `/theme.css?v={hash}` |
+| The header's "signed in as" | `crates/render/public/static/me.js`, which asks `/api/me` (`lib.rs` — `api_me`) only when the `ns_in` marker cookie is present; `cookie::set_session` sets both cookies together |
 | Editing it | the space form in `crates/render/src/admin.rs` — `theme_fields`; parsed in `worker::admin::space_form` |
 | Looking at every page without a database | `cargo run -p notespace-render --example preview -- target/preview` |
 
-The pages link `/static/style.css?v=BAKE_REVISION`; the sheet is part of that hash, so a change
-to it is a new URL and a deploy-time cache flush. Requests for static assets never invoke the
+The pages link `/static/style.css?v=BAKE_REVISION`; the sheet and `me.js` are part of that
+hash, so a change to either is a new URL and a deploy-time cache flush. Requests for static assets never invoke the
 Worker and are not counted against the daily cap. Everything past the sheet's token block is
 written in terms of the tokens (`the_stylesheet_uses_no_literal_colours_outside_the_token_block`
 enforces this), so a theme can reach all of it. Thread and space pages link their space's

@@ -139,6 +139,13 @@ MAILGUN_REGION = ""
 POSTMARK_STREAM = ""
 # Names the site in mail subjects and bodies.
 SITE_NAME = "notespace"
+# The site's look, in the lines the admin space form takes: `name: value` per line for the
+# stylesheet's tokens (bg, fg, accent, font, size, measure, ...), `light.`/`dark.` to scope one,
+# and after a line reading `---`, the site's own CSS. Empty means the default look. A space's
+# theme layers on top of this. The dev site runs in IBM Plex Sans; the default is Noto Sans.
+SITE_THEME = """
+font: "IBM Plex Sans", system-ui, sans-serif
+"""
 # "true" makes an address mandatory at signup. Only sensible once mail is configured.
 REQUIRE_EMAIL = "false"
 # Closed registration: `wrangler secret put SIGNUP_CODE` makes /register ask for the code (a

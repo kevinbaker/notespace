@@ -59,6 +59,7 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> WorkerResult<Respon
     // Without this a wasm panic surfaces as an opaque 1101 with no stack.
     console_error_panic_hook::set_once();
     startup::report_once(&posture(&env));
+    startup::site_once(&env);
     if let Some(redirect) = https_redirect(&req) {
         return Ok(redirect);
     }
@@ -71,6 +72,24 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> WorkerResult<Respon
         header::HeaderValue::from_static("max-age=31536000"),
     );
     Ok(resp)
+}
+
+/// The site's stylesheet, from the `SITE_THEME` var. Same contract as a space's: immutable,
+/// versioned by content, absent when there is no theme.
+async fn site_theme_css() -> Response {
+    let Some(theme) = notespace_render::layout::site_theme() else {
+        return error(StatusCode::NOT_FOUND, "this site has no theme");
+    };
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        notespace_render::layout::theme_css(theme),
+    )
+        .into_response()
 }
 
 /// Cloudflare answers on http as well as https unless the zone says otherwise, and this does
@@ -101,7 +120,11 @@ fn posture(env: &Env) -> startup::Posture {
         auth_config::AuthConfig::Passwords { scheme, .. } if scheme.client_params().is_some() => {
             startup::Posture::PasswordsClientArgon
         }
-        auth_config::AuthConfig::Passwords { .. } => startup::Posture::PasswordsWithPepper,
+        auth_config::AuthConfig::Passwords { scheme, .. } => {
+            startup::Posture::PasswordsWithPepper {
+                below_owasp: scheme.is_below_recommended(),
+            }
+        }
     }
 }
 
@@ -110,6 +133,8 @@ fn router(env: Env) -> Router {
         .route("/", get(index))
         .route("/healthz", get(healthz))
         .route("/favicon.ico", get(favicon))
+        .route("/theme.css", get(site_theme_css))
+        .route("/api/me", get(api_me))
         .route("/t/{id}", get(thread_page))
         .route("/t/{id}/{slug}", get(thread_page_slug))
         .route("/p/{id}", get(post_permalink))
@@ -261,10 +286,8 @@ async fn login_form(
     anon_page(body, set_anon)
 }
 
-/// How long the anonymous cookie lives: past the token it binds, with an hour to spare. The
-/// cookie used to live an hour to the token's four and was set only when missing, so a form
-/// loaded near the cookie's end -- or a tab left open past it -- failed on submit as "expired"
-/// while looking perfectly fresh.
+/// The anonymous cookie outlives the token it binds by an hour, and every form page re-sets
+/// it: a form must never outlive the cookie, or submitting it reads as "expired".
 const ANON_COOKIE_SECS: i64 = csrf::DEFAULT_LIFETIME_MS / 1000 + 60 * 60;
 
 /// A CSRF token for a visitor with no session, bound to an anonymous cookie. Reuses an
@@ -388,17 +411,10 @@ async fn login_submit(
         Ok(login::Outcome::Success { session, .. }) => {
             let max_age = (session.expires_at - now) / 1000;
             let target = next.as_deref().and_then(cookie::safe_next).unwrap_or("/");
-            (
-                StatusCode::SEE_OTHER,
-                [
-                    (header::LOCATION, target.to_string()),
-                    (
-                        header::SET_COOKIE,
-                        cookie::set(cookie::SESSION, &session_token.to_cookie_value(), max_age),
-                    ),
-                ],
+            redirect_with_cookies(
+                target,
+                cookie::set_session(&session_token.to_cookie_value(), max_age),
             )
-                .into_response()
         }
         Ok(login::Outcome::Rejected) => redirect_to_login("rejected", next.as_deref()),
         Ok(login::Outcome::RateLimited { retry_after_secs }) => {
@@ -511,14 +527,51 @@ async fn logout(State(env): State<Env>, headers: axum::http::HeaderMap) -> Respo
             let _ = D1Store::new(db).delete_session(&token.hash()).await;
         }
     }
-    (
-        StatusCode::SEE_OTHER,
-        [
-            (header::LOCATION, "/".to_string()),
-            (header::SET_COOKIE, cookie::clear(cookie::SESSION)),
-        ],
-    )
-        .into_response()
+    redirect_with_cookies("/", cookie::clear_session())
+}
+
+/// A redirect that also sets (or clears) the session cookies.
+pub(crate) fn redirect_with_cookies(target: &str, cookies: [String; 2]) -> Response {
+    let mut resp = see_other(target.to_string());
+    for c in cookies {
+        if let Ok(v) = c.parse() {
+            resp.headers_mut().append(header::SET_COOKIE, v);
+        }
+    }
+    resp
+}
+
+/// Who the reader is, for the script that personalises the shared header. Uncached, and only
+/// asked for when the `ns_in` marker cookie says there is a session to ask about.
+#[worker::send]
+async fn api_me(State(env): State<Env>, headers: axum::http::HeaderMap) -> Response {
+    let Ok(db) = env.d1(DB_BINDING) else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "no D1 binding");
+    };
+    let store = D1Store::new(db);
+    let no_store = [
+        (header::CACHE_CONTROL, "private, no-store"),
+        (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+    ];
+    match current_user(&store, &headers).await {
+        Some(user) => {
+            let body = serde_json::json!({
+                "name": user.name,
+                "moderator": user.role.can_moderate(),
+            });
+            (StatusCode::OK, no_store, body.to_string()).into_response()
+        }
+        // A stale marker: clear it so the script stops asking.
+        None => {
+            let mut resp = (StatusCode::UNAUTHORIZED, no_store, "{}").into_response();
+            for c in cookie::clear_session() {
+                if let Ok(v) = c.parse() {
+                    resp.headers_mut().append(header::SET_COOKIE, v);
+                }
+            }
+            resp
+        }
+    }
 }
 
 /// Runs the shared conformance suite against D1 and reports it as plain text. Exposed as a
@@ -1379,21 +1432,10 @@ async fn register_submit(
                 Some(d) => format!("/settings?did={}", account::delivery_code(&d)),
                 None => "/".to_string(),
             };
-            (
-                StatusCode::SEE_OTHER,
-                [
-                    (header::LOCATION, target),
-                    (
-                        header::SET_COOKIE,
-                        cookie::set(
-                            cookie::SESSION,
-                            &token.to_cookie_value(),
-                            cfg.sessions.lifetime_ms / 1000,
-                        ),
-                    ),
-                ],
+            redirect_with_cookies(
+                &target,
+                cookie::set_session(&token.to_cookie_value(), cfg.sessions.lifetime_ms / 1000),
             )
-                .into_response()
         }
         Ok(Outcome::RateLimited { retry_after_secs }) => back(&format!("wait-{retry_after_secs}")),
         Ok(Outcome::Rejected(Rejected::Taken)) => back("taken"),

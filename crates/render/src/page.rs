@@ -1,6 +1,6 @@
 //! Read-path templates. Nothing here takes a viewer: the baked HTML is shared byte-for-byte, and
-//! personalisation is layered client-side from `GET /api/me/thread/{id}`. Posts arrive already
-//! rendered and in preorder, so this is one linear pass.
+//! the header is personalised client-side from `GET /api/me`. Posts arrive already rendered and
+//! in preorder, so this is one linear pass.
 
 use crate::layout::{crumbs, Shell, SpaceTheme};
 use maud::{html, Markup, PreEscaped};

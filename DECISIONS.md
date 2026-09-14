@@ -730,6 +730,31 @@ textarea; a theme that does not validate is refused with the reason, the one pla
 form refuses rather than clamps. Spaces are edited by site admins only, which is the trust the
 `url()` allowance rests on; if space-level moderators ever edit themes, revisit it.
 
+## The site's name and look, and who the reader is
+
+**`SITE_NAME` and `SITE_THEME` are set into the render crate once per isolate**, not threaded
+through every template. They are deployment configuration, constant for the life of the
+process, and a `OnceLock` in `layout` is the honest shape for that; passing them through forty
+function signatures would have been ceremony. The site theme is served exactly like a space's
+(`/theme.css?v={hash}`, immutable) and linked before it, so a space's sheet wins. The dev site
+uses it to run in IBM Plex Sans over the Noto default. A self-hosted binary sets the same two
+values from its own configuration at startup.
+
+**The header is personalised by a script, gated on a marker cookie.** Baked pages are shared
+byte-for-byte, so "signed in as alice" cannot be in them (§7.1), and until now every page said
+"sign in · register" to everyone, signed in or not. `me.js` asks `/api/me` and swaps the links.
+The cost that mattered was requests: an extra fetch on every pageview would have halved the
+free plan's daily budget. So the session cookie now travels with a second, script-readable
+cookie that says only "there is a session" (`ns_in=1`; the session itself stays `HttpOnly`), and
+the script does nothing without it. Anonymous readers pay nothing; signed-in readers pay one
+uncached request per page. `/api/me` answering 401 clears the marker, so a stale one stops
+asking. The two cookies are set and cleared by one function, so they cannot disagree.
+
+**`PASSWORD_SCHEME=owasp` exists for the paid plan.** `Scheme::OWASP` was always in core; the
+Worker only offered `constrained` and `client-argon` because nothing else fit 10 ms. A paid plan
+with `limits.cpu_ms` raised does fit it, and the startup warning about parameters is now
+conditional on the scheme actually being below OWASP rather than printed unconditionally.
+
 ## `crates/core/src/sql.rs` -- space listings
 
 `SPACE_THREADS` is the subtree range scan the 0003 migration was designed for, and that

@@ -8,6 +8,7 @@
 
 use maud::{html, Markup, DOCTYPE};
 use notespace_core::theme::Theme;
+use std::sync::OnceLock;
 
 /// The site stylesheet, verbatim. Served as a static asset; included here for the tests, and
 /// as part of [`crate::BAKE_REVISION`].
@@ -15,6 +16,37 @@ pub const STYLE: &str = include_str!("../public/static/style.css");
 
 /// The one font file worth preloading: roman, Latin. The rest load as the text needs them.
 pub const PRELOAD_FONT: &str = "/static/fonts/noto-sans-roman-latin.woff2";
+
+/// The site's name and its own theme, applied to every page under any space's. Deployment
+/// configuration rather than data, so both are set once at startup instead of threaded through
+/// every template; the second call and later are ignored.
+static SITE_NAME: OnceLock<String> = OnceLock::new();
+static SITE_THEME: OnceLock<Theme> = OnceLock::new();
+
+pub fn set_site_name(name: String) {
+    let _ = SITE_NAME.set(name);
+}
+
+/// The brand in the header and the suffix in every title. "notespace" until told otherwise.
+pub fn site_name() -> &'static str {
+    SITE_NAME.get().map_or("notespace", String::as_str)
+}
+
+pub fn set_site_theme(theme: Theme) {
+    let _ = SITE_THEME.set(theme);
+}
+
+/// Where the site's stylesheet is, or nothing when there is no site theme.
+pub fn site_theme_href() -> Option<String> {
+    SITE_THEME
+        .get()
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("/theme.css?v={}", t.version()))
+}
+
+pub fn site_theme() -> Option<&'static Theme> {
+    SITE_THEME.get().filter(|t| !t.is_empty())
+}
 
 /// A space's look, for the page that belongs to it.
 pub struct SpaceTheme<'a> {
@@ -43,7 +75,7 @@ pub enum Width {
     Wide,
 }
 
-/// Everything around the body. `Default` is a plain page titled "notespace".
+/// Everything around the body. `Default` is a plain page titled with the site's name.
 #[derive(Default)]
 pub struct Shell<'a> {
     /// Goes in `<title>`; the site name is appended unless this is it.
@@ -71,12 +103,13 @@ impl Shell<'_> {
                     meta name="viewport" content="width=device-width, initial-scale=1";
                     link rel="icon" href="data:,";
                     title {
-                        @if self.title.is_empty() || self.title == "notespace" { "notespace" }
-                        @else { (self.title) " — notespace" }
+                        @if self.title.is_empty() || self.title == site_name() { (site_name()) }
+                        @else { (self.title) " — " (site_name()) }
                     }
                     (self.head)
                     link rel="preload" as="font" type="font/woff2" crossorigin href=(PRELOAD_FONT);
                     link rel="stylesheet" href={ "/static/style.css?v=" (revision()) };
+                    @if let Some(href) = site_theme_href() { link rel="stylesheet" href=(href); }
                     @if let Some(href) = self.theme.as_ref().and_then(SpaceTheme::href) {
                         link rel="stylesheet" href=(href);
                     }
@@ -84,11 +117,12 @@ impl Shell<'_> {
                 body {
                     header class="site" {
                         nav class="crumbs" {
-                            a class="brand" href="/" { "notespace" }
+                            a class="brand" href="/" { (site_name()) }
                             (self.crumbs)
                         }
                         // Identical for every reader: baked pages are shared byte-for-byte, so
-                        // "signed in as …" cannot live here. /settings asks for sign-in if needed.
+                        // "signed in as …" cannot live here. /static/me.js swaps these for the
+                        // reader's own links when a session cookie says there is one.
                         nav class="links" {
                             (self.links)
                             a href="/login" { "sign in" }
@@ -96,6 +130,7 @@ impl Shell<'_> {
                             a href="/settings" { "account" }
                         }
                     }
+                    script defer src={ "/static/me.js?v=" (revision()) } {}
                     main class=(match self.width {
                         Width::Normal => "",
                         Width::Narrow => "narrow",
